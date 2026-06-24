@@ -1,0 +1,16 @@
+[package]
+name = "moraine-binpkg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+moraine-atom = { version = "0.1.0", path = "../moraine-atom" }
+moraine-common = { version = "0.1.0", path = "../moraine-common" }
+moraine-repo = { version = "0.1.0", path = "../moraine-repo" }
+moraine-resolve = { version = "0.1.0", path = "../moraine-resolve" }
+moraine-vdb = { version = "0.1.0", path = "../moraine-vdb" }
+moraine-version = { version = "0.1.0", path = "../moraine-version" }
+
+[lints]
+workspace = true

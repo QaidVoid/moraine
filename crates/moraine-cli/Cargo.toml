@@ -1,0 +1,22 @@
+[package]
+name = "moraine-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+moraine-atom = { version = "0.1.0", path = "../moraine-atom" }
+moraine-binpkg = { version = "0.1.0", path = "../moraine-binpkg" }
+moraine-build = { version = "0.1.0", path = "../moraine-build" }
+moraine-common = { version = "0.1.0", path = "../moraine-common" }
+moraine-config = { version = "0.1.0", path = "../moraine-config" }
+moraine-eapi = { version = "0.1.0", path = "../moraine-eapi" }
+moraine-merge = { version = "0.1.0", path = "../moraine-merge" }
+moraine-repo = { version = "0.1.0", path = "../moraine-repo" }
+moraine-resolve = { version = "0.1.0", path = "../moraine-resolve" }
+moraine-sync = { version = "0.1.0", path = "../moraine-sync" }
+moraine-vdb = { version = "0.1.0", path = "../moraine-vdb" }
+moraine-version = { version = "0.1.0", path = "../moraine-version" }
+
+[lints]
+workspace = true

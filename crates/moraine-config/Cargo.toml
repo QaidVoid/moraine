@@ -1,0 +1,14 @@
+[package]
+name = "moraine-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+moraine-atom = { version = "0.1.0", path = "../moraine-atom" }
+moraine-common = { version = "0.1.0", path = "../moraine-common" }
+moraine-eapi = { version = "0.1.0", path = "../moraine-eapi" }
+moraine-version = { version = "0.1.0", path = "../moraine-version" }
+
+[lints]
+workspace = true

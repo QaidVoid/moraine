@@ -1,0 +1,15 @@
+[package]
+name = "moraine-merge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+moraine-build = { version = "0.1.0", path = "../moraine-build" }
+moraine-common = { version = "0.1.0", path = "../moraine-common" }
+moraine-config = { version = "0.1.0", path = "../moraine-config" }
+moraine-resolve = { version = "0.1.0", path = "../moraine-resolve" }
+moraine-vdb = { version = "0.1.0", path = "../moraine-vdb" }
+
+[lints]
+workspace = true

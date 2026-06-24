@@ -1,0 +1,13 @@
+[package]
+name = "moraine-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+moraine-common = { version = "0.1.0", path = "../moraine-common" }
+moraine-config = { version = "0.1.0", path = "../moraine-config" }
+moraine-repo = { version = "0.1.0", path = "../moraine-repo" }
+
+[lints]
+workspace = true
