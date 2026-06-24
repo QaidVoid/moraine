@@ -5,11 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+moraine-atom = { version = "0.1.0", path = "../moraine-atom" }
 moraine-build = { version = "0.1.0", path = "../moraine-build" }
 moraine-common = { version = "0.1.0", path = "../moraine-common" }
 moraine-config = { version = "0.1.0", path = "../moraine-config" }
+moraine-eapi = { version = "0.1.0", path = "../moraine-eapi" }
 moraine-resolve = { version = "0.1.0", path = "../moraine-resolve" }
 moraine-vdb = { version = "0.1.0", path = "../moraine-vdb" }
+moraine-version = { version = "0.1.0", path = "../moraine-version" }
+thiserror = "2.0.18"
+tracing = "0.1.44"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+insta = "1.48.0"
+proptest = "1.11.0"
+tempfile = "3.27.0"

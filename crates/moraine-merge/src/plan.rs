@@ -1,0 +1,52 @@
+//! The operation type consumed from the resolver task list.
+//!
+//! The resolver produces an ordered task list that already encodes merge versus
+//! unmerge and the replacement relationship within a slot. The merge engine
+//! consumes that order verbatim and does not re-derive it.
+
+use std::path::PathBuf;
+
+use crate::state::PackageState;
+
+/// One operation in the ordered task list: a merge or an unmerge.
+#[derive(Debug, Clone)]
+pub enum Operation {
+    /// Merge a built image into the live root and record the package.
+    Merge(Box<MergeOp>),
+    /// Unmerge an installed package from the live root.
+    Unmerge(UnmergeOp),
+}
+
+impl Operation {
+    /// A short `category/package-version` label for tracing and markers.
+    pub fn label(&self) -> &str {
+        match self {
+            Operation::Merge(m) => &m.state.cpv,
+            Operation::Unmerge(u) => &u.cpv,
+        }
+    }
+}
+
+/// A merge operation: the image to install and the state to record.
+#[derive(Debug, Clone)]
+pub struct MergeOp {
+    /// The built image directory (`D`) to install from.
+    pub image_dir: PathBuf,
+    /// The installed-store record to write at commit, minus the counter.
+    pub state: PackageState,
+    /// The `category/package-version` of a prior version being replaced in the
+    /// same slot, if this merge replaces one.
+    pub replaces: Option<String>,
+    /// Whether the package was explicitly requested and so joins `@world`.
+    pub in_world: bool,
+}
+
+/// An unmerge operation: the package to remove from the live root.
+#[derive(Debug, Clone)]
+pub struct UnmergeOp {
+    /// The `category/package-version` of the package to unmerge.
+    pub cpv: String,
+    /// Whether this is part of a same-slot replacement (so a later merge owns the
+    /// slot) and should not be removed from `@world`.
+    pub replaced: bool,
+}
