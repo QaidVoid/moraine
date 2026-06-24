@@ -757,7 +757,10 @@ dependencies = [
 name = "moraine-solver"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "insta",
  "moraine-common",
+ "proptest",
 ]
 
 [[package]]

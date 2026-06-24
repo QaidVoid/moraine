@@ -1,0 +1,15 @@
+---
+source: crates/moraine-solver/tests/explanation.rs
+expression: out
+---
+- derived from:
+  - derived from:
+    - derived from:
+      - derived from:
+        - derived from:
+          - no versions of "a" satisfy the constraint
+          - "root" depends on "a"
+        - "a" depends on "c"
+      - "b" depends on "c"
+    - "root" depends on "b"
+  - no versions of "b" satisfy the constraint
