@@ -1,14 +1,96 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! The available-packages metadata database for the Moraine package manager.
+//!
+//! This crate is the `portdbapi` equivalent of the rewrite. It answers the
+//! question the solver asks millions of times: given an atom, which package
+//! versions exist, and what are their dependencies, slots, keywords, and USE
+//! flags? It does so in layers:
+//!
+//! - [`discovery`]: parse `repos.conf`, `layout.conf`, and `profiles/repo_name`,
+//!   resolve masters inheritance and `priority` into one deterministic
+//!   repository order, and build per-repository eclass search paths.
+//! - [`store`]: a greenfield, mmap-backed on-disk format holding the resolution
+//!   subset of metadata per ebuild version, with dependency variables stored as
+//!   raw text and parsed into [`moraine_atom`] ASTs once at load time so the
+//!   resolver never re-parses.
+//! - [`import`]: a parallel, eclass-validated, incremental importer from stock
+//!   md5-cache into the store.
+//! - [`query`]: the atom-to-candidate-version query API the solver consumes.
+//!
+//! # Interning and on-disk stability
+//!
+//! [`moraine_common::Symbol`] values are per-interner and not stable across
+//! runs, so the store never serializes symbols or parsed ASTs. It writes raw
+//! dependency strings and structured string fields, then on load builds its own
+//! interner and parses the strings into ASTs held in memory.
+
+pub mod discovery;
+pub mod error;
+pub mod import;
+pub mod query;
+pub mod store;
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use tracing::instrument;
+
+pub use discovery::{RepoConfig, RepoSet, discover};
+pub use error::{DiscoveryError, ImportError, RepoError, Result};
+pub use import::{ImportIssue, ImportReport, import_repo};
+pub use query::{Candidate, RepoIndex, RepoStore};
+pub use store::{FORMAT_VERSION, LoadedEntry, LoadedStore, StoredEntry};
+
+/// Build the incremental-reimport index from on-disk store entries, which retain
+/// `_mtime_` and `_md5_`. The importer reuses an entry whose `_mtime_` and
+/// `_md5_` match the source cache file.
+pub fn previous_index(entries: &[StoredEntry]) -> HashMap<(String, String, String), StoredEntry> {
+    entries
+        .iter()
+        .map(|e| {
+            (
+                (e.category.clone(), e.package.clone(), e.version.clone()),
+                e.clone(),
+            )
+        })
+        .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Discover repositories, import each into its store file, and load them into a
+/// queryable [`RepoIndex`] in the discovered order.
+///
+/// `repos_conf` is the `repos.conf` file or directory. `store_dir` is where each
+/// repository's `<name>.mrepo` store file is written. If a store file already
+/// exists and is valid and current, its entries seed an incremental reimport so
+/// only changed entries are re-parsed.
+#[instrument(skip_all)]
+pub fn build_index(repos_conf: impl AsRef<Path>, store_dir: impl AsRef<Path>) -> Result<RepoIndex> {
+    let repo_set = discover(repos_conf)?;
+    let store_dir = store_dir.as_ref();
+    std::fs::create_dir_all(store_dir).map_err(|source| {
+        RepoError::Common(moraine_common::CommonError::Io {
+            path: store_dir.to_path_buf(),
+            source,
+        })
+    })?;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    let mut repos = Vec::new();
+    for cfg in repo_set.ordered() {
+        let store_path = store_dir.join(format!("{}.mrepo", cfg.name));
+
+        // Seed incremental reimport from a valid existing store.
+        let previous = match store::read_entries(&store_path) {
+            Ok(prev) => previous_index(&prev),
+            Err(_) => HashMap::new(),
+        };
+
+        let report = import_repo(&repo_set, &cfg.name, &previous)?;
+        store::write_store(&store_path, report.entries)?;
+        let store = LoadedStore::load(&store_path)?;
+        repos.push(RepoStore {
+            name: cfg.name.clone(),
+            store,
+        });
     }
+
+    Ok(RepoIndex::new(repos))
 }
