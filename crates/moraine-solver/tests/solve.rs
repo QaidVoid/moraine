@@ -1,6 +1,62 @@
 //! Integration tests for the solver over the synthetic provider.
 
-use moraine_solver::{Explanation, MapProvider, Range, Term, solve};
+use moraine_solver::{
+    Clause, Dependencies, DependencyProvider, Explanation, MapProvider, Range, Range as R,
+    Requirements, Term, solve,
+};
+
+/// A provider that exposes disjunctive clauses and conflicts directly so the
+/// new `Requirements` shape can be exercised end to end.
+struct ClauseProvider;
+
+impl DependencyProvider for ClauseProvider {
+    type Package = &'static str;
+    type Version = u32;
+
+    fn candidates(&self, package: &&'static str, range: &R<u32>) -> Vec<u32> {
+        let versions: &[u32] = match *package {
+            "root" => &[1],
+            "a" => &[1, 2],
+            "b" => &[1, 2],
+            "x" => &[1, 2, 3],
+            _ => &[],
+        };
+        versions
+            .iter()
+            .rev()
+            .copied()
+            .filter(|v| range.contains(v))
+            .collect()
+    }
+
+    fn dependencies(
+        &self,
+        package: &&'static str,
+        version: &u32,
+    ) -> Dependencies<&'static str, u32> {
+        match (*package, *version) {
+            // root needs (a>=2 OR b>=1) and forbids a in [2,inf).
+            ("root", 1) => Dependencies::Known(Requirements {
+                clauses: vec![Clause::any_of(vec![
+                    ("a", Term::positive(R::at_least(2))),
+                    ("b", Term::positive(R::at_least(1))),
+                ])],
+                conflicts: vec![("a", Term::positive(R::at_least(2)))],
+            }),
+            _ => Dependencies::Known(Requirements::new()),
+        }
+    }
+}
+
+#[test]
+fn disjunction_falls_back_to_second_alternative() {
+    // The first alternative (a>=2) is forbidden by the conflict, so the solver
+    // must satisfy the clause via b.
+    let solution = solve(&ClauseProvider, "root", 1).expect("should solve");
+    assert!(solution.contains_key("b"));
+    // a must not be chosen at >=2.
+    assert!(solution.get("a").map(|v| *v < 2).unwrap_or(true));
+}
 
 /// `root@1` depends on `a` (any) and `b >= 2`; `a@2` depends on `b < 3`.
 fn solvable_provider() -> MapProvider<&'static str> {

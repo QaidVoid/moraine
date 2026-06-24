@@ -95,19 +95,33 @@ impl<DP: DependencyProvider> Solver<'_, DP> {
                     });
                     pkg
                 }
-                Dependencies::Known(deps) => {
-                    for (dep_pkg, dep_term) in deps {
+                Dependencies::Known(reqs) => {
+                    let chosen = Term::positive(Range::singleton(version.clone()));
+                    for clause in reqs.clauses {
+                        // `pkg=v => some alternative holds`: an incompatibility
+                        // listing the chosen version positively plus every
+                        // alternative negated.
+                        if clause.alternatives.is_empty() {
+                            continue;
+                        }
+                        let mut terms = Vec::with_capacity(clause.alternatives.len() + 1);
+                        terms.push((pkg.clone(), chosen.clone()));
+                        let cause = Cause::Dependency {
+                            dependent: pkg.clone(),
+                            dependency: clause.alternatives[0].0.clone(),
+                        };
+                        for (alt_pkg, alt_term) in clause.alternatives {
+                            terms.push((alt_pkg, alt_term.negate()));
+                        }
+                        self.add_incompat(Incompatibility { terms, cause });
+                    }
+                    for (q, term) in reqs.conflicts {
+                        // `pkg=v => q not in term`.
                         self.add_incompat(Incompatibility {
-                            terms: vec![
-                                (
-                                    pkg.clone(),
-                                    Term::positive(Range::singleton(version.clone())),
-                                ),
-                                (dep_pkg.clone(), dep_term.negate()),
-                            ],
+                            terms: vec![(pkg.clone(), chosen.clone()), (q.clone(), term)],
                             cause: Cause::Dependency {
                                 dependent: pkg.clone(),
-                                dependency: dep_pkg,
+                                dependency: q,
                             },
                         });
                     }
@@ -319,5 +333,6 @@ fn describe_cause<P: std::fmt::Debug>(cause: &Cause<P>) -> String {
         Cause::NoVersions(p) => format!("no versions of {p:?} satisfy the constraint"),
         Cause::Unavailable(p, reason) => format!("{p:?} is unavailable: {reason}"),
         Cause::Derived(..) => "a learned conflict".to_owned(),
+        Cause::Custom(label) => label.clone(),
     }
 }

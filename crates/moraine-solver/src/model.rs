@@ -28,6 +28,10 @@ pub enum Cause<P> {
     /// A no-good learned by resolving two incompatibilities during conflict
     /// analysis, linking to its parents to form the derivation graph.
     Derived(IncompatId, IncompatId),
+    /// A resolver-supplied incompatibility carrying its own label, used for
+    /// constraints expressed outside the generic dependency model (clauses,
+    /// blockers, slot collisions, REQUIRED_USE).
+    Custom(String),
 }
 
 /// A set of terms that cannot all hold simultaneously.

@@ -1,0 +1,8 @@
+---
+source: crates/moraine-resolve/tests/snapshots_test.rs
+expression: rendered
+---
+Merge sys-libs/glibc-2:0
+Merge cat/lib-1:0
+Merge cat/tool-1:0
+Merge cat/app-1:0

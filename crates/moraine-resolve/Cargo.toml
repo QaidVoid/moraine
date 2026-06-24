@@ -13,6 +13,18 @@ moraine-repo = { version = "0.1.0", path = "../moraine-repo" }
 moraine-solver = { version = "0.1.0", path = "../moraine-solver" }
 moraine-vdb = { version = "0.1.0", path = "../moraine-vdb" }
 moraine-version = { version = "0.1.0", path = "../moraine-version" }
+thiserror = "2.0.18"
+tracing = "0.1.44"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = "0.8.2"
+insta = "1.48.0"
+proptest = "1.11.0"
+tempfile = "3.27.0"
+
+[[bench]]
+name = "resolve"
+harness = false

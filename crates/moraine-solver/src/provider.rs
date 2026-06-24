@@ -12,11 +12,80 @@ use std::hash::Hash;
 use crate::range::Range;
 use crate::term::Term;
 
+/// A single requirement clause: a disjunction over alternatives.
+///
+/// A plain dependency is a clause with exactly one alternative. A `||`
+/// any-of group or a virtual expansion is a clause with several
+/// alternatives, of which at least one must hold. Each alternative is a
+/// `(package, term)` pair, in the provider's preference order.
+#[derive(Debug, Clone)]
+pub struct Clause<P, V> {
+    /// The alternatives, at least one of which must be satisfied. Listed in
+    /// preference order (most preferred first).
+    pub alternatives: Vec<(P, Term<V>)>,
+}
+
+impl<P, V> Clause<P, V> {
+    /// A clause with a single alternative (an ordinary dependency).
+    pub fn single(package: P, term: Term<V>) -> Self {
+        Clause {
+            alternatives: vec![(package, term)],
+        }
+    }
+
+    /// A clause that is a disjunction over the given alternatives.
+    pub fn any_of(alternatives: Vec<(P, Term<V>)>) -> Self {
+        Clause { alternatives }
+    }
+}
+
+/// The full requirement set of a concrete package version: a conjunction of
+/// disjunctive clauses plus a set of conflicts.
+///
+/// A `conflict (q, term)` means "if this version is chosen, then `q` must NOT
+/// be in `term`'s set", which encodes blockers and slot collisions.
+#[derive(Debug, Clone)]
+pub struct Requirements<P, V> {
+    /// The clauses, all of which must be satisfied (each is a disjunction).
+    pub clauses: Vec<Clause<P, V>>,
+    /// Conflicts: pairs that must not both hold together with this version.
+    pub conflicts: Vec<(P, Term<V>)>,
+}
+
+impl<P, V> Default for Requirements<P, V> {
+    fn default() -> Self {
+        Requirements {
+            clauses: Vec::new(),
+            conflicts: Vec::new(),
+        }
+    }
+}
+
+impl<P, V> Requirements<P, V> {
+    /// An empty requirement set.
+    pub fn new() -> Self {
+        Requirements::default()
+    }
+
+    /// Build a requirement set from a list of plain single-alternative
+    /// dependencies, with no disjunctions and no conflicts. Keeps simple
+    /// call-sites and tests terse.
+    pub fn simple(deps: Vec<(P, Term<V>)>) -> Self {
+        Requirements {
+            clauses: deps
+                .into_iter()
+                .map(|(p, t)| Clause::single(p, t))
+                .collect(),
+            conflicts: Vec::new(),
+        }
+    }
+}
+
 /// The dependencies of a concrete package version.
 #[derive(Debug, Clone)]
 pub enum Dependencies<P, V> {
-    /// The version is available and depends on these `(package, term)` pairs.
-    Known(Vec<(P, Term<V>)>),
+    /// The version is available and carries these requirements.
+    Known(Requirements<P, V>),
     /// The version cannot be used; the string explains why.
     Unavailable(String),
 }
@@ -97,8 +166,8 @@ impl<P: Ord + Clone + Hash + Debug> DependencyProvider for MapProvider<P> {
 
     fn dependencies(&self, package: &P, version: &u32) -> Dependencies<P, u32> {
         match self.deps.get(&(package.clone(), *version)) {
-            Some(deps) => Dependencies::Known(deps.clone()),
-            None => Dependencies::Known(Vec::new()),
+            Some(deps) => Dependencies::Known(Requirements::simple(deps.clone())),
+            None => Dependencies::Known(Requirements::new()),
         }
     }
 }
