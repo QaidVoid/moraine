@@ -10,6 +10,15 @@ moraine-common = { version = "0.1.0", path = "../moraine-common" }
 moraine-config = { version = "0.1.0", path = "../moraine-config" }
 moraine-eapi = { version = "0.1.0", path = "../moraine-eapi" }
 moraine-repo = { version = "0.1.0", path = "../moraine-repo" }
+thiserror = "2.0.18"
+tracing = "0.1.44"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+insta = "1.48.0"
+moraine-common = { version = "0.1.0", path = "../moraine-common" }
+moraine-repo = { version = "0.1.0", path = "../moraine-repo" }
+proptest = "1.11.0"
+tempfile = "3.27.0"
