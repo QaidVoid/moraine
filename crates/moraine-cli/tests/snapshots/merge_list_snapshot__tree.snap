@@ -1,0 +1,11 @@
+---
+source: crates/moraine-cli/tests/merge_list_snapshot.rs
+expression: "render_tree(&plan, false)"
+---
+Dependency tree:
+
+[ebuild R] app-misc/tool-2.0 USE="ssl"
+  [ebuild U] dev-libs/openssl-3.1.4 [3.0.9] USE="asm* zlib"
+  [ebuild N] dev-lang/python:3.12-3.12.1
+
+Total: 3 packages, Size of downloads: 0 B

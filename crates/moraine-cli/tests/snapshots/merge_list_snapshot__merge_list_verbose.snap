@@ -1,0 +1,11 @@
+---
+source: crates/moraine-cli/tests/merge_list_snapshot.rs
+expression: "render_merge_list(&plan, true)"
+---
+These are the packages that would be merged, in order:
+
+[ebuild U] dev-libs/openssl-3.1.4 [3.0.9] USE="asm* zlib" 9.06 MiB::gentoo
+[ebuild R] app-misc/tool-2.0 USE="ssl"
+[ebuild N] dev-lang/python:3.12-3.12.1::gentoo
+
+Total: 3 packages, Size of downloads: 9.06 MiB

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
 miette = { version = "7.6.0", features = ["fancy"] }
 moraine-atom = { version = "0.1.0", path = "../moraine-atom" }
 moraine-binpkg = { version = "0.1.0", path = "../moraine-binpkg" }
