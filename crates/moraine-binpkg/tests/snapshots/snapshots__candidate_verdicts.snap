@@ -1,0 +1,40 @@
+---
+source: crates/moraine-binpkg/tests/snapshots.rs
+expression: cases
+---
+[
+    (
+        "accept",
+        Accept,
+    ),
+    (
+        "use_mismatch",
+        Reject(
+            UseMismatch {
+                extra: [],
+                missing: [
+                    "zlib",
+                ],
+            },
+        ),
+    ),
+    (
+        "chost_mismatch",
+        Reject(
+            ChostMismatch {
+                recorded: "i686-pc-linux-gnu",
+                target: "x86_64-pc-linux-gnu",
+            },
+        ),
+    ),
+    (
+        "soname_unsatisfied",
+        Reject(
+            UnsatisfiedSonames(
+                [
+                    "libssl.so.3",
+                ],
+            ),
+        ),
+    ),
+]

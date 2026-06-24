@@ -1,0 +1,21 @@
+---
+source: crates/moraine-binpkg/tests/snapshots.rs
+expression: text
+---
+ACCEPT_KEYWORDS: amd64
+ARCH: amd64
+FEATURES: binpkg-logs
+VERSION: 1
+
+CPV: dev-libs/foo-1.2.3
+BUILD_ID: 1
+BUILD_TIME: 1700000000
+CHOST: x86_64-pc-linux-gnu
+DESC: Foundational library
+EAPI: 8
+RDEPEND: dev-libs/openssl sys-libs/zlib
+SIZE: 12345
+SLOT: 0
+USE: ssl
+MTIME: 1700000000
+REPO: gentoo

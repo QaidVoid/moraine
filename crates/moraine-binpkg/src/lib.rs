@@ -1,14 +1,133 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! Binary package containers, the binhost index, and binary candidate support.
+//!
+//! This crate is the binary-package layer of the Moraine package manager. It
+//! owns:
+//!
+//! - [`greenfield`]: the binary package format Moraine produces, with
+//!   separately addressable metadata, image, and manifest sections, an
+//!   integrity manifest of BLAKE2b and SHA-512 per-section checksums, and an
+//!   optional detached signature.
+//! - [`xpak`] and [`gpkg`]: read-only importers for the two stock container
+//!   formats, recovering their embedded metadata into the canonical
+//!   [`metadata::MetadataMap`] without rewriting the source.
+//! - [`detect`]: format detection that dispatches between the three readers.
+//! - [`index`]: the binhost `Packages` index model with name translation and
+//!   use-evaluated dependency keys, plus a local built-package index.
+//! - [`resolution`]: binary packages as solver candidates, the usepkg-style
+//!   selection policy, and the USE/CHOST/soname compatibility checks.
+//! - [`fetch`]: network fetch of a binary package by shelling out to a
+//!   configurable command, with manifest and signature verification.
+//!
+//! Network access and cryptographic verification are confined to this crate.
+//! The crate exposes typed errors and never prints.
+
+pub mod compress;
+pub mod detect;
+pub mod error;
+pub mod fetch;
+pub mod gpkg;
+pub mod greenfield;
+pub mod index;
+pub mod metadata;
+pub mod resolution;
+pub mod signature;
+pub mod xpak;
+
+pub use compress::Compression;
+pub use detect::{Format, detect};
+pub use error::{ContainerError, FetchError, IndexError};
+pub use index::{PackageEntry, PackagesIndex, build_local_index};
+pub use metadata::MetadataMap;
+pub use resolution::{
+    BinaryCandidate, Eligibility, Rejection, TargetConfig, UsepkgMode, UsepkgPolicy, Verdict,
+    check_compatibility,
+};
+
+/// A binary package read into memory: its metadata and decompressed image.
+///
+/// This is the format-agnostic result of [`read_package`]; callers that do not
+/// care which container format a file uses consume this directly.
+pub struct Package {
+    /// The container format the source used.
+    pub format: Format,
+    /// The recovered canonical metadata map.
+    pub metadata: MetadataMap,
+    /// The decompressed image tar bytes.
+    pub image: Vec<u8>,
+}
+
+/// Read any supported binary package into a format-agnostic [`Package`].
+///
+/// Detects the container format, dispatches to the matching reader, verifies
+/// integrity where the format carries a manifest, and returns the recovered
+/// metadata and decompressed image. When `signature` is provided, a present
+/// detached signature is verified for the greenfield and GPKG formats.
+pub fn read_package(
+    bytes: &[u8],
+    signature: Option<&signature::SignatureConfig>,
+) -> Result<Package, ContainerError> {
+    let span = tracing::info_span!("binpkg.read_package");
+    let _enter = span.enter();
+
+    match detect(bytes)? {
+        Format::Greenfield => {
+            let reader = greenfield::Reader::open(bytes)?;
+            reader.verify_manifest()?;
+            if let Some(config) = signature {
+                reader.verify_signature(config)?;
+            }
+            Ok(Package {
+                format: Format::Greenfield,
+                metadata: reader.metadata()?,
+                image: reader.image()?,
+            })
+        }
+        Format::Gpkg => {
+            let pkg = gpkg::read(bytes, signature)?;
+            Ok(Package {
+                format: Format::Gpkg,
+                metadata: pkg.metadata().clone(),
+                image: pkg.image().to_vec(),
+            })
+        }
+        Format::Xpak => {
+            let pkg = xpak::read(bytes)?;
+            Ok(Package {
+                format: Format::Xpak,
+                metadata: pkg.metadata().clone(),
+                image: pkg.image().to_vec(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::greenfield::{WriteOptions, write_bytes};
+    use crate::metadata::{KEY_CHOST, KEY_USE};
+
+    fn meta() -> MetadataMap {
+        let mut m = MetadataMap::new();
+        m.set_str(KEY_CHOST, "x86_64-pc-linux-gnu");
+        m.set_str(KEY_USE, "ssl zlib");
+        m
+    }
 
     #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    fn read_package_greenfield() {
+        let bytes = write_bytes(&meta(), b"image", &WriteOptions::default()).unwrap();
+        let pkg = read_package(&bytes, None).unwrap();
+        assert_eq!(pkg.format, Format::Greenfield);
+        assert_eq!(pkg.metadata, meta());
+        assert_eq!(pkg.image, b"image");
+    }
+
+    #[test]
+    fn read_package_xpak() {
+        let file = xpak::build_tbz2(b"img", &meta());
+        let pkg = read_package(&file, None).unwrap();
+        assert_eq!(pkg.format, Format::Xpak);
+        assert_eq!(pkg.metadata, meta());
     }
 }
