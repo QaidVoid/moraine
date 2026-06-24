@@ -6,6 +6,15 @@ rust-version.workspace = true
 
 [dependencies]
 moraine-common = { version = "0.1.0", path = "../moraine-common" }
+thiserror = "2.0.18"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = "0.8.2"
+proptest = "1.11.0"
+
+[[bench]]
+name = "version"
+harness = false

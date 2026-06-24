@@ -603,9 +603,12 @@ dependencies = [
 name = "moraine-atom"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "moraine-common",
  "moraine-eapi",
  "moraine-version",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]
@@ -752,7 +755,10 @@ dependencies = [
 name = "moraine-version"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "moraine-common",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]
