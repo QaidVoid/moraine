@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+miette = { version = "7.6.0", features = ["fancy"] }
 moraine-atom = { version = "0.1.0", path = "../moraine-atom" }
 moraine-binpkg = { version = "0.1.0", path = "../moraine-binpkg" }
 moraine-build = { version = "0.1.0", path = "../moraine-build" }
@@ -17,6 +18,16 @@ moraine-resolve = { version = "0.1.0", path = "../moraine-resolve" }
 moraine-sync = { version = "0.1.0", path = "../moraine-sync" }
 moraine-vdb = { version = "0.1.0", path = "../moraine-vdb" }
 moraine-version = { version = "0.1.0", path = "../moraine-version" }
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[[bin]]
+name = "moraine"
+path = "src/main.rs"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+insta = "1.48.0"

@@ -1,0 +1,8 @@
+---
+source: crates/moraine-cli/tests/diagnostic_snapshot.rs
+expression: render_report(&err)
+---
+moraine::demo
+
+  × demonstration error: snapshot sample
+  help: this is a smoke-test diagnostic; run without --demo-error to proceed normally
