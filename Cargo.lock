@@ -649,6 +649,7 @@ dependencies = [
  "moraine-sync",
  "moraine-vdb",
  "moraine-version",
+ "tempfile",
  "thiserror",
  "tracing",
  "tracing-subscriber",

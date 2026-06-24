@@ -31,3 +31,4 @@ workspace = true
 
 [dev-dependencies]
 insta = "1.48.0"
+tempfile = "3.27.0"

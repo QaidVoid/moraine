@@ -5,6 +5,8 @@
 //! diagnostics and tracing and runs a placeholder workload; real actions arrive
 //! in later phases.
 
+pub mod corpus;
+
 use miette::Diagnostic;
 use thiserror::Error;
 use tracing::level_filters::LevelFilter;

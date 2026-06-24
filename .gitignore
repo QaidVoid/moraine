@@ -1,1 +1,4 @@
 /target
+
+# Local corpus snapshot of real Gentoo data (used for comparison benchmarks)
+/corpus/
