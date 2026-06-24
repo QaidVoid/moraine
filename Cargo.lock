@@ -678,10 +678,14 @@ dependencies = [
 name = "moraine-config"
 version = "0.1.0"
 dependencies = [
+ "insta",
  "moraine-atom",
  "moraine-common",
  "moraine-eapi",
  "moraine-version",
+ "proptest",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

@@ -1,0 +1,220 @@
+//! Parsing of `make.conf` and `make.defaults` shell-style assignment files.
+//!
+//! Supports `KEY=value`, single and double quoting, backslash line
+//! continuation, comments, and `$VAR` / `${VAR}` expansion against the
+//! accumulating variable set. A directory path is read as its sorted member
+//! files applied in filename order.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::error::ConfigError;
+
+/// A set of shell-style variable assignments, in the order they were defined.
+#[derive(Debug, Default, Clone)]
+pub struct VarMap {
+    vars: BTreeMap<String, String>,
+}
+
+impl VarMap {
+    /// Create an empty map.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The value of `key`, if set.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.vars.get(key).map(String::as_str)
+    }
+
+    /// All variables.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.vars.iter()
+    }
+
+    /// Insert or replace a variable directly.
+    pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.vars.insert(key.into(), value.into());
+    }
+
+    /// Parse the contents of one assignment file, merging into this map so that
+    /// later assignments override and expansion sees earlier values.
+    pub fn merge_str(&mut self, content: &str, path: &Path) -> Result<(), ConfigError> {
+        let joined = join_continuations(content);
+        for raw_line in joined.lines() {
+            let line = raw_line.trim_start();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, rest)) = line.split_once('=') else {
+                return Err(ConfigError::MakeConf {
+                    path: path.to_path_buf(),
+                    reason: "expected KEY=value assignment",
+                });
+            };
+            let key = key.trim();
+            if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return Err(ConfigError::MakeConf {
+                    path: path.to_path_buf(),
+                    reason: "invalid variable name",
+                });
+            }
+            let value = parse_value(rest, &self.vars);
+            self.vars.insert(key.to_owned(), value);
+        }
+        Ok(())
+    }
+
+    /// Parse a file or directory path into this map.
+    pub fn merge_path(&mut self, path: &Path) -> Result<(), ConfigError> {
+        if path.is_dir() {
+            let mut entries: Vec<_> = std::fs::read_dir(path)
+                .map_err(|_| ConfigError::Io {
+                    path: path.to_path_buf(),
+                })?
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect();
+            entries.sort();
+            for entry in entries {
+                self.merge_file(&entry)?;
+            }
+            Ok(())
+        } else {
+            self.merge_file(path)
+        }
+    }
+
+    fn merge_file(&mut self, path: &Path) -> Result<(), ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(|_| ConfigError::Io {
+            path: path.to_path_buf(),
+        })?;
+        self.merge_str(&content, path)
+    }
+}
+
+fn join_continuations(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut lines = content.lines().peekable();
+    while let Some(line) = lines.next() {
+        if let Some(stripped) = line.strip_suffix('\\') {
+            out.push_str(stripped);
+            if lines.peek().is_some() {
+                continue;
+            }
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn parse_value(rest: &str, vars: &BTreeMap<String, String>) -> String {
+    let chars: Vec<char> = rest.trim_start().chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut prev_ws = true;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+                prev_ws = false;
+            }
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        out.push(chars[i + 1]);
+                        i += 2;
+                    } else if chars[i] == '$' {
+                        i += 1;
+                        out.push_str(&expand(&chars, &mut i, vars));
+                    } else {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                i += 1;
+                prev_ws = false;
+            }
+            '$' => {
+                i += 1;
+                out.push_str(&expand(&chars, &mut i, vars));
+                prev_ws = false;
+            }
+            '\\' if i + 1 < chars.len() => {
+                out.push(chars[i + 1]);
+                i += 2;
+                prev_ws = false;
+            }
+            '#' if prev_ws => break,
+            c if c.is_whitespace() => {
+                out.push(c);
+                i += 1;
+                prev_ws = true;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+                prev_ws = false;
+            }
+        }
+    }
+    out.trim().to_owned()
+}
+
+fn expand(chars: &[char], i: &mut usize, vars: &BTreeMap<String, String>) -> String {
+    let mut name = String::new();
+    if *i < chars.len() && chars[*i] == '{' {
+        *i += 1;
+        while *i < chars.len() && chars[*i] != '}' {
+            name.push(chars[*i]);
+            *i += 1;
+        }
+        *i += 1;
+    } else {
+        while *i < chars.len() && (chars[*i].is_ascii_alphanumeric() || chars[*i] == '_') {
+            name.push(chars[*i]);
+            *i += 1;
+        }
+    }
+    vars.get(&name).cloned().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(content: &str) -> VarMap {
+        let mut m = VarMap::new();
+        m.merge_str(content, Path::new("make.conf")).unwrap();
+        m
+    }
+
+    #[test]
+    fn quoted_multi_token() {
+        let m = parse("USE=\"a b c\"\n");
+        assert_eq!(m.get("USE"), Some("a b c"));
+    }
+
+    #[test]
+    fn variable_expansion() {
+        let m = parse("A=\"x\"\nB=\"${A}y\"\nC=\"$A z\"\n");
+        assert_eq!(m.get("B"), Some("xy"));
+        assert_eq!(m.get("C"), Some("x z"));
+    }
+
+    #[test]
+    fn line_continuation_and_comments() {
+        let m = parse("# comment\nUSE=\"a \\\nb\"\n");
+        assert_eq!(m.get("USE"), Some("a b"));
+    }
+}

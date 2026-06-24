@@ -1,14 +1,19 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Gentoo configuration: make.conf, profile stacking, USE resolution, package
+//! visibility, and package sets.
+//!
+//! This crate loads the configuration that drives dependency resolution and
+//! exposes it as an immutable, queryable [`snapshot::ResolvedConfig`].
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod error;
+pub mod makeconf;
+pub mod profile;
+pub mod sets;
+pub mod snapshot;
+pub mod stacking;
+pub mod use_resolution;
+pub mod visibility;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use error::ConfigError;
+pub use makeconf::VarMap;
+pub use profile::{ProfileNode, ProfileStack};
+pub use snapshot::ResolvedConfig;
