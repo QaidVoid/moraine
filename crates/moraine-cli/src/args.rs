@@ -41,10 +41,49 @@ pub struct Cli {
     #[arg(short = 'N', long)]
     pub newuse: bool,
 
-    /// Prompt before proceeding. In this read-only phase this resolves to the
-    /// pretend display.
+    /// Prompt before proceeding with any mutation.
     #[arg(short = 'a', long)]
     pub ask: bool,
+
+    /// Unmerge the named installed packages.
+    #[arg(short = 'C', long)]
+    pub unmerge: bool,
+
+    /// Remove installed packages not needed by the world or system sets.
+    #[arg(short = 'c', long)]
+    pub depclean: bool,
+
+    /// Remove installed versions superseded by a higher version in the slot.
+    #[arg(long)]
+    pub prune: bool,
+
+    /// Synchronize the configured repositories.
+    #[arg(long)]
+    pub sync: bool,
+
+    /// Resolve and apply pending CONFIG_PROTECT updates.
+    #[arg(long = "config-update")]
+    pub config_update: bool,
+
+    /// Resume the unfinished portion of the most recent transaction.
+    #[arg(long)]
+    pub resume: bool,
+
+    /// Build a binary package alongside merging each package.
+    #[arg(short = 'b', long)]
+    pub buildpkg: bool,
+
+    /// Build a binary package for each package without merging it.
+    #[arg(short = 'B', long)]
+    pub buildpkgonly: bool,
+
+    /// Prefer an available binary package over building from source.
+    #[arg(short = 'k', long)]
+    pub usepkg: bool,
+
+    /// Fetch binary packages from the configured binhost.
+    #[arg(short = 'g', long)]
+    pub getbinpkg: bool,
 
     /// Increase output detail. Repeat for more verbosity.
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
@@ -150,6 +189,12 @@ pub fn prepass(args: &[String]) -> Vec<String> {
         ('v', "--verbose"),
         ('1', "--oneshot"),
         ('t', "--tree"),
+        ('C', "--unmerge"),
+        ('c', "--depclean"),
+        ('b', "--buildpkg"),
+        ('B', "--buildpkgonly"),
+        ('k', "--usepkg"),
+        ('g', "--getbinpkg"),
     ];
 
     let mut out = Vec::with_capacity(args.len());

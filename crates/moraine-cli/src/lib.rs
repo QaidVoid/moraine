@@ -7,6 +7,7 @@
 //! diagnostics, and unread news. Nothing here builds, fetches, syncs, merges, or
 //! writes persisted state.
 
+pub mod action;
 pub mod args;
 pub mod config;
 pub mod corpus;
@@ -16,6 +17,7 @@ pub mod plan;
 pub mod render;
 pub mod run;
 pub mod sets;
+pub mod write;
 
 use miette::Diagnostic;
 use thiserror::Error;
@@ -80,14 +82,47 @@ pub fn render_report(diagnostic: &dyn Diagnostic) -> String {
     out
 }
 
-/// Dispatch the parsed command line through the read-only flow.
+/// Dispatch the parsed command line to its primary write or read action.
 ///
-/// Loads configuration, expands targets and sets, and prints the request that
-/// would be resolved together with the timing breakdown and any unread news.
-/// The full solve over a real system runs only when a repository and installed
-/// store are available; this phase is strictly read-only and returns a
-/// [`miette::Result`] so failures render through the reporter.
+/// Exactly one primary action runs per invocation. `--pretend` renders the plan
+/// for the selected action without performing it; otherwise the action runs
+/// through its engine. Conflicting actions produce a diagnostic and a non-zero
+/// exit.
 pub fn dispatch(cli: &Cli) -> miette::Result<()> {
+    use crate::action::{Action, select_action};
+    use crate::config::ConfigContext;
+
+    let action = select_action(cli).map_err(|message| miette::miette!("{message}"))?;
+    let roots = run::roots_from(cli);
+
+    if matches!(action, Action::Sync) {
+        return crate::write::sync(cli, &roots);
+    }
+
+    let ctx = ConfigContext::load(&roots).map_err(miette::Report::new)?;
+    match action {
+        Action::Sync => unreachable!("handled above"),
+        Action::Unmerge => crate::write::unmerge(cli, &ctx, &roots),
+        Action::Depclean => crate::write::depclean(cli, &ctx, &roots),
+        Action::Prune => crate::write::prune(cli, &ctx, &roots),
+        Action::ConfigUpdate => crate::write::config_update(cli, &ctx, &roots),
+        Action::Resume => crate::write::resume(cli, &ctx, &roots),
+        Action::Install => {
+            if cli.targets.is_empty() {
+                println!("No targets given. Pass atoms or package sets such as @world.");
+                Ok(())
+            } else if cli.pretend {
+                render_plan(cli)
+            } else {
+                crate::write::install(cli, &ctx, &roots)
+            }
+        }
+    }
+}
+
+/// Render the read-only resolution plan: the resolved targets, any unread news,
+/// and the timing breakdown. This is the `--pretend` view of the install action.
+pub fn render_plan(cli: &Cli) -> miette::Result<()> {
     use crate::config::installed_set_heads;
     use crate::news::{NewsEnv, render_news, unread_relevant};
     use std::collections::BTreeSet;

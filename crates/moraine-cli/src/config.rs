@@ -65,6 +65,12 @@ pub struct ConfigContext {
     pub profile: ProfileStack,
     /// The system architecture keyword.
     pub arch: String,
+    /// The `FEATURES` tokens from configuration.
+    pub features: Vec<String>,
+    /// The `CONFIG_PROTECT` paths from configuration.
+    pub config_protect: Vec<String>,
+    /// The `CONFIG_PROTECT_MASK` paths from configuration.
+    pub config_protect_mask: Vec<String>,
     /// The `@system` set members.
     pub system: Vec<String>,
     /// The `@selected` set members (world file contents).
@@ -96,6 +102,16 @@ impl ConfigContext {
                 .map_err(ConfigLoadError::MakeConf)?;
         }
         let arch = env.get("ARCH").unwrap_or_default().to_owned();
+        let tokens = |key: &str| {
+            env.get(key)
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let features = tokens("FEATURES");
+        let config_protect = tokens("CONFIG_PROTECT");
+        let config_protect_mask = tokens("CONFIG_PROTECT_MASK");
 
         let profile_layers: Vec<String> = profile
             .nodes
@@ -114,6 +130,9 @@ impl ConfigContext {
         Ok(ConfigContext {
             profile,
             arch,
+            features,
+            config_protect,
+            config_protect_mask,
             system,
             selected,
             world,
@@ -205,6 +224,9 @@ mod tests {
         let ctx = ConfigContext {
             profile: ProfileStack::default(),
             arch: "amd64".to_owned(),
+            features: Vec::new(),
+            config_protect: Vec::new(),
+            config_protect_mask: Vec::new(),
             system: vec!["sys-apps/baselayout".to_owned()],
             selected: vec!["app/editor".to_owned()],
             world: vec!["app/editor".to_owned(), "sys-apps/baselayout".to_owned()],

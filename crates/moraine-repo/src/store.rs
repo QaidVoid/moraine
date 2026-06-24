@@ -78,6 +78,12 @@ pub struct StoredEntry {
     pub idepend: String,
     /// `REQUIRED_USE` source text.
     pub required_use: String,
+    /// `SRC_URI` source text, needed to fetch and build from source.
+    #[serde(default)]
+    pub src_uri: String,
+    /// `LICENSE` source text.
+    #[serde(default)]
+    pub license: String,
     /// `KEYWORDS` tokens.
     pub keywords: Vec<String>,
     /// `IUSE` tokens.
@@ -90,6 +96,9 @@ pub struct StoredEntry {
     pub defined_phases: Vec<String>,
     /// `INHERIT` (direct eclass) tokens.
     pub inherit: Vec<String>,
+    /// `INHERITED` transitive eclass tokens.
+    #[serde(default)]
+    pub inherited: Vec<String>,
     /// The source cache file's `_mtime_`, used for incremental reimport.
     pub mtime: String,
     /// The source cache file's `_md5_`, used for incremental reimport.
@@ -427,12 +436,15 @@ mod tests {
             pdepend: String::new(),
             idepend: String::new(),
             required_use: String::new(),
+            src_uri: "https://example.com/src.tar.gz".to_owned(),
+            license: "GPL-2".to_owned(),
             keywords: vec!["amd64".to_owned(), "~arm64".to_owned()],
             iuse: vec!["ssl".to_owned()],
             properties: vec![],
             restrict: vec![],
             defined_phases: vec!["compile".to_owned()],
             inherit: vec!["toolchain".to_owned()],
+            inherited: vec!["toolchain".to_owned(), "multilib".to_owned()],
             mtime: "1700000000".to_owned(),
             md5: "deadbeef".to_owned(),
         }

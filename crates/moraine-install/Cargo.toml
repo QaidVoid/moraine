@@ -1,36 +1,27 @@
 [package]
-name = "moraine-cli"
+name = "moraine-install"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-clap = { version = "4.6.1", features = ["derive"] }
-miette = { version = "7.6.0", features = ["fancy"] }
-moraine-atom = { version = "0.1.0", path = "../moraine-atom" }
 moraine-binpkg = { version = "0.1.0", path = "../moraine-binpkg" }
 moraine-build = { version = "0.1.0", path = "../moraine-build" }
 moraine-common = { version = "0.1.0", path = "../moraine-common" }
 moraine-config = { version = "0.1.0", path = "../moraine-config" }
-moraine-eapi = { version = "0.1.0", path = "../moraine-eapi" }
-moraine-install = { version = "0.1.0", path = "../moraine-install" }
 moraine-merge = { version = "0.1.0", path = "../moraine-merge" }
-moraine-repo = { version = "0.1.0", path = "../moraine-repo" }
 moraine-resolve = { version = "0.1.0", path = "../moraine-resolve" }
 moraine-sync = { version = "0.1.0", path = "../moraine-sync" }
 moraine-vdb = { version = "0.1.0", path = "../moraine-vdb" }
 moraine-version = { version = "0.1.0", path = "../moraine-version" }
+rmp-serde = "1.3.1"
+serde = { version = "1.0.228", features = ["derive"] }
+tar = "0.4.46"
 thiserror = "2.0.18"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-
-[[bin]]
-name = "moraine"
-path = "src/main.rs"
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-insta = "1.48.0"
 tempfile = "3.27.0"
