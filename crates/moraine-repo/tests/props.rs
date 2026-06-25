@@ -23,6 +23,12 @@ fn atom_strategy() -> impl Strategy<Value = String> {
         if op.is_empty() {
             format!("{cat}/{pkg}{slot}")
         } else {
+            // The `~` operator may not carry a revision (PMS), so strip it.
+            let ver = if op == "~" {
+                ver.split("-r").next().unwrap_or(ver)
+            } else {
+                ver
+            };
             format!("{op}{cat}/{pkg}-{ver}{slot}")
         }
     })

@@ -141,19 +141,38 @@ impl VarMap {
     }
 }
 
+/// Fold physical lines into logical assignment lines: a trailing backslash is a
+/// continuation, and a newline inside an open quote becomes a space so a quoted
+/// value may span several lines (as `make.globals` and `make.conf` both do).
 fn join_continuations(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
-    let mut lines = content.lines().peekable();
-    while let Some(line) = lines.next() {
-        if let Some(stripped) = line.strip_suffix('\\') {
-            out.push_str(stripped);
-            if lines.peek().is_some() {
-                continue;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !in_single && chars.peek() == Some(&'\n') => {
+                // Backslash line continuation: drop both characters.
+                chars.next();
             }
-        } else {
-            out.push_str(line);
+            '\\' if !in_single => {
+                // A backslash escape; keep it for `parse_value` to interpret.
+                out.push('\\');
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push(c);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push(c);
+            }
+            '\n' if in_single || in_double => out.push(' '),
+            _ => out.push(c),
         }
-        out.push('\n');
     }
     out
 }
@@ -281,5 +300,17 @@ mod tests {
     fn line_continuation_and_comments() {
         let m = parse("# comment\nUSE=\"a \\\nb\"\n");
         assert_eq!(m.get("USE"), Some("a b"));
+    }
+
+    #[test]
+    fn quoted_value_spans_multiple_lines() {
+        let m = parse("FEATURES=\"a b\n          c d\"\n");
+        assert_eq!(
+            m.get("FEATURES")
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"]
+        );
     }
 }
