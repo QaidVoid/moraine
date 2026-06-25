@@ -130,7 +130,11 @@ fn reduce<'a>(
                 }
             }
         }
-        DepNode::AnyOf(branches) => {
+        // `^^`/`??` are REQUIRED_USE-only and never appear in dependency strings;
+        // treat them as any-of here defensively.
+        DepNode::AnyOf(branches)
+        | DepNode::ExactlyOneOf(branches)
+        | DepNode::AtMostOneOf(branches) => {
             // Each branch reduces to its own conjunction of atoms (nested groups
             // inside a branch are flattened into the branch's atom list, which is
             // an acceptable approximation for the common corpus).
@@ -195,7 +199,10 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 }
                 Ok(())
             }
-            DepNode::AllOf(c) | DepNode::AnyOf(c) => {
+            DepNode::AllOf(c)
+            | DepNode::AnyOf(c)
+            | DepNode::ExactlyOneOf(c)
+            | DepNode::AtMostOneOf(c) => {
                 for n in c {
                     self.validate_node(cp, n, features)?;
                 }

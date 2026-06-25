@@ -184,7 +184,9 @@ fn collect_atoms<'a>(
                 }
             }
         }
-        DepNode::AnyOf(branches) => {
+        DepNode::AnyOf(branches)
+        | DepNode::ExactlyOneOf(branches)
+        | DepNode::AtMostOneOf(branches) => {
             for b in branches {
                 collect_atoms(b, parent_use, true, out);
             }

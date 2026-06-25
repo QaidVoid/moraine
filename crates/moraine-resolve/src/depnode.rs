@@ -102,6 +102,12 @@ pub enum DepNode {
     AllOf(Vec<DepNode>),
     /// An any-of (`||`) group: at least one child must hold.
     AnyOf(Vec<DepNode>),
+    /// An exactly-one-of (`^^`) group: exactly one child must hold. Only valid in
+    /// REQUIRED_USE.
+    ExactlyOneOf(Vec<DepNode>),
+    /// An at-most-one-of (`??`) group: at most one child must hold. Only valid in
+    /// REQUIRED_USE.
+    AtMostOneOf(Vec<DepNode>),
     /// A USE-conditional group.
     Conditional {
         /// The controlling flag.

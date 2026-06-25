@@ -49,6 +49,7 @@ fn parse_seq(tokens: &[String], pos: &mut usize) -> Vec<DepNode> {
             break;
         }
         if tok == "||" || tok == "^^" || tok == "??" {
+            let op = tok.clone();
             *pos += 1;
             // Expect "(".
             if *pos < tokens.len() && tokens[*pos] == "(" {
@@ -58,9 +59,11 @@ fn parse_seq(tokens: &[String], pos: &mut usize) -> Vec<DepNode> {
             if *pos < tokens.len() && tokens[*pos] == ")" {
                 *pos += 1;
             }
-            // `||` and `^^` are encoded as any-of; `??` (at-most-one) is encoded
-            // as a satisfiable group (its constraint is enforced only loosely).
-            nodes.push(DepNode::AnyOf(body));
+            nodes.push(match op.as_str() {
+                "^^" => DepNode::ExactlyOneOf(body),
+                "??" => DepNode::AtMostOneOf(body),
+                _ => DepNode::AnyOf(body),
+            });
             continue;
         }
         if let Some(cond) = tok.strip_suffix('?') {
@@ -145,7 +148,9 @@ fn node_satisfied(node: &DepNode, use_set: &BTreeSet<String>) -> bool {
     match node {
         DepNode::Leaf(atom) => flag_state(atom, use_set),
         DepNode::AllOf(children) => children.iter().all(|c| node_satisfied(c, use_set)),
-        DepNode::AnyOf(branches) => branches.iter().any(|b| node_satisfied(b, use_set)),
+        DepNode::AnyOf(branches) => matched_members(branches, use_set) >= 1,
+        DepNode::ExactlyOneOf(branches) => matched_members(branches, use_set) == 1,
+        DepNode::AtMostOneOf(branches) => matched_members(branches, use_set) <= 1,
         DepNode::Conditional { flag, sense, body } => {
             let live = use_set.contains(flag) == *sense;
             if live {
@@ -155,6 +160,24 @@ fn node_satisfied(node: &DepNode, use_set: &BTreeSet<String>) -> bool {
             }
         }
     }
+}
+
+/// Count the matched members of a grouped REQUIRED_USE constraint. An immediate
+/// USE-conditional child whose condition is inactive is not a member of the
+/// group (PMS), so it is excluded from the count rather than counting as matched.
+fn matched_members(children: &[DepNode], use_set: &BTreeSet<String>) -> usize {
+    children
+        .iter()
+        .filter(|c| {
+            if let DepNode::Conditional { flag, sense, .. } = c {
+                // Inactive conditional child: not a member.
+                use_set.contains(flag) == *sense
+            } else {
+                true
+            }
+        })
+        .filter(|c| node_satisfied(c, use_set))
+        .count()
 }
 
 /// Render a REQUIRED_USE node for an explanation.
@@ -174,6 +197,18 @@ pub fn render(node: &DepNode) -> String {
                 branches.iter().map(render).collect::<Vec<_>>().join(" ")
             )
         }
+        DepNode::ExactlyOneOf(branches) => {
+            format!(
+                "^^ ( {} )",
+                branches.iter().map(render).collect::<Vec<_>>().join(" ")
+            )
+        }
+        DepNode::AtMostOneOf(branches) => {
+            format!(
+                "?? ( {} )",
+                branches.iter().map(render).collect::<Vec<_>>().join(" ")
+            )
+        }
         DepNode::Conditional { flag, sense, body } => {
             let prefix = if *sense { "" } else { "!" };
             format!(
@@ -181,5 +216,59 @@ pub fn render(node: &DepNode) -> String {
                 body.iter().map(render).collect::<Vec<_>>().join(" ")
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uses(flags: &[&str]) -> BTreeSet<String> {
+        flags.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn check(input: &str, flags: &[&str]) -> bool {
+        let node = parse_required_use(input);
+        matches!(
+            evaluate_required_use(&node, &uses(flags)),
+            RequiredUseOutcome::Satisfied
+        )
+    }
+
+    #[test]
+    fn exactly_one_of() {
+        assert!(check("^^ ( a b c )", &["a"]));
+        assert!(!check("^^ ( a b c )", &["a", "b"]));
+        assert!(!check("^^ ( a b c )", &[]));
+    }
+
+    #[test]
+    fn at_most_one_of() {
+        assert!(check("?? ( a b )", &[]));
+        assert!(check("?? ( a b )", &["a"]));
+        assert!(!check("?? ( a b )", &["a", "b"]));
+    }
+
+    #[test]
+    fn any_of_still_at_least_one() {
+        assert!(check("|| ( a b )", &["b"]));
+        assert!(!check("|| ( a b )", &[]));
+    }
+
+    #[test]
+    fn inactive_conditional_is_not_a_member() {
+        // `a? ( x )` is inactive (a off), so it is not a member of the any-of;
+        // with b off too, the group has no matched member and is violated.
+        assert!(!check("|| ( a? ( x ) b )", &["x"]));
+        // Enabling b satisfies it.
+        assert!(check("|| ( a? ( x ) b )", &["x", "b"]));
+    }
+
+    #[test]
+    fn conditional_and_plain_leaves() {
+        assert!(check("a? ( b )", &["a", "b"]));
+        assert!(!check("a? ( b )", &["a"]));
+        assert!(check("a? ( b )", &[]));
+        assert!(check("!a? ( b )", &["b"]));
     }
 }
