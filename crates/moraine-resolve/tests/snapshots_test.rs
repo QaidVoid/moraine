@@ -50,6 +50,7 @@ fn serialized_order_snapshot() {
         ],
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let tasks = serialize(&solution).expect("serializes");
     let rendered: String = tasks

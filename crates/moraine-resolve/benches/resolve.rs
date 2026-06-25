@@ -38,6 +38,7 @@ fn linear_solution(n: usize) -> ResolvedSolution {
         edges,
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     }
 }
 

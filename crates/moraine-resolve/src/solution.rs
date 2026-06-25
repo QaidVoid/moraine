@@ -147,6 +147,18 @@ impl ResolvedPackage {
     }
 }
 
+/// A configuration change autounmask must report for a selected package that is
+/// only installable after accepting a keyword or license.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutounmaskChange {
+    /// The `category/package`.
+    pub cp: String,
+    /// The exact version that needs the change.
+    pub version: Version,
+    /// The keyword/license acceptance required.
+    pub change: crate::source::AcceptChange,
+}
+
 /// The full output of a successful resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvedSolution {
@@ -158,6 +170,8 @@ pub struct ResolvedSolution {
     pub blockers: Vec<RecordedBlocker>,
     /// The number of conflict-driven backjumps the solver performed.
     pub backtracks: u32,
+    /// Keyword/license acceptance changes required by newly-merged packages.
+    pub autounmask: Vec<AutounmaskChange>,
 }
 
 impl ResolvedSolution {

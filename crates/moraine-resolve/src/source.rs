@@ -66,6 +66,45 @@ pub struct InstalledMeta {
     pub slot_bindings: Vec<(String, String, Option<String>)>,
 }
 
+/// The configuration change needed to make a soft-masked package installable,
+/// for autounmask reporting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptChange {
+    /// The keyword to accept (for example `~amd64` or `**`), if keyword-masked.
+    pub keyword: Option<String>,
+    /// The licenses that must be accepted, if license-masked.
+    pub licenses: Vec<String>,
+}
+
+impl AcceptChange {
+    /// Whether this change carries no required acceptance.
+    pub fn is_empty(&self) -> bool {
+        self.keyword.is_none() && self.licenses.is_empty()
+    }
+}
+
+/// A package version's installability, distinguishing autounmaskable soft masks
+/// (keyword/license) from hard masks (`package.mask`), which autounmask leaves
+/// alone by default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Acceptability {
+    /// Installable with no configuration change.
+    Visible,
+    /// Installable only after accepting the given keyword/license change.
+    NeedsAccept(AcceptChange),
+    /// Blocked by a hard mask; not autounmasked.
+    HardMasked,
+}
+
+impl Acceptability {
+    /// Whether autounmask may pull this version in. Like Portage's default, a
+    /// `**` keyword (broken/empty KEYWORDS, typically a live ebuild) is not
+    /// autounmasked; only `~arch` keywords and licenses are.
+    pub fn is_autounmaskable(&self) -> bool {
+        matches!(self, Acceptability::NeedsAccept(c) if c.keyword.as_deref() != Some("**"))
+    }
+}
+
 /// The data the Gentoo provider needs about packages, configuration, and the
 /// installed store.
 pub trait ResolveSource {
@@ -76,6 +115,25 @@ pub trait ResolveSource {
     /// Whether the given package version is visible (passes package.mask and
     /// keyword acceptance). USE masking is reflected through `resolved_use`.
     fn is_visible(&self, meta: &PackageMeta) -> bool;
+
+    /// Whether a binary package is available for `cp` at `version` (local or from
+    /// the binhost). The default is `false`; `RealSource` consults the binhost so
+    /// version selection can prefer a binary over a higher source-only version
+    /// under `getbinpkg`, like Portage.
+    fn has_binary(&self, _cp: &str, _version: &Version) -> bool {
+        false
+    }
+
+    /// Classify a version for autounmask: visible, soft-masked (keyword/license,
+    /// reportable as a change), or hard-masked. The default treats any invisible
+    /// package as hard-masked; `RealSource` distinguishes the soft cases.
+    fn acceptability(&self, meta: &PackageMeta) -> Acceptability {
+        if self.is_visible(meta) {
+            Acceptability::Visible
+        } else {
+            Acceptability::HardMasked
+        }
+    }
 
     /// The resolved enabled USE flags for the given package version.
     fn resolved_use(&self, meta: &PackageMeta) -> BTreeSet<String>;

@@ -112,6 +112,7 @@ fn fixture() -> (Vec<Task>, ResolvedSolution, FixtureSource) {
         ],
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let source = FixtureSource {
         installed: vec![

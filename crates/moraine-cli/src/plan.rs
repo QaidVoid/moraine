@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use moraine_resolve::{ResolveSource, ResolvedSolution, Task, TaskKind};
+use moraine_resolve::{Acceptability, ResolveSource, ResolvedSolution, Task, TaskKind};
 use tracing::instrument;
 
 use crate::render::{Acceptance, MergeEntry, MergePlan, Operation, UseFlag};
@@ -51,6 +51,7 @@ fn build_entry<S: ResolveSource>(
             repository: None,
             binary: false,
             fetched: false,
+            build_id: None,
             use_flags: Vec::new(),
             fetch_size: None,
             parents: parents_of(&task.cp, solution),
@@ -70,7 +71,25 @@ fn build_entry<S: ResolveSource>(
     let installed_use: BTreeSet<String> = installed_same_slot
         .map(|i| i.use_enabled.clone())
         .unwrap_or_default();
-    let iuse: BTreeSet<String> = resolved.map(|_| enabled.clone()).unwrap_or_default();
+    // The selected candidate's metadata drives the display universe (its full
+    // IUSE so disabled flags show as `-flag`) and the keyword acceptance marker.
+    let meta = source
+        .versions_of(&task.cp)
+        .into_iter()
+        .find(|m| m.version.as_str() == task.version && m.slot == task.slot);
+    let iuse: BTreeSet<String> = meta
+        .as_ref()
+        .map(|m| m.iuse.clone())
+        .unwrap_or_else(|| enabled.clone());
+    // A package the resolver could only reach via a `~arch` keyword is marked
+    // testing (`~`), matching `emerge`; a license-only change keeps it stable.
+    let acceptance = match meta.as_ref().map(|m| source.acceptability(m)) {
+        Some(Acceptability::NeedsAccept(c)) if c.keyword.as_deref() == Some("**") => {
+            Acceptance::Masked
+        }
+        Some(Acceptability::NeedsAccept(c)) if c.keyword.is_some() => Acceptance::Testing,
+        _ => Acceptance::Stable,
+    };
     let use_flags = use_diff(
         &enabled,
         &installed_use,
@@ -83,12 +102,13 @@ fn build_entry<S: ResolveSource>(
         version: task.version.clone(),
         old_version,
         operation,
-        acceptance: Acceptance::Stable,
+        acceptance,
         slot: task.slot.clone(),
         subslot: resolved.and_then(|r| r.subslot.clone()),
         repository: None,
         binary: false,
         fetched: false,
+        build_id: None,
         use_flags,
         fetch_size: None,
         parents: parents_of(&task.cp, solution),
@@ -144,6 +164,7 @@ fn use_diff(
                 removed: true,
                 group: None,
                 hidden: false,
+                forced: false,
             });
             continue;
         }
@@ -155,6 +176,7 @@ fn use_diff(
             removed: false,
             group: None,
             hidden: false,
+            forced: false,
         });
     }
     flags

@@ -133,6 +133,24 @@ impl IndexedBinhost {
         None
     }
 
+    /// Whether the binhost index lists a package for `cpv`.
+    pub fn contains(&self, cpv: &str) -> bool {
+        self.entry(cpv).is_some()
+    }
+
+    /// Every `cpv` the binhost index lists, for binary-aware version selection.
+    pub fn cpvs(&self) -> impl Iterator<Item = &str> {
+        self.index.packages.iter().map(|e| e.cpv.as_str())
+    }
+
+    /// The binary package build id recorded for `cpv`, if present.
+    pub fn build_id(&self, cpv: &str) -> Option<String> {
+        self.entry(cpv)?
+            .metadata
+            .get_str("BUILD_ID")
+            .map(|s| s.trim().to_owned())
+    }
+
     /// The download size recorded for `cpv` in the index, if present.
     pub fn size_of(&self, cpv: &str) -> Option<u64> {
         self.entry(cpv)?

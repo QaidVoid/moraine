@@ -77,10 +77,6 @@ pub enum ContainerError {
 /// Errors produced while parsing or emitting a binhost `Packages` index.
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
-    /// A stanza key line was not in `KEY: VALUE` form.
-    #[error("malformed index line: `{0}`")]
-    MalformedLine(String),
-
     /// The index declared a version newer than this crate supports.
     #[error("unsupported index version {found} (supported up to {supported})")]
     UnsupportedVersion {

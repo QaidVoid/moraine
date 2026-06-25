@@ -17,7 +17,7 @@ use moraine_version::Version;
 
 use crate::normalize::normalize_depspec;
 use crate::required_use::parse_required_use;
-use crate::source::{InstalledMeta, PackageMeta, ResolveSource};
+use crate::source::{AcceptChange, Acceptability, InstalledMeta, PackageMeta, ResolveSource};
 
 /// A resolution source over a repository index, installed store, and resolved
 /// configuration.
@@ -27,6 +27,9 @@ pub struct RealSource<'a> {
     config: &'a ResolvedConfig,
     /// Whether to evaluate keyword acceptance as stable.
     stable: bool,
+    /// `cp-version` strings that a binary package is available for, so version
+    /// selection can prefer a binary. Empty when `getbinpkg` is off.
+    binary_cpvs: std::collections::HashSet<String>,
 }
 
 impl<'a> RealSource<'a> {
@@ -37,12 +40,20 @@ impl<'a> RealSource<'a> {
             vdb,
             config,
             stable: false,
+            binary_cpvs: std::collections::HashSet::new(),
         }
     }
 
     /// Set whether keyword acceptance is evaluated as stable.
     pub fn with_stable(mut self, stable: bool) -> Self {
         self.stable = stable;
+        self
+    }
+
+    /// Provide the set of `cp-version` strings that have a binary package, so
+    /// version selection prefers them under `getbinpkg`.
+    pub fn with_binaries(mut self, cpvs: std::collections::HashSet<String>) -> Self {
+        self.binary_cpvs = cpvs;
         self
     }
 
@@ -170,6 +181,69 @@ impl ResolveSource for RealSource<'_> {
             return true;
         }
         false
+    }
+
+    fn has_binary(&self, cp: &str, version: &Version) -> bool {
+        !self.binary_cpvs.is_empty() && self.binary_cpvs.contains(&format!("{cp}-{version}"))
+    }
+
+    fn acceptability(&self, meta: &PackageMeta) -> Acceptability {
+        let Some((category, package)) = Self::split_cp(&meta.cp) else {
+            return Acceptability::HardMasked;
+        };
+        for cand in self.repo.match_atom_str(&meta.cp) {
+            let store = &self.repo.repos()[cand.repo_order].store;
+            let interner = store.interner();
+            let entry = cand.entry;
+            if entry.version != meta.version {
+                continue;
+            }
+            let pref = PackageRef {
+                category: interner.intern(category),
+                package: interner.intern(package),
+                version: &entry.version,
+                slot: Some(entry.slot),
+                subslot: entry.subslot,
+                repo: Some(entry.repository),
+            };
+            let ebuild_keywords: Vec<String> = entry
+                .keywords
+                .iter()
+                .filter_map(|k| interner.resolve(*k).map(|x| x.to_string()))
+                .collect();
+            let keywords = self.config.stacked_keywords(&pref, &ebuild_keywords);
+            let extra = self.config.package_keywords(&pref);
+            let mut change = AcceptChange::default();
+            match self.config.visibility(&pref, &keywords, &extra) {
+                moraine_config::Visibility::Visible => {}
+                moraine_config::Visibility::HardMasked(_) => return Acceptability::HardMasked,
+                moraine_config::Visibility::NeedsKeyword => {
+                    change.keyword = Some(format!("~{}", self.config.arch));
+                }
+                moraine_config::Visibility::NeedsDoubleStar => {
+                    change.keyword = Some("**".to_owned());
+                }
+            }
+            if !meta.license.is_empty() {
+                let iuse: Vec<String> = entry
+                    .iuse
+                    .iter()
+                    .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
+                    .collect();
+                let use_set = self.config.effective_use(&pref, &iuse, self.stable).enabled;
+                let reduced = crate::license::reduce_license(&meta.license, &use_set);
+                let missing = self.config.missing_licenses(&reduced, &pref);
+                if !missing.is_empty() {
+                    change.licenses = missing.into_iter().collect();
+                }
+            }
+            return if change.is_empty() {
+                Acceptability::Visible
+            } else {
+                Acceptability::NeedsAccept(change)
+            };
+        }
+        Acceptability::HardMasked
     }
 
     fn resolved_use(&self, meta: &PackageMeta) -> BTreeSet<String> {

@@ -111,7 +111,27 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
                             .any(|i| i.version == m.version && i.slot == m.slot)
                 })
                 .collect();
-            relaxed.sort_by(|a, b| b.version.cmp(&a.version));
+            if relaxed.is_empty() {
+                // Autounmask pass: include soft-masked (keyword/license)
+                // candidates so the solver can resolve through them. The required
+                // acceptance change is reported after resolution; hard-masked
+                // (`package.mask`) versions stay excluded.
+                relaxed = self
+                    .source
+                    .versions_of(cp)
+                    .into_iter()
+                    .filter(|m| {
+                        m.slot == slot
+                            && range.contains(&m.version)
+                            && self.source.acceptability(m).is_autounmaskable()
+                    })
+                    .collect();
+            }
+            relaxed.sort_by(|a, b| {
+                let ab = self.source.has_binary(cp, &a.version);
+                let bb = self.source.has_binary(cp, &b.version);
+                bb.cmp(&ab).then_with(|| b.version.cmp(&a.version))
+            });
             return relaxed.into_iter().map(|m| m.version).collect();
         }
 
@@ -126,7 +146,11 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
         strict.sort_by(|a, b| {
             let ai = installed_versions.contains(&a.version);
             let bi = installed_versions.contains(&b.version);
-            bi.cmp(&ai).then_with(|| b.version.cmp(&a.version))
+            let ab = self.source.has_binary(cp, &a.version);
+            let bb = self.source.has_binary(cp, &b.version);
+            bi.cmp(&ai)
+                .then_with(|| bb.cmp(&ab))
+                .then_with(|| b.version.cmp(&a.version))
         });
         strict.into_iter().map(|m| m.version).collect()
     }

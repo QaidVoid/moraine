@@ -448,14 +448,37 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         }
 
         // PMS || resolution: prefer a branch already fully satisfied by the
-        // installed set, then the leftmost branch. Without the first key an
-        // already-installed member (e.g. gentoo-kernel-bin) loses to a textually
-        // earlier source variant and drags in its whole build tree; the leftmost
-        // tiebreak keeps Portage's default order when nothing is installed.
+        // installed set. When the branches are version windows of one package
+        // (cabal-style `|| ( <X >=Y )`), prefer the highest version next, like
+        // Portage; otherwise keep the leftmost (so an installed member such as
+        // gentoo-kernel-bin still wins and Portage's default order holds).
+        let same_cp = {
+            let mut lead = branches
+                .iter()
+                .filter_map(|(idx, _, _)| Self::branch_lead_cp(&group[*idx]));
+            match lead.next() {
+                Some(first) => lead.all(|cp| cp == first),
+                None => false,
+            }
+        };
+        let best: std::collections::HashMap<usize, Option<Version>> = if same_cp {
+            branches
+                .iter()
+                .map(|(idx, _, _)| (*idx, self.branch_best_version(&group[*idx])))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
         branches.sort_by(|a, b| {
             self.branch_needs_new(&a.1)
                 .cmp(&self.branch_needs_new(&b.1))
-                .then(a.0.cmp(&b.0))
+                .then_with(|| {
+                    if same_cp {
+                        best[&b.0].cmp(&best[&a.0]).then(a.0.cmp(&b.0))
+                    } else {
+                        a.0.cmp(&b.0)
+                    }
+                })
         });
 
         // The chosen branch is the first after ordering: emit its full
@@ -495,6 +518,35 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         })
     }
 
+    /// The category/package of a branch's first required (non-blocker) atom.
+    fn branch_lead_cp<'b>(branch: &'b [&NormAtom]) -> Option<&'b str> {
+        branch
+            .iter()
+            .find(|a| a.blocker == BlockerKind::None)
+            .map(|a| a.cp.as_str())
+    }
+
+    /// The highest selectable version satisfying every same-`cp` atom of a
+    /// branch, used to prefer the newest window of a same-package `||` version
+    /// range (cabal-style `|| ( <X >=Y )`), as Portage does.
+    fn branch_best_version(&self, branch: &[&NormAtom]) -> Option<Version> {
+        let cp = Self::branch_lead_cp(branch)?;
+        self.source
+            .versions_of(cp)
+            .into_iter()
+            .filter(|m| {
+                branch
+                    .iter()
+                    .filter(|a| a.blocker == BlockerKind::None && a.cp == cp)
+                    .all(|a| version_satisfies(a, &m.version) && slot_matches(a, m))
+            })
+            .filter(|m| {
+                self.source.is_visible(m) || self.source.acceptability(m).is_autounmaskable()
+            })
+            .map(|m| m.version)
+            .max()
+    }
+
     /// The required atom's matching visible versions grouped into one `(cp,
     /// slot)` alternative per slot, ordered installed-slot first then by highest
     /// version, so a slotless atom becomes a disjunction over its available slots
@@ -519,6 +571,24 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 continue;
             }
             by_slot.entry(m.slot.clone()).or_default().push(m.version);
+        }
+        if by_slot.is_empty() {
+            // Autounmask: no visible version satisfies the atom, so admit
+            // soft-masked (keyword/license) versions as alternatives. The change
+            // is reported after resolution; hard masks stay excluded.
+            for m in self.source.versions_of(&atom.cp) {
+                if !version_satisfies(atom, &m.version) || !slot_matches(atom, &m) {
+                    continue;
+                }
+                if !self.source.acceptability(&m).is_autounmaskable() {
+                    continue;
+                }
+                let cand_use = self.source.resolved_use(&m);
+                if !use_deps_satisfied(atom, &cand_use, &m.iuse, parent_use, features) {
+                    continue;
+                }
+                by_slot.entry(m.slot.clone()).or_default().push(m.version);
+            }
         }
         self.to_alternatives(&atom.cp, by_slot)
     }

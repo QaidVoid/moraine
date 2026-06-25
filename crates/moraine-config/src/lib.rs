@@ -23,4 +23,5 @@ pub use loader::{RepoMaskInput, resolve_config};
 pub use makeconf::VarMap;
 pub use profile::{ProfileNode, ProfileStack};
 pub use snapshot::{ResolvedConfig, Visibility};
+pub use use_resolution::{UseExpandGroup, use_expand_groups};
 pub use visibility::MaskReason;

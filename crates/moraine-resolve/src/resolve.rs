@@ -15,9 +15,10 @@ use crate::error::ResolveError;
 use crate::normalize::normalize_atom;
 use crate::provider::{GentooProvider, REQUEST_CP, split_key};
 use crate::solution::{
-    BlockVictim, DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, SlotBinding,
+    AutounmaskChange, BlockVictim, DepClass, DepEdge, RecordedBlocker, ResolvedPackage,
+    ResolvedSolution, SlotBinding,
 };
-use crate::source::{PackageMeta, ResolveSource};
+use crate::source::{Acceptability, PackageMeta, ResolveSource};
 
 /// The package manager's own `category/package`, which a blocker may never
 /// uninstall.
@@ -85,12 +86,25 @@ fn assemble_solution<S: ResolveSource>(
     let mut packages: Vec<ResolvedPackage> = Vec::new();
     let mut edges: Vec<DepEdge> = Vec::new();
     let mut blockers: Vec<RecordedBlocker> = Vec::new();
+    let mut autounmask: Vec<AutounmaskChange> = Vec::new();
 
     for (cp, slots) in &selected {
         for (version, meta) in slots {
             let resolved_use = source.resolved_use(meta);
             let features = features_for(&meta.eapi);
             let already_installed = source.installed_matches(cp, version, &meta.slot);
+
+            // Autounmask: a newly-merged package the solver could only reach via a
+            // soft mask records the keyword/license change the user must accept.
+            if !already_installed
+                && let Acceptability::NeedsAccept(change) = source.acceptability(meta)
+            {
+                autounmask.push(AutounmaskChange {
+                    cp: cp.clone(),
+                    version: version.clone(),
+                    change,
+                });
+            }
 
             // Slot-operator rebuild detection: if this package is installed and
             // recorded a `:=` binding whose provider is now selected with a
@@ -182,11 +196,14 @@ fn assemble_solution<S: ResolveSource>(
     });
     blockers.dedup();
 
+    autounmask.sort_by(|a, b| a.cp.cmp(&b.cp).then_with(|| a.version.cmp(&b.version)));
+
     Ok(ResolvedSolution {
         packages,
         edges,
         blockers,
         backtracks: 0,
+        autounmask,
     })
 }
 

@@ -6,11 +6,165 @@
 //! recomputes resolution decisions, which keeps the output snapshot-testable
 //! against constructed fixtures with no real Gentoo system.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 
+use moraine_config::UseExpandGroup;
+use moraine_resolve::{AutounmaskChange, DepEdge};
 use tracing::instrument;
+
+/// Render the autounmask changes emerge-style: each soft-masked package shows the
+/// `# required by` chain up to the requested argument, then the
+/// `package.accept_keywords` / `package.license` line to add. Returns an empty
+/// string when no changes are required.
+pub fn render_autounmask(
+    changes: &[AutounmaskChange],
+    plan: &MergePlan,
+    edges: &[DepEdge],
+    args: &BTreeSet<String>,
+) -> String {
+    if changes.is_empty() {
+        return String::new();
+    }
+
+    // `cp -> cp-version::repo` for every merged entry, used in the reason chain.
+    let cpv: HashMap<&str, String> = plan
+        .entries
+        .iter()
+        .map(|e| {
+            let mut s = format!("{}-{}", e.cp, e.version);
+            if let Some(r) = &e.repository {
+                let _ = write!(s, "::{r}");
+            }
+            (e.cp.as_str(), s)
+        })
+        .collect();
+
+    // `child cp -> requirer cps`, from the dependency edges.
+    let mut parents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in edges {
+        if e.from != e.to {
+            parents
+                .entry(e.to.as_str())
+                .or_default()
+                .push(e.from.as_str());
+        }
+    }
+
+    // A chain ends at a requested argument or a graph root (no requirer), which
+    // also breaks dependency cycles cleanly.
+    let is_terminus = |cp: &str| args.contains(cp) || parents.get(cp).is_none_or(Vec::is_empty);
+    let req_line = |cp: &str| {
+        let label = cpv.get(cp).cloned().unwrap_or_else(|| cp.to_owned());
+        paint(&format!("# required by {label}"), "2")
+    };
+    let arg_line = |cp: &str| {
+        let pn = cp.rsplit('/').next().unwrap_or(cp);
+        paint(&format!("# required by {pn} (argument)"), "2")
+    };
+
+    // Breadth-first search up through requirers to the nearest terminus, so the
+    // shortest representative path is shown, matching emerge's intent.
+    let chain_for = |start: &str| -> Vec<String> {
+        if is_terminus(start) {
+            return vec![arg_line(start)];
+        }
+        let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::from([start]);
+        let mut prev: HashMap<&str, &str> = HashMap::new();
+        let mut visited: HashSet<&str> = HashSet::from([start]);
+        let mut terminus: Option<&str> = None;
+        'bfs: while let Some(node) = queue.pop_front() {
+            for &p in parents.get(node).map(Vec::as_slice).unwrap_or(&[]) {
+                if !visited.insert(p) {
+                    continue;
+                }
+                prev.insert(p, node);
+                if is_terminus(p) {
+                    terminus = Some(p);
+                    break 'bfs;
+                }
+                queue.push_back(p);
+            }
+        }
+        let Some(term) = terminus else {
+            return vec![arg_line(start)];
+        };
+        let mut path = Vec::new();
+        let mut cur = term;
+        while cur != start {
+            path.push(cur);
+            cur = prev[cur];
+        }
+        path.reverse();
+        let mut out: Vec<String> = path.iter().map(|cp| req_line(cp)).collect();
+        out.push(arg_line(term));
+        out
+    };
+
+    let mut keyword_block: Vec<String> = Vec::new();
+    let mut license_block: Vec<String> = Vec::new();
+    for c in changes {
+        let atom = paint(&format!("={}-{}", c.cp, c.version), "32");
+        if let Some(kw) = &c.change.keyword {
+            keyword_block.extend(chain_for(&c.cp));
+            keyword_block.push(format!("{atom} {kw}"));
+        }
+        if !c.change.licenses.is_empty() {
+            license_block.extend(chain_for(&c.cp));
+            license_block.push(format!("{atom} {}", c.change.licenses.join(" ")));
+        }
+    }
+
+    let mut out = String::new();
+    if !keyword_block.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{}",
+            paint(
+                "The following keyword changes are necessary to proceed:",
+                "33"
+            )
+        );
+        out.push_str(
+            " (see \"package.accept_keywords\" in the portage(5) man page for more details)\n",
+        );
+        for line in keyword_block {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    if !license_block.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{}",
+            paint(
+                "The following license changes are necessary to proceed:",
+                "33"
+            )
+        );
+        out.push_str(" (see \"package.license\" in the portage(5) man page for more details)\n");
+        for line in license_block {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    out
+}
+
+/// Fold flat `prefix_value` USE flags into their USE_EXPAND group, stripping the
+/// prefix for display and marking hidden groups for suppression. `groups` must
+/// be ordered longest-prefix first so the most specific group wins.
+pub fn apply_use_expand_groups(flags: &mut [UseFlag], groups: &[UseExpandGroup]) {
+    for flag in flags.iter_mut() {
+        if flag.group.is_some() {
+            continue;
+        }
+        if let Some(g) = groups.iter().find(|g| flag.name.starts_with(&g.prefix)) {
+            flag.name = flag.name[g.prefix.len()..].to_owned();
+            flag.group = Some(g.name.clone());
+            flag.hidden = g.hidden;
+        }
+    }
+}
 
 /// Whether to emit ANSI color: true only when stdout is an interactive terminal,
 /// so captured output (tests, pipes, redirects) stays plain.
@@ -87,6 +241,9 @@ pub struct UseFlag {
     pub group: Option<String>,
     /// Whether the flag's group is hidden and should be suppressed.
     pub hidden: bool,
+    /// Whether the flag is forced or masked (`use.force`/`use.mask`), shown
+    /// parenthesized like `emerge`.
+    pub forced: bool,
 }
 
 /// One entry in the merge plan.
@@ -113,6 +270,8 @@ pub struct MergeEntry {
     pub binary: bool,
     /// Whether the binary package is fetched from a binhost (`g`).
     pub fetched: bool,
+    /// The binary package build id, shown as a `-N` version suffix like `emerge`.
+    pub build_id: Option<String>,
     /// The USE-flag diff against the installed package.
     pub use_flags: Vec<UseFlag>,
     /// The download size in bytes when a fetch is required.
@@ -153,8 +312,11 @@ pub fn render_merge_list(plan: &MergePlan, verbose: bool) -> String {
 
 /// Render a single `[ebuild ...]` merge-list line.
 pub fn render_entry(entry: &MergeEntry, verbose: bool) -> String {
+    // `emerge` shows `:slot/subslot` after the version when the slot is not the
+    // default or carries a distinguishing sub-slot (for example `ghc-9.2.8:0/9.2.8`).
     let mut slot_suffix = String::new();
-    if entry.slot != DEFAULT_SLOT {
+    let interesting_subslot = entry.subslot.as_deref().is_some_and(|s| s != entry.slot);
+    if entry.slot != DEFAULT_SLOT || interesting_subslot {
         let mut slot = entry.slot.clone();
         if let Some(sub) = &entry.subslot {
             let _ = write!(slot, "/{sub}");
@@ -171,10 +333,16 @@ pub fn render_entry(entry: &MergeEntry, verbose: bool) -> String {
         paint("ebuild", "32")
     };
     let indicator = paint(&indicator_block(entry), operation_color(entry.operation));
+    // A binary package shows its build id as a `-N` version suffix.
+    let mut version = entry.version.clone();
+    if entry.binary
+        && let Some(build_id) = &entry.build_id
+    {
+        let _ = write!(version, "-{build_id}");
+    }
     let mut line = format!(
-        "[{label} {indicator}] {}{slot_suffix}-{}",
+        "[{label} {indicator}] {}-{version}{slot_suffix}",
         paint(&entry.cp, "32"),
-        entry.version
     );
     if let Some(old) = &entry.old_version {
         let _ = write!(line, " {}", paint(&format!("[{old}]"), "33"));
@@ -267,21 +435,46 @@ pub fn render_use_string(flags: &[UseFlag]) -> String {
 }
 
 /// Render the flag tokens for one group.
+///
+/// Tokens are grouped enabled-first, then disabled, then removed (Portage's
+/// default, non-`--alphabetical` order). Each group preserves the caller's
+/// alphabetical order.
 fn render_flag_group(flags: &[&UseFlag]) -> String {
-    let mut tokens: Vec<String> = Vec::new();
+    let mut enabled: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
     for flag in flags {
         if flag.removed {
             // Removed flags: yellow, matching `emerge`'s `(-flag*)`.
-            tokens.push(paint(&format!("(-{}*)", flag.name), "33"));
+            removed.push(paint(&format!("(-{}*)", flag.name), "33"));
             continue;
         }
-        let sign = if flag.enabled { "" } else { "-" };
         let mark = if flag.changed { "*" } else { "" };
-        // Enabled flags are red, disabled flags blue, as `emerge` colors them.
-        let color = if flag.enabled { "31" } else { "34" };
-        tokens.push(paint(&format!("{sign}{}{mark}", flag.name), color));
+        // A changed flag is green; otherwise enabled is red and disabled blue, as
+        // `emerge` colors them, so a state change stands out from a fixed flag.
+        let sign = if flag.enabled { "" } else { "-" };
+        let color = if flag.changed {
+            "32"
+        } else if flag.enabled {
+            "31"
+        } else {
+            "34"
+        };
+        let body = format!("{sign}{}{mark}", flag.name);
+        let mut token = paint(&body, color);
+        if flag.forced {
+            // Forced/masked flags are parenthesized, as `emerge` shows them.
+            token = format!("({token})");
+        }
+        if flag.enabled {
+            enabled.push(token);
+        } else {
+            disabled.push(token);
+        }
     }
-    tokens.join(" ")
+    enabled.extend(disabled);
+    enabled.extend(removed);
+    enabled.join(" ")
 }
 
 /// Render the package-count and total-download summary.
@@ -406,6 +599,7 @@ mod tests {
             removed: false,
             group: None,
             hidden: false,
+            forced: false,
         }
     }
 
@@ -421,6 +615,7 @@ mod tests {
             repository: Some("gentoo".to_owned()),
             binary: false,
             fetched: false,
+            build_id: None,
             use_flags: vec![],
             fetch_size: None,
             parents: vec![],
@@ -477,6 +672,26 @@ mod tests {
     }
 
     #[test]
+    fn forced_flags_are_parenthesized() {
+        let mut entry = base_entry();
+        let mut forced_on = flag("unicode", true, false);
+        forced_on.forced = true;
+        let mut masked_off = flag("selinux", false, false);
+        masked_off.forced = true;
+        entry.use_flags = vec![flag("ssl", true, false), forced_on, masked_off];
+        let line = render_entry(&entry, false);
+        assert!(
+            line.contains("(unicode)"),
+            "forced-on flag parenthesized: {line}"
+        );
+        assert!(
+            line.contains("(-selinux)"),
+            "masked flag parenthesized: {line}"
+        );
+        assert!(!line.contains("(ssl)"), "unforced flag is bare: {line}");
+    }
+
+    #[test]
     fn hidden_group_is_suppressed() {
         let mut entry = base_entry();
         let mut hidden = flag("amd64", true, false);
@@ -498,6 +713,40 @@ mod tests {
         let s = render_use_string(&entry.use_flags);
         assert!(s.contains("USE=\"ssl\""));
         assert!(s.contains("CPU_FLAGS_X86=\"x86_64\""));
+    }
+
+    #[test]
+    fn apply_use_expand_groups_folds_prefixed_flags() {
+        let groups = vec![
+            UseExpandGroup {
+                prefix: "python_single_target_".to_owned(),
+                name: "python_single_target".to_owned(),
+                hidden: false,
+            },
+            UseExpandGroup {
+                prefix: "abi_x86_".to_owned(),
+                name: "abi_x86".to_owned(),
+                hidden: true,
+            },
+        ];
+        let mut flags = vec![
+            flag("ssl", true, false),
+            flag("python_single_target_python3_14", true, false),
+            flag("abi_x86_64", true, false),
+        ];
+        apply_use_expand_groups(&mut flags, &groups);
+
+        let pst = flags.iter().find(|f| f.name == "python3_14").unwrap();
+        assert_eq!(pst.group.as_deref(), Some("python_single_target"));
+        assert!(!pst.hidden);
+
+        let abi = flags.iter().find(|f| f.name == "64").unwrap();
+        assert_eq!(abi.group.as_deref(), Some("abi_x86"));
+        assert!(abi.hidden, "hidden USE_EXPAND group is marked hidden");
+
+        // A plain flag is untouched.
+        let ssl = flags.iter().find(|f| f.name == "ssl").unwrap();
+        assert!(ssl.group.is_none());
     }
 
     #[test]

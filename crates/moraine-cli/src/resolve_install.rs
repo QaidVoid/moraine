@@ -110,41 +110,11 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         return Ok(());
     }
 
-    // Resolve and serialize the merge order, timing the solve.
-    let source = RealSource::new(&repo_index, &vdb, &config);
-    let atom_refs: Vec<&str> = request.atoms.iter().map(String::as_str).collect();
-    let started = std::time::Instant::now();
-    let solution = resolve(&source, &atom_refs).map_err(|e| miette!("resolution failed:\n{e}"))?;
-    let elapsed = started.elapsed();
-    println!(
-        "Dependency resolution took {:.2} s (backtracks: {})",
-        elapsed.as_secs_f64(),
-        solution.backtracks
-    );
-    let raw_order = serialize(&solution).map_err(|e| miette!("merge ordering failed: {e}"))?;
-
-    // Drop blocker uninstalls for packages that are not installed, and resolve
-    // genuine ones to the real installed version(s).
-    let installed = installed_versions(&vdb);
-    let order = clean_order(&raw_order, &installed);
-    // Drop no-op reinstalls: a package already installed at the resolved version
-    // and slot that is not being rebuilt is not part of the merge delta, matching
-    // Portage's default of not reinstalling unchanged packages.
-    let order: Vec<Task> = order
-        .into_iter()
-        .filter(|task| !is_noop_merge(task, &solution))
-        .collect();
-    if order.is_empty() {
-        println!("Nothing to do; the targets are already satisfied.");
-        return Ok(());
-    }
-
+    // Binary preferences and the binhost index, loaded before resolution so the
+    // resolver can prefer a version that has a binary package (`getbinpkg`),
+    // matching `emerge`. Reused afterwards for display and execution.
     let prefs = BinaryPrefs::from(cli, &ctx.features);
     let pkgdir = wr.eroot.join("var/cache/binpkgs");
-    let stage = wr.state_dir.join("install-stage");
-
-    // Fetch the binhost index when binary packages are wanted, for sizes and
-    // for fetching. Done once; reused for display and execution.
     let binhost = if prefs.getbinpkg {
         let uris = crate::binhost::binhost_uris(&config_dir, &ctx.vars);
         let binhost_cache = store_dir
@@ -161,6 +131,45 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     } else {
         None
     };
+    let binary_cpvs = binary_cpv_set(&pkgdir, binhost.as_ref());
+
+    // Resolve and serialize the merge order, timing the solve.
+    let source = RealSource::new(&repo_index, &vdb, &config).with_binaries(binary_cpvs);
+    let atom_refs: Vec<&str> = request.atoms.iter().map(String::as_str).collect();
+    let started = std::time::Instant::now();
+    let solution = resolve(&source, &atom_refs).map_err(|e| miette!("resolution failed:\n{e}"))?;
+    let elapsed = started.elapsed();
+    println!(
+        "Dependency resolution took {:.2} s (backtracks: {})",
+        elapsed.as_secs_f64(),
+        solution.backtracks
+    );
+    let raw_order = serialize(&solution).map_err(|e| miette!("merge ordering failed: {e}"))?;
+
+    // Drop blocker uninstalls for packages that are not installed, and resolve
+    // genuine ones to the real installed version(s).
+    let installed = installed_versions(&vdb);
+    let order = clean_order(&raw_order, &installed);
+    // Drop no-op reinstalls of installed dependencies and set members, matching
+    // Portage's default of not reinstalling unchanged packages. A package named
+    // explicitly on the command line is still re-merged (a `[R]` reinstall), as
+    // `emerge` does, even when it is already installed. Heads are taken from the
+    // qualified targets so a bare name like `xmlto` matches `app-text/xmlto`.
+    let explicit: BTreeSet<String> = qualified
+        .iter()
+        .filter(|t| !t.starts_with('@'))
+        .map(|t| cp_of_atom(t))
+        .collect();
+    let order: Vec<Task> = order
+        .into_iter()
+        .filter(|task| explicit.contains(&task.cp) || !is_noop_merge(task, &solution))
+        .collect();
+    if order.is_empty() {
+        println!("Nothing to do; the targets are already satisfied.");
+        return Ok(());
+    }
+
+    let stage = wr.state_dir.join("install-stage");
 
     // Build the presentation plan and enrich it with source/binary, repository,
     // and download size, then render it `emerge`-style.
@@ -175,10 +184,18 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         &pkgdir,
         binhost.as_ref(),
     );
+    let use_expand = moraine_config::use_expand_groups(&ctx.vars);
+    for entry in &mut plan.entries {
+        crate::render::apply_use_expand_groups(&mut entry.use_flags, &use_expand);
+    }
     print!("{}", render_merge_list(&plan, cli.is_verbose()));
     if cli.show_tree() {
         print!("{}", render_tree(&plan, cli.is_verbose()));
     }
+    print!(
+        "{}",
+        crate::render::render_autounmask(&solution.autounmask, &plan, &solution.edges, &explicit)
+    );
 
     if cli.pretend {
         return Ok(());
@@ -192,7 +209,16 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let explicit = explicit_heads(cli);
     let tasks: Vec<InstallTask> = order
         .iter()
-        .map(|task| to_install_task(task, &explicit, &prefs, cli.oneshot, &pkgdir))
+        .map(|task| {
+            to_install_task(
+                task,
+                &explicit,
+                &prefs,
+                cli.oneshot,
+                &pkgdir,
+                binhost.as_ref(),
+            )
+        })
         .collect();
 
     // Drive the orchestrator with a runner that dispatches source vs binary.
@@ -457,13 +483,14 @@ fn to_install_task(
     prefs: &BinaryPrefs,
     oneshot: bool,
     pkgdir: &Path,
+    binhost: Option<&crate::binhost::IndexedBinhost>,
 ) -> InstallTask {
     let cpv = format!("{}-{}", task.cp, task.version);
     let kind = match task.kind {
         ResolveTaskKind::Uninstall => moraine_install::TaskKind::Uninstall,
         ResolveTaskKind::Merge => moraine_install::TaskKind::Merge,
     };
-    let (binary, _) = binary_choice(&task.cp, &task.version, prefs, pkgdir);
+    let (binary, _) = binary_choice(&task.cp, &task.version, prefs, pkgdir, binhost);
     InstallTask {
         cpv,
         cp: task.cp.clone(),
@@ -482,16 +509,53 @@ fn to_install_task(
 /// Decide whether a task installs a binary package, and whether that package
 /// comes from a binhost (the `g` indicator). Honors `--usepkg`/`--getbinpkg` and
 /// the `getbinpkg` `FEATURE`. A local package is preferred over the binhost.
-fn binary_choice(cp: &str, version: &str, prefs: &BinaryPrefs, pkgdir: &Path) -> (bool, bool) {
+/// The set of `cp-version` strings a binary package exists for: every binhost
+/// index entry plus local `.gpkg` files under `pkgdir`. Fed to the resolver so
+/// version selection can prefer a version that has a binary.
+fn binary_cpv_set(
+    pkgdir: &Path,
+    binhost: Option<&crate::binhost::IndexedBinhost>,
+) -> HashSet<String> {
+    let mut set: HashSet<String> = binhost
+        .map(|bh| bh.cpvs().map(str::to_owned).collect())
+        .unwrap_or_default();
+    if let Ok(categories) = std::fs::read_dir(pkgdir) {
+        for cat in categories.flatten() {
+            if !cat.path().is_dir() {
+                continue;
+            }
+            let category = cat.file_name().to_string_lossy().into_owned();
+            if let Ok(files) = std::fs::read_dir(cat.path()) {
+                for f in files.flatten() {
+                    let name = f.file_name().to_string_lossy().into_owned();
+                    if let Some(pf) = name.strip_suffix(".gpkg") {
+                        set.insert(format!("{category}/{pf}"));
+                    }
+                }
+            }
+        }
+    }
+    set
+}
+
+fn binary_choice(
+    cp: &str,
+    version: &str,
+    prefs: &BinaryPrefs,
+    pkgdir: &Path,
+    binhost: Option<&crate::binhost::IndexedBinhost>,
+) -> (bool, bool) {
     let (category, _) = cp.split_once('/').unwrap_or((cp, ""));
     let pf = format!("{}-{}", cp.rsplit('/').next().unwrap_or(cp), version);
     let local = pkgdir.join(category).join(format!("{pf}.gpkg")).exists();
     if (prefs.usepkg || prefs.getbinpkg) && local {
+        // A local binary package is present.
         (true, false)
-    } else if prefs.getbinpkg {
-        // No local package, but the binhost may provide one.
+    } else if prefs.getbinpkg && binhost.is_some_and(|bh| bh.contains(&format!("{cp}-{version}"))) {
+        // The binhost actually lists this version (the `g` flag).
         (true, true)
     } else {
+        // No binary package anywhere: build from source.
         (false, false)
     }
 }
@@ -644,9 +708,12 @@ fn enrich_plan(
             continue;
         }
         let cpv = format!("{}-{}", entry.cp, entry.version);
-        let (binary, fetched) = binary_choice(&entry.cp, &entry.version, prefs, pkgdir);
+        let (binary, fetched) = binary_choice(&entry.cp, &entry.version, prefs, pkgdir, binhost);
         entry.binary = binary;
         entry.fetched = fetched;
+        if binary {
+            entry.build_id = binhost.and_then(|bh| bh.build_id(&cpv));
+        }
 
         let Some(stored) = lookup_entry(repo_set, store_dir, &mut cache, &cpv) else {
             continue;
@@ -663,6 +730,22 @@ fn enrich_plan(
         entry
             .use_flags
             .retain(|f| f.removed || iuse.contains(&f.name));
+
+        // Mark flags fixed by use.force/use.mask so they render parenthesized.
+        if let Ok(version) = Version::parse(&stored.version) {
+            let pref = moraine_atom::PackageRef {
+                category: interner.intern(&stored.category),
+                package: interner.intern(&stored.package),
+                version: &version,
+                slot: Some(interner.intern(&stored.slot)),
+                subslot: stored.subslot.as_deref().map(|s| interner.intern(s)),
+                repo: Some(interner.intern(&stored.repository)),
+            };
+            let forced = config.effective_use(&pref, &stored.iuse, false).forced;
+            for flag in &mut entry.use_flags {
+                flag.forced = forced.contains(&flag.name);
+            }
+        }
 
         entry.fetch_size = if binary {
             binary_size(pkgdir, &cpv).or_else(|| binhost.and_then(|b| b.size_of(&cpv)))
@@ -982,7 +1065,7 @@ mod tests {
     fn binary_choice_defaults_to_source() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            binary_choice("cat/pkg", "1", &prefs(false, false), dir.path()),
+            binary_choice("cat/pkg", "1", &prefs(false, false), dir.path(), None),
             (false, false)
         );
     }
@@ -993,18 +1076,19 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("cat")).unwrap();
         std::fs::write(dir.path().join("cat/pkg-1.gpkg"), b"x").unwrap();
         assert_eq!(
-            binary_choice("cat/pkg", "1", &prefs(false, true), dir.path()),
+            binary_choice("cat/pkg", "1", &prefs(false, true), dir.path(), None),
             (true, false)
         );
     }
 
     #[test]
-    fn binary_choice_uses_binhost_when_no_local() {
+    fn binary_choice_without_binhost_match_builds_from_source() {
         let dir = tempfile::tempdir().unwrap();
-        // getbinpkg with no local package: binary from binhost (the `g` flag).
+        // getbinpkg with no local package and no binhost listing the cpv must
+        // fall back to source, not blindly claim a binary package exists.
         assert_eq!(
-            binary_choice("cat/pkg", "1", &prefs(true, true), dir.path()),
-            (true, true)
+            binary_choice("cat/pkg", "1", &prefs(true, true), dir.path(), None),
+            (false, false)
         );
     }
 

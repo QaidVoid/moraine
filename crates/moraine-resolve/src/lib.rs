@@ -33,6 +33,7 @@ pub use realsource::RealSource;
 pub use resolve::resolve;
 pub use serialize::{Task, TaskKind, serialize};
 pub use solution::{
-    DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, Root, SlotBinding,
+    AutounmaskChange, DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, Root,
+    SlotBinding,
 };
-pub use source::{InstalledMeta, PackageMeta, ResolveSource};
+pub use source::{AcceptChange, Acceptability, InstalledMeta, PackageMeta, ResolveSource};

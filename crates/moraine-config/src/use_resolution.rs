@@ -15,6 +15,9 @@ pub struct EffectiveUse {
     pub enabled: BTreeSet<String>,
     /// The flags that are enabled but hidden from display.
     pub hidden: BTreeSet<String>,
+    /// The flags whose state is fixed by `use.force`/`use.mask` (the user cannot
+    /// change them), shown parenthesized in verbose output.
+    pub forced: BTreeSet<String>,
 }
 
 fn tokens<'a>(env: &'a VarMap, key: &str) -> Vec<&'a str> {
@@ -47,6 +50,39 @@ pub fn flatten_use_expand(env: &VarMap) -> (Vec<String>, BTreeSet<String>) {
         }
     }
     (flags, hidden)
+}
+
+/// A `USE_EXPAND` group, used to fold flat `prefix_value` flags back into their
+/// `PREFIX="value …"` display column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UseExpandGroup {
+    /// The flag-name prefix, lowercased with a trailing underscore (for example
+    /// `python_targets_`).
+    pub prefix: String,
+    /// The lowercased group name (for example `python_targets`), uppercased for
+    /// display.
+    pub name: String,
+    /// Whether the group is in `USE_EXPAND_HIDDEN` and should be suppressed.
+    pub hidden: bool,
+}
+
+/// The prefixed `USE_EXPAND` groups, longest prefix first so the most specific
+/// group wins when one prefix is a prefix of another. `USE_EXPAND_UNPREFIXED`
+/// variables (whose flags carry no prefix, like `ARCH`) are excluded.
+pub fn use_expand_groups(env: &VarMap) -> Vec<UseExpandGroup> {
+    let unprefixed: BTreeSet<&str> = tokens(env, "USE_EXPAND_UNPREFIXED").into_iter().collect();
+    let hidden_vars: BTreeSet<&str> = tokens(env, "USE_EXPAND_HIDDEN").into_iter().collect();
+    let mut groups: Vec<UseExpandGroup> = tokens(env, "USE_EXPAND")
+        .into_iter()
+        .filter(|var| !unprefixed.contains(var))
+        .map(|var| UseExpandGroup {
+            prefix: format!("{}_", var.to_lowercase()),
+            name: var.to_lowercase(),
+            hidden: hidden_vars.contains(var),
+        })
+        .collect();
+    groups.sort_by_key(|g| std::cmp::Reverse(g.prefix.len()));
+    groups
 }
 
 /// Derive `IUSE_EFFECTIVE` for EAPI 5+ from `IUSE_IMPLICIT` and the implicit
@@ -267,7 +303,12 @@ impl UseManager {
         }
 
         let hidden = self.hidden.intersection(&enabled).cloned().collect();
-        EffectiveUse { enabled, hidden }
+        let forced = force.union(&mask).cloned().collect();
+        EffectiveUse {
+            enabled,
+            hidden,
+            forced,
+        }
     }
 }
 

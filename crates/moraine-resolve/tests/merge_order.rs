@@ -48,6 +48,7 @@ fn build_dependency_precedes_dependent() {
         edges: vec![edge("cat/a", "cat/b", DepClass::Depend)],
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let tasks = serialize(&solution).expect("serializes");
     let pos = |cp: &str| tasks.iter().position(|t| t.cp == cp).unwrap();
@@ -69,6 +70,7 @@ fn output_is_permutation_of_input() {
         ],
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let tasks = serialize(&solution).expect("serializes");
     assert_eq!(tasks.len(), 3);
@@ -84,6 +86,7 @@ fn serialization_is_deterministic() {
         edges: vec![edge("cat/a", "cat/b", DepClass::Rdepend)],
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let first = serialize(&solution).expect("ok");
     let second = serialize(&solution).expect("ok");
@@ -101,6 +104,7 @@ fn runtime_cycle_is_broken() {
         ],
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let tasks = serialize(&solution).expect("breaks the cycle");
     assert_eq!(tasks.len(), 2);
@@ -117,6 +121,7 @@ fn hard_only_cycle_is_reported() {
         ],
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let r = serialize(&solution);
     assert!(matches!(r, Err(MergeOrderError::UnresolvableCycle(_))));
@@ -144,6 +149,7 @@ fn satisfied_edge_breaks_otherwise_unsolvable_cycle() {
         ],
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let tasks = serialize(&solution).expect("breaks via satisfied/runtime edge");
     assert_eq!(tasks.len(), 2);
@@ -157,6 +163,7 @@ fn libc_is_preferred_early() {
         edges: vec![edge("cat/app", "sys-libs/glibc", DepClass::Rdepend)],
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let tasks = serialize(&solution).expect("ok");
     let pos = |cp: &str| tasks.iter().position(|t| t.cp == cp).unwrap();
@@ -173,6 +180,7 @@ fn task_carries_details() {
         edges: Vec::new(),
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let tasks = serialize(&solution).expect("ok");
     let t = &tasks[0];
@@ -207,6 +215,7 @@ fn strong_blocker_uninstall_precedes_merges() {
             victims: vec![victim("cat/old", "1", "0")],
         }],
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let tasks = serialize(&solution).expect("ok");
     // The strong-blocker uninstall is ordered before the replacement merge.
@@ -231,6 +240,7 @@ fn weak_blocker_uninstall_follows_merges() {
             victims: vec![victim("cat/old", "1", "0")],
         }],
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let tasks = serialize(&solution).expect("ok");
     // The merge comes first; the weak-blocker removal is still emitted, after.
@@ -255,6 +265,7 @@ fn blocker_with_no_victims_uninstalls_nothing() {
             victims: Vec::new(),
         }],
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let tasks = serialize(&solution).expect("ok");
     assert!(tasks.iter().all(|t| t.kind == TaskKind::Merge));
@@ -267,6 +278,7 @@ fn leaf_query_ignores_soft_edges() {
         edges: vec![edge("cat/a", "cat/b", DepClass::Pdepend)],
         blockers: Vec::new(),
         backtracks: 0,
+        autounmask: Vec::new(),
     };
     let graph = MergeGraph::from_solution(&solution);
     // At tier 0 (ignore nothing), cat/a is not a leaf (has a runtime_post edge).

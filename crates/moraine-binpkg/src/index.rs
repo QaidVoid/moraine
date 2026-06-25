@@ -308,10 +308,13 @@ fn parse_kv_block(block: &str) -> Result<BTreeMap<String, String>, IndexError> {
         if line.trim().is_empty() {
             continue;
         }
-        let (key, value) = line
-            .split_once(": ")
-            .or_else(|| line.split_once(':'))
-            .ok_or_else(|| IndexError::MalformedLine(line.to_string()))?;
+        // Skip a line with no `key: value` separator rather than failing the
+        // whole index: a truncated or partially-written cache (a clipped final
+        // line) must not discard every package, matching Portage's tolerance.
+        let Some((key, value)) = line.split_once(": ").or_else(|| line.split_once(':')) else {
+            tracing::debug!(line, "skipping malformed index line");
+            continue;
+        };
         map.insert(key.trim().to_string(), value.trim().to_string());
     }
     Ok(map)
