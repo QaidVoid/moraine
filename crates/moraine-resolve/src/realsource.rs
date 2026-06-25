@@ -101,12 +101,9 @@ impl ResolveSource for RealSource<'_> {
                 rdepend: normalize_depspec(&entry.rdepend, interner),
                 pdepend: normalize_depspec(&entry.pdepend, interner),
                 idepend: normalize_depspec(&entry.idepend, interner),
-                // REQUIRED_USE leaves are USE flags, not atoms, so it cannot be
-                // normalized from the atom AST; re-parse it from a rendered form.
-                required_use: parse_required_use(&render_required_use(
-                    &entry.required_use,
-                    interner,
-                )),
+                // REQUIRED_USE leaves are USE flags, not atoms; parse the raw
+                // text with the dedicated USE-constraint parser.
+                required_use: parse_required_use(&entry.required_use),
                 iuse,
             });
         }
@@ -263,59 +260,5 @@ impl ResolveSource for RealSource<'_> {
             });
         }
         out
-    }
-}
-
-/// Render a parsed dependency AST back to a `category/package` string sequence so
-/// the REQUIRED_USE flag parser can reinterpret its leaves as flags. This relies
-/// on the fact that the repo importer stores REQUIRED_USE whose leaves were
-/// parsed as atoms (`pkg` becomes `category/pkg`), recovering the flag from the
-/// package component.
-fn render_required_use(
-    spec: &moraine_atom::DepSpec,
-    interner: &moraine_common::Interner,
-) -> String {
-    use moraine_atom::DepSpec;
-    match spec {
-        DepSpec::AllOf(children) => children
-            .iter()
-            .map(|c| render_required_use(c, interner))
-            .collect::<Vec<_>>()
-            .join(" "),
-        DepSpec::AnyOf(children) => format!(
-            "|| ( {} )",
-            children
-                .iter()
-                .map(|c| render_required_use(c, interner))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
-        DepSpec::Conditional { flag, sense, body } => {
-            let prefix = if *sense { "" } else { "!" };
-            let flag = interner
-                .resolve(*flag)
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            format!(
-                "{prefix}{flag}? ( {} )",
-                body.iter()
-                    .map(|c| render_required_use(c, interner))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        }
-        DepSpec::Leaf(atom) => {
-            // The flag is the package component; a blocker marks negation.
-            let flag = interner
-                .resolve(atom.package())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let prefix = if atom.blocker() == moraine_atom::Blocker::None {
-                ""
-            } else {
-                "!"
-            };
-            format!("{prefix}{flag}")
-        }
     }
 }

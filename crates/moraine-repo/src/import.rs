@@ -230,14 +230,9 @@ fn import_one(
             });
         }
     }
-    let required_use_text = fields.get("REQUIRED_USE").copied().unwrap_or_default();
-    if let Err(e) = DepSpec::parse(required_use_text, features, &interner) {
-        return EntryOutcome::Rejected(ImportIssue::EapiViolation {
-            cpv,
-            variable: "REQUIRED_USE".to_owned(),
-            reason: e.to_string(),
-        });
-    }
+    // REQUIRED_USE is a USE-flag constraint grammar (bare flags plus `||`/`^^`/
+    // `??` groups), not a dependency atom expression, so it is stored verbatim
+    // and parsed by the resolver rather than validated as atoms here.
 
     let (slot, subslot) = split_slot(fields.get("SLOT").copied().unwrap_or("0"));
     let tokens = |k: &str| {

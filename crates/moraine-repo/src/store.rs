@@ -41,7 +41,7 @@ use crate::error::{RepoError, Result};
 
 /// The on-disk format version. Bump when the encoding or the AST semantics
 /// baked into the import change, which forces a full reimport.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The magic tag identifying a Moraine metadata store.
 pub const MAGIC: [u8; 8] = *b"MORAREPO";
@@ -213,8 +213,10 @@ pub struct LoadedEntry {
     pub pdepend: DepSpec,
     /// Parsed `IDEPEND`.
     pub idepend: DepSpec,
-    /// Parsed `REQUIRED_USE`.
-    pub required_use: DepSpec,
+    /// Raw `REQUIRED_USE` text. It is a USE-flag constraint grammar, not a
+    /// dependency atom expression, so it is kept verbatim and parsed by the
+    /// resolver's dedicated parser.
+    pub required_use: String,
     /// Interned `KEYWORDS`.
     pub keywords: Vec<Symbol>,
     /// Interned `IUSE`.
@@ -364,7 +366,7 @@ fn parse_entry(e: &StoredEntry, interner: &Interner) -> Result<LoadedEntry> {
         bdepend: parse_dep(&e.bdepend)?,
         pdepend: parse_dep(&e.pdepend)?,
         idepend: parse_dep(&e.idepend)?,
-        required_use: parse_dep(&e.required_use)?,
+        required_use: e.required_use.clone(),
         keywords: intern_all(&e.keywords),
         iuse: intern_all(&e.iuse),
         properties: intern_all(&e.properties),
@@ -433,7 +435,10 @@ mod tests {
             bdepend: String::new(),
             pdepend: String::new(),
             idepend: String::new(),
-            required_use: String::new(),
+            // A USE-constraint grammar with `^^` and bare flags must survive the
+            // store round-trip without being parsed as dependency atoms.
+            required_use: "^^ ( python_single_target_python3_13 python_single_target_python3_14 )"
+                .to_owned(),
             src_uri: "https://example.com/src.tar.gz".to_owned(),
             license: "GPL-2".to_owned(),
             keywords: vec!["amd64".to_owned(), "~arm64".to_owned()],
@@ -469,6 +474,8 @@ mod tests {
         assert_eq!(e.depend.atoms().len(), 1);
         assert_eq!(e.rdepend.atoms().len(), 2);
         assert_eq!(e.repository, i.intern("gentoo"));
+        // REQUIRED_USE is kept as raw text, not parsed as atoms.
+        assert!(e.required_use.contains("^^"));
     }
 
     #[test]
