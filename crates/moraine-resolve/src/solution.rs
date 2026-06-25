@@ -70,6 +70,19 @@ pub struct SlotBinding {
     pub root: Root,
 }
 
+/// A specific installed package an actionable blocker removes: the exact
+/// `(cp, version, slot)` matched by the blocker's atom, so an uninstall touches
+/// only the matching entries rather than every version and slot of the cp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockVictim {
+    /// The `category/package`.
+    pub cp: String,
+    /// The exact installed version to remove.
+    pub version: Version,
+    /// The exact installed slot to remove.
+    pub slot: String,
+}
+
 /// A blocker recorded in the solution for the merge-order phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedBlocker {
@@ -79,6 +92,9 @@ pub struct RecordedBlocker {
     pub blocked_atom: String,
     /// Whether the blocker is strong (`!!`).
     pub strong: bool,
+    /// The exact installed entries this blocker removes (atom-filtered by version
+    /// and slot). Empty when the blocker is informational and removes nothing.
+    pub victims: Vec<BlockVictim>,
 }
 
 /// A class-tagged dependency edge between two packages in the solution.

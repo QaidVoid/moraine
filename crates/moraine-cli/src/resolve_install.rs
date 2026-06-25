@@ -497,7 +497,18 @@ fn clean_order(order: &[Task], installed: &HashMap<String, Vec<(String, String)>
         match task.kind {
             ResolveTaskKind::Merge => out.push(task.clone()),
             ResolveTaskKind::Uninstall => {
-                if let Some(versions) = installed.get(&task.cp) {
+                if !task.version.is_empty() {
+                    // An atom-filtered blocker victim names its exact version and
+                    // slot; remove only that entry if it is actually installed.
+                    if installed.get(&task.cp).is_some_and(|vs| {
+                        vs.iter()
+                            .any(|(v, s)| v == &task.version && s == &task.slot)
+                    }) {
+                        out.push(task.clone());
+                    }
+                } else if let Some(versions) = installed.get(&task.cp) {
+                    // An unversioned uninstall (an explicit `-C`) removes every
+                    // installed version and slot of the cp.
                     for (version, slot) in versions {
                         out.push(Task {
                             kind: ResolveTaskKind::Uninstall,

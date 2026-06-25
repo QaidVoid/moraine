@@ -10,14 +10,18 @@ use moraine_version::Version;
 use tracing::instrument;
 
 use crate::depnode::{BlockerKind, DepNode, NormAtom, SlotOpKind};
-use crate::encode::{CLASSES, root_for, slot_matches, version_satisfies};
+use crate::encode::{CLASSES, root_for, slot_matches, use_deps_satisfied, version_satisfies};
 use crate::error::ResolveError;
 use crate::normalize::normalize_atom;
 use crate::provider::{GentooProvider, REQUEST_CP, split_key};
 use crate::solution::{
-    DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, SlotBinding,
+    BlockVictim, DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, SlotBinding,
 };
 use crate::source::{PackageMeta, ResolveSource};
+
+/// The package manager's own `category/package`, which a blocker may never
+/// uninstall.
+const PACKAGE_MANAGER: &str = "sys-apps/portage";
 
 /// Resolve a set of request atom strings against the given source, producing a
 /// resolved solution or a structured failure.
@@ -125,6 +129,7 @@ fn assemble_solution<S: ResolveSource>(
                         class,
                         optional,
                         features,
+                        &resolved_use,
                         &selected,
                         &mut edges,
                         &mut blockers,
@@ -142,6 +147,17 @@ fn assemble_solution<S: ResolveSource>(
                 slot_bindings,
                 already_installed,
                 subslot_rebuild,
+            });
+        }
+    }
+
+    // Safety: a blocker is never allowed to remove the package manager itself.
+    for blocker in &blockers {
+        if let Some(victim) = blocker.victims.iter().find(|v| v.cp == PACKAGE_MANAGER) {
+            return Err(ResolveError::UnresolvableBlocker {
+                blocker: blocker.blocker.clone(),
+                victim: victim.cp.clone(),
+                reason: "the package manager cannot be uninstalled".to_owned(),
             });
         }
     }
@@ -211,6 +227,48 @@ fn find_provider<'a>(
         .find(|(v, m)| version_satisfies(atom, v) && slot_matches(atom, m))
 }
 
+/// The installed entries an actionable blocker removes: those matching the
+/// blocker's version, slot, and USE constraints, excluding any `(cp, slot)` the
+/// solution is installing (a same-slot install replaces rather than removes it).
+fn blocker_victims<S: ResolveSource>(
+    source: &S,
+    atom: &NormAtom,
+    parent_use: &BTreeSet<String>,
+    features: moraine_eapi::EapiFeatures,
+    selected: &BTreeMap<String, Vec<(Version, PackageMeta)>>,
+) -> Vec<BlockVictim> {
+    let mut victims = Vec::new();
+    for inst in source.installed(&atom.cp) {
+        let slot_ok = atom.slot.as_ref().is_none_or(|s| &inst.slot == s);
+        if !slot_ok || !version_satisfies(atom, &inst.version) {
+            continue;
+        }
+        if !use_deps_satisfied(
+            atom,
+            &inst.use_enabled,
+            &inst.use_enabled,
+            parent_use,
+            features,
+        ) {
+            continue;
+        }
+        // A same-slot install replaces the installed package rather than removing
+        // it, so it is not an uninstall victim.
+        let replaced = selected
+            .get(&atom.cp)
+            .is_some_and(|s| s.iter().any(|(_, m)| m.slot == inst.slot));
+        if replaced {
+            continue;
+        }
+        victims.push(BlockVictim {
+            cp: atom.cp.clone(),
+            version: inst.version.clone(),
+            slot: inst.slot.clone(),
+        });
+    }
+    victims
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_edge_for_atom<S: ResolveSource>(
     source: &S,
@@ -219,6 +277,7 @@ fn emit_edge_for_atom<S: ResolveSource>(
     class: DepClass,
     optional: bool,
     features: moraine_eapi::EapiFeatures,
+    parent_use: &BTreeSet<String>,
     selected: &BTreeMap<String, Vec<(Version, PackageMeta)>>,
     edges: &mut Vec<DepEdge>,
     blockers: &mut Vec<RecordedBlocker>,
@@ -227,10 +286,18 @@ fn emit_edge_for_atom<S: ResolveSource>(
     let root = root_for(class, features);
 
     if atom.blocker != BlockerKind::None {
+        let victims = blocker_victims(source, atom, parent_use, features, selected);
+        // A blocker that matches no installed victim and no selected package is
+        // irrelevant and is dropped rather than recorded as a phantom uninstall.
+        let matches_selected = find_provider(selected, atom).is_some();
+        if victims.is_empty() && !matches_selected {
+            return;
+        }
         blockers.push(RecordedBlocker {
             blocker: from.to_owned(),
             blocked_atom: render_atom(atom),
             strong: atom.blocker == BlockerKind::Strong,
+            victims,
         });
         return;
     }

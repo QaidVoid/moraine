@@ -102,6 +102,13 @@ impl From<ResolveError> for ResolutionDiagnostic {
             ResolveError::Unsatisfiable { explanation } => {
                 ResolutionDiagnostic::Unsatisfiable { explanation }
             }
+            ResolveError::UnresolvableBlocker {
+                blocker,
+                victim,
+                reason,
+            } => ResolutionDiagnostic::Unsatisfiable {
+                explanation: format!("blocker {blocker} blocks {victim}, but {reason}"),
+            },
         }
     }
 }

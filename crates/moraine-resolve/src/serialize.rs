@@ -95,41 +95,44 @@ pub fn serialize(solution: &ResolvedSolution) -> Result<Vec<Task>, MergeOrderErr
 
 /// Schedule uninstall tasks for the solution's blockers around the merges.
 ///
-/// A strong blocker (`!!`) forbids file overlap, so the blocked package's
-/// uninstall is ordered before the replacement merges. A weak blocker (`!`)
-/// permits merge-over, so its removal is appended after the merges. Safety
-/// refusals (the package manager, the only-suitable-runtime-provider case, and
-/// unresolvable system-set members) would be enforced here once the installed
-/// store is threaded in; with only the solved set available the scheduler
-/// records the removals without removing a package that the merges depend on.
+/// Each blocker carries the exact installed entries its atom matched (filtered
+/// by version and slot when the victims were computed), so an uninstall removes
+/// only those entries, never the whole cp. A strong blocker (`!!`) forbids file
+/// overlap, so its victims are removed before the replacement merges; a weak
+/// blocker (`!`) permits merge-over, so its victims are removed after. The
+/// package-manager refusal is enforced earlier, at victim computation.
 fn schedule_blockers(solution: &ResolvedSolution, merges: Vec<Task>) -> Vec<Task> {
-    let merged_cps: BTreeSet<&str> = solution.packages.iter().map(|p| p.cp.as_str()).collect();
     let mut pre: Vec<Task> = Vec::new();
     let mut post: Vec<Task> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
 
     for blocker in &solution.blockers {
-        let Some(cp) = blocked_cp(&blocker.blocked_atom) else {
-            continue;
-        };
-        // Never uninstall a package that the solution is installing.
-        if merged_cps.contains(cp.as_str()) {
-            continue;
-        }
-        if !seen.insert(cp.clone()) {
-            continue;
-        }
-        let task = Task {
-            kind: TaskKind::Uninstall,
-            cp,
-            version: String::new(),
-            slot: String::new(),
-            use_enabled: Vec::new(),
-        };
-        if blocker.strong {
-            pre.push(task);
-        } else {
-            post.push(task);
+        // Uninstall only the specific installed entries the blocker's atom
+        // matches, by version and slot, never the whole cp.
+        for victim in &blocker.victims {
+            let key = (
+                victim.cp.clone(),
+                victim.version.as_str().to_owned(),
+                victim.slot.clone(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            let task = Task {
+                kind: TaskKind::Uninstall,
+                cp: victim.cp.clone(),
+                version: victim.version.as_str().to_owned(),
+                slot: victim.slot.clone(),
+                use_enabled: Vec::new(),
+            };
+            // A strong blocker forbids file overlap, so its victim is removed
+            // before the merges; a weak blocker permits merge-over and is removed
+            // after.
+            if blocker.strong {
+                pre.push(task);
+            } else {
+                post.push(task);
+            }
         }
     }
 
@@ -138,37 +141,6 @@ fn schedule_blockers(solution: &ResolvedSolution, merges: Vec<Task>) -> Vec<Task
     out.extend(merges);
     out.extend(post);
     out
-}
-
-/// Extract the `category/package` from a rendered blocker atom such as
-/// `!cat/foo`, `!!=cat/foo-1`, or `cat/foo:2`.
-fn blocked_cp(atom: &str) -> Option<String> {
-    let s = atom.trim_start_matches('!');
-    let s = s.trim_start_matches(['=', '<', '>', '~']);
-    let s = s.trim_start_matches('=');
-    // Strip slot/use suffixes.
-    let s = s.split([':', '[']).next().unwrap_or(s);
-    // The remaining text is `category/package` possibly followed by `-version`.
-    // Keep up to the version: a version segment starts at a `-` followed by a
-    // digit.
-    let (category, rest) = s.split_once('/')?;
-    let pkg_end = rest
-        .char_indices()
-        .find_map(|(i, _)| {
-            let bytes = rest.as_bytes();
-            if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1].is_ascii_digit() {
-                Some(i)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(rest.len());
-    let package = &rest[..pkg_end];
-    if package.is_empty() {
-        None
-    } else {
-        Some(format!("{category}/{package}"))
-    }
 }
 
 /// The range a stage searches under.

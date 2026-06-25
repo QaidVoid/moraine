@@ -2,10 +2,18 @@
 
 use moraine_resolve::graph::{EdgeFlags, MergeGraph, Range};
 use moraine_resolve::solution::{
-    DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, Root,
+    BlockVictim, DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, Root,
 };
 use moraine_resolve::{MergeOrderError, TaskKind, serialize};
 use moraine_version::Version;
+
+fn victim(cp: &str, version: &str, slot: &str) -> BlockVictim {
+    BlockVictim {
+        cp: cp.to_owned(),
+        version: Version::parse(version).unwrap(),
+        slot: slot.to_owned(),
+    }
+}
 
 fn rp(cp: &str, version: &str, installed: bool) -> ResolvedPackage {
     ResolvedPackage {
@@ -196,6 +204,7 @@ fn strong_blocker_uninstall_precedes_merges() {
             blocker: "cat/new".to_owned(),
             blocked_atom: "cat/old".to_owned(),
             strong: true,
+            victims: vec![victim("cat/old", "1", "0")],
         }],
         backtracks: 0,
     };
@@ -219,6 +228,7 @@ fn weak_blocker_uninstall_follows_merges() {
             blocker: "cat/new".to_owned(),
             blocked_atom: "cat/old".to_owned(),
             strong: false,
+            victims: vec![victim("cat/old", "1", "0")],
         }],
         backtracks: 0,
     };
@@ -231,9 +241,10 @@ fn weak_blocker_uninstall_follows_merges() {
 }
 
 #[test]
-fn blocker_does_not_uninstall_an_installed_target() {
-    // A blocker whose target the solution is also installing must not produce an
-    // uninstall (safety).
+fn blocker_with_no_victims_uninstalls_nothing() {
+    // A blocker whose target the solution is also installing in the same slot is
+    // a replacement, so the victim computation leaves it with no victims and the
+    // scheduler emits no uninstall (safety).
     let solution = ResolvedSolution {
         packages: vec![rp("cat/new", "2", false), rp("cat/old", "1", false)],
         edges: Vec::new(),
@@ -241,6 +252,7 @@ fn blocker_does_not_uninstall_an_installed_target() {
             blocker: "cat/new".to_owned(),
             blocked_atom: "cat/old".to_owned(),
             strong: true,
+            victims: Vec::new(),
         }],
         backtracks: 0,
     };

@@ -37,6 +37,17 @@ pub enum ResolveError {
         /// Why it failed.
         reason: String,
     },
+
+    /// A blocker could only be resolved by a destructive or forbidden uninstall.
+    #[error("unresolvable blocker: {blocker} blocks {victim}, but {reason}")]
+    UnresolvableBlocker {
+        /// The blocking package's `category/package`.
+        blocker: String,
+        /// The `category/package` of the package the blocker would remove.
+        victim: String,
+        /// Why the uninstall is refused.
+        reason: String,
+    },
 }
 
 /// An error raised while serializing the merge order.

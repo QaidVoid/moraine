@@ -523,6 +523,72 @@ fn two_slots_of_one_cp_coinstall() {
 }
 
 #[test]
+fn ranged_blocker_only_removes_matching_versions() {
+    // `!<cat/foo-2` removes the installed cat/foo-1 but leaves cat/foo-3.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/parent",
+        version: "1",
+        rdepend: "!<cat/foo-2",
+        ..Default::default()
+    });
+    f.add_installed(installed("cat/foo", "1", "1", None, &[]));
+    f.add_installed(installed("cat/foo", "3", "3", None, &[]));
+
+    let sol = resolve(&f, &["cat/parent"]).expect("resolves");
+    let victims: Vec<_> = sol.blockers.iter().flat_map(|b| &b.victims).collect();
+    assert!(
+        victims.iter().any(|v| v.version.as_str() == "1"),
+        "cat/foo-1 (<2) is a victim"
+    );
+    assert!(
+        !victims.iter().any(|v| v.version.as_str() == "3"),
+        "cat/foo-3 (>=2) must not be removed: {victims:?}"
+    );
+}
+
+#[test]
+fn slotted_blocker_keeps_other_slot() {
+    // `!cat/foo:1` removes the installed slot 1 but leaves slot 2.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/parent",
+        version: "1",
+        rdepend: "!cat/foo:1",
+        ..Default::default()
+    });
+    f.add_installed(installed("cat/foo", "1", "1", None, &[]));
+    f.add_installed(installed("cat/foo", "2", "2", None, &[]));
+
+    let sol = resolve(&f, &["cat/parent"]).expect("resolves");
+    let victims: Vec<_> = sol.blockers.iter().flat_map(|b| &b.victims).collect();
+    assert!(victims.iter().any(|v| v.slot == "1"));
+    assert!(
+        !victims.iter().any(|v| v.slot == "2"),
+        "slot 2 must be kept: {victims:?}"
+    );
+}
+
+#[test]
+fn blocker_cannot_remove_the_package_manager() {
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/parent",
+        version: "1",
+        rdepend: "!sys-apps/portage",
+        ..Default::default()
+    });
+    f.add_installed(installed("sys-apps/portage", "3.0", "0", None, &[]));
+
+    match resolve(&f, &["cat/parent"]) {
+        Err(ResolveError::UnresolvableBlocker { victim, .. }) => {
+            assert_eq!(victim, "sys-apps/portage");
+        }
+        other => panic!("expected UnresolvableBlocker refusal, got {other:?}"),
+    }
+}
+
+#[test]
 fn slotless_dep_satisfied_by_existing_slot() {
     // A slotless dep does not force a new slot when an available slot already
     // satisfies it: it expands to a disjunction over the cp's slots.
