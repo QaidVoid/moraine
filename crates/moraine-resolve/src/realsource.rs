@@ -255,6 +255,11 @@ impl ResolveSource for RealSource<'_> {
                 .iter()
                 .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
                 .collect();
+            let iuse = record
+                .iuse
+                .iter()
+                .map(|f| f.trim_start_matches(['+', '-']).to_owned())
+                .collect();
             let slot_bindings = self
                 .vdb
                 .slot_operator_bindings(record)
@@ -279,6 +284,7 @@ impl ResolveSource for RealSource<'_> {
                 slot,
                 subslot,
                 use_enabled,
+                iuse,
                 slot_bindings,
             });
         }

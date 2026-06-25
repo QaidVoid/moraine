@@ -173,6 +173,7 @@ pub fn installed(
         slot: slot.to_owned(),
         subslot: subslot.map(|s| s.to_owned()),
         use_enabled: BTreeSet::new(),
+        iuse: BTreeSet::new(),
         slot_bindings: bindings
             .iter()
             .map(|(c, s, ss)| ((*c).to_owned(), (*s).to_owned(), ss.map(|x| x.to_owned())))

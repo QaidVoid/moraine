@@ -50,6 +50,7 @@ fn installed(cp: &str, version: &str, slot: &str, use_enabled: &[&str]) -> Insta
         slot: slot.to_owned(),
         subslot: None,
         use_enabled: use_enabled.iter().map(|s| s.to_string()).collect(),
+        iuse: use_enabled.iter().map(|s| s.to_string()).collect(),
         slot_bindings: Vec::new(),
     }
 }

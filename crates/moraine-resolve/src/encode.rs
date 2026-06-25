@@ -402,7 +402,6 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         conflicts: &mut Vec<(String, Term<Version>)>,
         features: EapiFeatures,
     ) -> Result<(), String> {
-        let overlapping = branches_overlap(group);
         // Each satisfiable branch: its index, the per-atom alternative lists (one
         // disjunction per required atom), and its blocker atoms.
         let mut branches: Vec<EncodedBranch> = Vec::new();
@@ -448,14 +447,16 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             return Err("no satisfiable branch in any-of group".to_owned());
         }
 
-        if overlapping {
-            // Prefer the branch adding the fewest new slots (by its leading atom).
-            branches.sort_by(|a, b| {
-                let an = a.1.first().map_or(0, |alts| self.new_slot_count(alts));
-                let bn = b.1.first().map_or(0, |alts| self.new_slot_count(alts));
-                an.cmp(&bn).then(a.0.cmp(&b.0))
-            });
-        }
+        // PMS || resolution: prefer a branch already fully satisfied by the
+        // installed set, then the leftmost branch. Without the first key an
+        // already-installed member (e.g. gentoo-kernel-bin) loses to a textually
+        // earlier source variant and drags in its whole build tree; the leftmost
+        // tiebreak keeps Portage's default order when nothing is installed.
+        branches.sort_by(|a, b| {
+            self.branch_needs_new(&a.1)
+                .cmp(&self.branch_needs_new(&b.1))
+                .then(a.0.cmp(&b.0))
+        });
 
         // The chosen branch is the first after ordering: emit its full
         // conjunction (every atom required) and assert its blockers.
@@ -482,15 +483,16 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         Ok(())
     }
 
-    /// The number of providers in a set of alternatives that are not already
-    /// installed, used to prefer DNF branches that add the fewest new slots.
-    fn new_slot_count(&self, reps: &[Alt]) -> usize {
-        reps.iter()
-            .filter(|(key, _)| {
+    /// Whether a branch requires installing at least one package not already
+    /// present, used to prefer `||` branches fully met by the installed set. A
+    /// branch is "free" only when every required atom has an installed provider.
+    fn branch_needs_new(&self, atom_alts: &[Vec<Alt>]) -> bool {
+        atom_alts.iter().any(|alts| {
+            !alts.iter().any(|(key, _)| {
                 let cp = crate::provider::split_key(key).map_or(key.as_str(), |(c, _)| c);
-                self.source.installed(cp).is_empty()
+                !self.source.installed(cp).is_empty()
             })
-            .count()
+        })
     }
 
     /// The required atom's matching visible versions grouped into one `(cp,
@@ -555,13 +557,14 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             }
         }
         for m in self.source.installed(&atom.cp) {
-            // An installed package's USE is fixed; its enabled set serves as both
-            // its USE and its known IUSE for the blocker's USE condition. A
-            // slotted blocker (`!pkg:slot`) does not match a different slot.
+            // An installed package's USE is fixed (its recorded enabled set), but
+            // its declared IUSE must be used for the blocker's USE condition so a
+            // `[flag(+)]` default is not wrongly applied to a declared-but-disabled
+            // flag. A slotted blocker (`!pkg:slot`) does not match a different slot.
             let slot_ok = atom.slot.as_ref().is_none_or(|s| &m.slot == s);
             if slot_ok
                 && version_satisfies(atom, &m.version)
-                && use_deps_satisfied(atom, &m.use_enabled, &m.use_enabled, parent_use, features)
+                && use_deps_satisfied(atom, &m.use_enabled, &m.iuse, parent_use, features)
                 && !excluded(&m.slot)
             {
                 by_slot.entry(m.slot.clone()).or_default().push(m.version);
@@ -682,25 +685,6 @@ fn push_disjunction(clauses: &mut Vec<Clause<String, Version>>, alternatives: Ve
     }
 }
 
-/// Whether any two branches of an any-of group share a category/package, which
-/// is Portage's condition for applying DNF to the group.
-fn branches_overlap(group: &Group) -> bool {
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for branch in group {
-        let mut local: BTreeSet<&str> = BTreeSet::new();
-        for atom in branch {
-            local.insert(atom.cp.as_str());
-        }
-        for cp in &local {
-            if seen.contains(cp) {
-                return true;
-            }
-        }
-        seen.extend(local);
-    }
-    false
-}
-
 /// Whether a candidate's slot satisfies an atom's slot constraints.
 pub(crate) fn slot_matches(atom: &NormAtom, meta: &crate::source::PackageMeta) -> bool {
     match (&atom.slot, atom.slot_op) {
@@ -755,5 +739,39 @@ mod tests {
         assert!(DepClass::Rdepend.is_runtime());
         assert!(DepClass::Pdepend.is_runtime());
         assert!(DepClass::Idepend.is_runtime());
+    }
+
+    fn atom_with_use_dep(flag: &str, default: Option<bool>) -> NormAtom {
+        NormAtom {
+            blocker: crate::depnode::BlockerKind::None,
+            cp: "sys-libs/glibc".to_owned(),
+            version: None,
+            slot: None,
+            subslot: None,
+            slot_op: None,
+            use_deps: vec![crate::depnode::UseReq {
+                flag: flag.to_owned(),
+                kind: crate::depnode::UseReqKind::Enabled,
+                default,
+            }],
+        }
+    }
+
+    #[test]
+    fn use_dep_default_yields_to_declared_disabled_flag() {
+        // `[vanilla(+)]` must not be assumed enabled when the candidate actually
+        // declares `vanilla` (in IUSE) but has it disabled: the declared state
+        // wins over the `(+)` default. This guards the installed-blocker path.
+        let atom = atom_with_use_dep("vanilla", Some(true));
+        let parent = BTreeSet::new();
+        let f8 = features_for("8");
+
+        let iuse: BTreeSet<String> = ["vanilla".to_owned()].into_iter().collect();
+        let disabled = BTreeSet::new();
+        assert!(!use_deps_satisfied(&atom, &disabled, &iuse, &parent, f8));
+
+        // With `vanilla` genuinely absent from IUSE the `(+)` default applies.
+        let no_iuse = BTreeSet::new();
+        assert!(use_deps_satisfied(&atom, &disabled, &no_iuse, &parent, f8));
     }
 }

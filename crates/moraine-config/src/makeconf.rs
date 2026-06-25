@@ -215,8 +215,12 @@ fn join_continuations(content: &str) -> String {
     out
 }
 
-/// Apply an incremental assignment's tokens onto the accumulated value: a plain
-/// token adds, `-token` removes, and `-*` clears, preserving order.
+/// Apply an incremental assignment's tokens onto the accumulated value,
+/// preserving the sign of the most recent occurrence of each token. A plain
+/// token enables, `-token` disables, and `-*` clears. The sign is kept (rather
+/// than resolved here) because an incremental variable is consumed in signed
+/// form: a `-flag` for a flag not yet present must survive so a later reader can
+/// see it was disabled, not silently drop it.
 fn stack_incremental(current: Option<&String>, value: &str) -> String {
     let mut acc: Vec<String> = current
         .map(|s| s.split_whitespace().map(str::to_owned).collect())
@@ -224,11 +228,12 @@ fn stack_incremental(current: Option<&String>, value: &str) -> String {
     for token in value.split_whitespace() {
         if token == "-*" {
             acc.clear();
-        } else if let Some(name) = token.strip_prefix('-') {
-            acc.retain(|t| t != name);
-        } else if !acc.iter().any(|t| t == token) {
             acc.push(token.to_owned());
+            continue;
         }
+        let name = token.strip_prefix('-').unwrap_or(token);
+        acc.retain(|t| t.strip_prefix('-').unwrap_or(t) != name);
+        acc.push(token.to_owned());
     }
     acc.join(" ")
 }
@@ -356,6 +361,23 @@ mod tests {
         // A `#` comment containing `USE="..."` must not affect the real USE.
         let m = parse("# stage1 breaks because of USE=\"-* foo\"\nUSE=\"acl\"\n");
         assert_eq!(m.get("USE"), Some("acl"));
+    }
+
+    #[test]
+    fn incremental_use_preserves_negatives() {
+        // A `-flag` for a flag not present in the accumulated value must survive
+        // so a later signed reader (global USE resolution) sees it disabled,
+        // rather than silently dropping it.
+        let m = parse("USE=\"acl unicode\"\nUSE=\"-man bluetooth\"\n");
+        assert_eq!(m.get("USE"), Some("acl unicode -man bluetooth"));
+    }
+
+    #[test]
+    fn incremental_use_last_sign_wins() {
+        // Re-enabling a previously disabled flag drops the negative, and vice
+        // versa: only the most recent occurrence of a flag is kept.
+        let m = parse("USE=\"-foo bar\"\nUSE=\"foo -bar\"\n");
+        assert_eq!(m.get("USE"), Some("foo -bar"));
     }
 
     #[test]

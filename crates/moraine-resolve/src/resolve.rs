@@ -98,10 +98,16 @@ fn assemble_solution<S: ResolveSource>(
             let mut subslot_rebuild = false;
             for inst in source.installed(cp) {
                 for (dep_cp, bslot, bsub) in &inst.slot_bindings {
+                    // PMS 7.2: a missing sub-slot equals the slot. The recorded
+                    // binding is rewritten to `slot/subslot=` at build time, so an
+                    // unspecified store sub-slot must default to the slot before
+                    // comparing, or every bare-slot provider looks rebuilt.
+                    let bound_sub = bsub.as_deref().unwrap_or(bslot.as_str());
                     if let Some(dep_slots) = selected.get(dep_cp)
-                        && dep_slots
-                            .iter()
-                            .any(|(_, dm)| &dm.slot == bslot && &dm.subslot != bsub)
+                        && dep_slots.iter().any(|(_, dm)| {
+                            &dm.slot == bslot
+                                && dm.subslot.as_deref().unwrap_or(dm.slot.as_str()) != bound_sub
+                        })
                     {
                         subslot_rebuild = true;
                     }

@@ -266,13 +266,12 @@ pub fn resolve_config(
         }
     }
 
-    // Accepted keywords, defaulting to the profile arch.
-    let mut accepted: std::collections::BTreeSet<String> = env
-        .get("ACCEPT_KEYWORDS")
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect();
+    // Accepted keywords, defaulting to the profile arch. ACCEPT_KEYWORDS is an
+    // incremental variable kept in signed form, so resolve `-keyword` removals
+    // before building the accepted set.
+    let (accepted_vec, _) =
+        crate::stacking::stack_layers_signed([env.get("ACCEPT_KEYWORDS").unwrap_or_default()]);
+    let mut accepted: std::collections::BTreeSet<String> = accepted_vec.into_iter().collect();
     if accepted.is_empty() && !arch.is_empty() {
         accepted.insert(arch.clone());
     }

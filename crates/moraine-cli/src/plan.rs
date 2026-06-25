@@ -222,6 +222,7 @@ mod tests {
             slot: "0".to_owned(),
             subslot: None,
             use_enabled: use_enabled.iter().map(|s| s.to_string()).collect(),
+            iuse: use_enabled.iter().map(|s| s.to_string()).collect(),
             slot_bindings: Vec::new(),
         }
     }

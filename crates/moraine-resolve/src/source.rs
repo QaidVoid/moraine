@@ -58,6 +58,10 @@ pub struct InstalledMeta {
     pub subslot: Option<String>,
     /// The recorded enabled USE flags.
     pub use_enabled: BTreeSet<String>,
+    /// The declared IUSE flags (bare names, no `+`/`-`), needed so a USE-dep
+    /// default (`[flag(+)]`) is not applied to a flag the package actually
+    /// declares but has disabled.
+    pub iuse: BTreeSet<String>,
     /// Recorded `:=`/`:slot=` bindings: `(dependency_cp, slot, subslot)`.
     pub slot_bindings: Vec<(String, String, Option<String>)>,
 }
