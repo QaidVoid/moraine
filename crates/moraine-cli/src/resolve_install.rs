@@ -26,9 +26,9 @@ use moraine_build::{
 use moraine_common::Interner;
 use moraine_config::{ResolvedConfig, resolve_config};
 use moraine_install::{
-    BinhostSource, BinpkgRunner, BinpkgSource, BuildOptions, BuildPlanner, EngineApplier,
-    InstallError, InstallTask, LocalPkgdir, Realized, SourceKind, SourceRunner, StepRunner,
-    Transaction, TransactionEngine,
+    BinpkgRunner, BinpkgSource, BuildOptions, BuildPlanner, EngineApplier, InstallError,
+    InstallTask, LocalPkgdir, Realized, SourceKind, SourceRunner, StepRunner, Transaction,
+    TransactionEngine,
 };
 use moraine_repo::store::{StoredEntry, read_entries};
 use moraine_repo::{RepoIndex, RepoSet, build_index_with, discover};
@@ -128,12 +128,33 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
 
     let prefs = BinaryPrefs::from(cli, &ctx.features);
     let pkgdir = wr.eroot.join("var/cache/binpkgs");
+    let stage = wr.state_dir.join("install-stage");
+
+    // Fetch the binhost index when binary packages are wanted, for sizes and
+    // for fetching. Done once; reused for display and execution.
+    let binhost = if prefs.getbinpkg {
+        let uris = crate::binhost::binhost_uris(&config_dir, &ctx.vars);
+        crate::binhost::IndexedBinhost::load(
+            &uris,
+            moraine_binpkg::fetch::FetchCommand::default(),
+            &stage,
+        )
+    } else {
+        None
+    };
 
     // Build the presentation plan and enrich it with source/binary, repository,
     // and download size, then render it `emerge`-style.
     let mut plan = build_plan(&order, &solution, &source);
     enrich_plan(
-        &mut plan, &repo_set, &store_dir, &config, &interner, &prefs, &pkgdir,
+        &mut plan,
+        &repo_set,
+        &store_dir,
+        &config,
+        &interner,
+        &prefs,
+        &pkgdir,
+        binhost.as_ref(),
     );
     print!("{}", render_merge_list(&plan, cli.is_verbose()));
     if cli.show_tree() {
@@ -173,22 +194,14 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         pkgdir: pkgdir.clone(),
         ..BuildOptions::default()
     };
-    let stage = wr.state_dir.join("install-stage");
-    let binpkg_source: Box<dyn BinpkgSource> = if prefs.getbinpkg {
-        Box::new(BinhostSource {
-            base_uri: ctx
-                .vars
-                .get("PORTAGE_BINHOST")
-                .unwrap_or_default()
-                .to_owned(),
-            fetch: moraine_binpkg::fetch::FetchCommand::default(),
-            stage_dir: stage.clone(),
-        })
-    } else {
-        Box::new(LocalPkgdir {
-            pkgdir: pkgdir.clone(),
-        })
-    };
+    // Try a local package first, then the binhost.
+    let mut sources: Vec<Box<dyn BinpkgSource>> = vec![Box::new(LocalPkgdir {
+        pkgdir: pkgdir.clone(),
+    })];
+    if let Some(bh) = binhost {
+        sources.push(Box::new(bh));
+    }
+    let binpkg_source = crate::binhost::ChainSource::new(sources);
     let runner = CombinedRunner {
         source: SourceRunner::new(planner, &command_runner, options),
         binpkg: BinpkgRunner::new(binpkg_source, stage),
@@ -205,14 +218,24 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
 /// A runner that dispatches each task to the source or binary path.
 struct CombinedRunner<'a> {
     source: SourceRunner<'a, CliPlanner<'a>, SystemRunner>,
-    binpkg: BinpkgRunner<Box<dyn BinpkgSource>>,
+    binpkg: BinpkgRunner<crate::binhost::ChainSource>,
 }
 
 impl StepRunner for CombinedRunner<'_> {
     fn realize(&self, task: &InstallTask) -> moraine_install::Result<Realized> {
         match task.source {
-            SourceKind::Binary => self.binpkg.realize(task),
             SourceKind::Source => self.source.realize(task),
+            SourceKind::Binary => match self.binpkg.realize(task) {
+                // No binary package was available anywhere: fall back to a source
+                // build, matching `emerge`'s behavior without `--usepkgonly`.
+                Err(InstallError::Realize { reason, .. })
+                    if reason.contains("no compatible binary package") =>
+                {
+                    tracing::warn!(cpv = %task.cpv, "no binary package found; building from source");
+                    self.source.realize(task)
+                }
+                other => other,
+            },
         }
     }
 }
@@ -560,6 +583,7 @@ fn split_operator(target: &str) -> (&str, &str) {
 
 /// Enrich the presentation plan with source/binary kind, repository, and
 /// download size, reading each package's stored entry from disk once.
+#[allow(clippy::too_many_arguments)]
 fn enrich_plan(
     plan: &mut crate::render::MergePlan,
     repo_set: &RepoSet,
@@ -568,6 +592,7 @@ fn enrich_plan(
     interner: &Interner,
     prefs: &BinaryPrefs,
     pkgdir: &Path,
+    binhost: Option<&crate::binhost::IndexedBinhost>,
 ) {
     let mut cache: HashMap<String, Arc<Vec<StoredEntry>>> = HashMap::new();
     for entry in &mut plan.entries {
@@ -583,8 +608,20 @@ fn enrich_plan(
             continue;
         };
         entry.repository = Some(stored.repository.clone());
+
+        // The resolver's enabled set is the whole effective USE; restrict the
+        // displayed flags to the package's own IUSE (plus any removed flags).
+        let iuse: HashSet<String> = stored
+            .iuse
+            .iter()
+            .map(|f| f.trim_start_matches(['+', '-']).to_owned())
+            .collect();
+        entry
+            .use_flags
+            .retain(|f| f.removed || iuse.contains(&f.name));
+
         entry.fetch_size = if binary {
-            binary_size(pkgdir, &cpv)
+            binary_size(pkgdir, &cpv).or_else(|| binhost.and_then(|b| b.size_of(&cpv)))
         } else {
             source_size(&stored, repo_set, config, interner)
         };

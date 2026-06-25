@@ -265,12 +265,15 @@ fn render_flag_group(flags: &[&UseFlag]) -> String {
     let mut tokens: Vec<String> = Vec::new();
     for flag in flags {
         if flag.removed {
-            tokens.push(format!("(-{}*)", flag.name));
+            // Removed flags: yellow, matching `emerge`'s `(-flag*)`.
+            tokens.push(paint(&format!("(-{}*)", flag.name), "33"));
             continue;
         }
         let sign = if flag.enabled { "" } else { "-" };
         let mark = if flag.changed { "*" } else { "" };
-        tokens.push(format!("{sign}{}{mark}", flag.name));
+        // Enabled flags are red, disabled flags blue, as `emerge` colors them.
+        let color = if flag.enabled { "31" } else { "34" };
+        tokens.push(paint(&format!("{sign}{}{mark}", flag.name), color));
     }
     tokens.join(" ")
 }

@@ -9,6 +9,7 @@
 
 pub mod action;
 pub mod args;
+pub mod binhost;
 pub mod config;
 pub mod corpus;
 pub mod diagnostics;
