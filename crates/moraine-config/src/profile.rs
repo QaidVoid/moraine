@@ -442,6 +442,26 @@ mod tests {
     }
 
     #[test]
+    fn deprecation_reads_selected_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("p");
+        fs::create_dir_all(&node).unwrap();
+        write(
+            &node.join("deprecated"),
+            "gentoo:default/linux/amd64/23.0\n",
+        );
+        let ctx = ProfileContext {
+            repo_profiles: &|_| None,
+            node_repo: &|_| RepoProfileInfo::default(),
+        };
+        let stack = ProfileStack::from_profile(&node, &ctx).unwrap();
+        assert_eq!(
+            stack.deprecation().as_deref(),
+            Some("gentoo:default/linux/amd64/23.0")
+        );
+    }
+
+    #[test]
     fn unsupported_eapi_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let node = dir.path().join("p");

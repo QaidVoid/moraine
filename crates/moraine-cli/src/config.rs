@@ -470,6 +470,19 @@ mod tests {
     }
 
     #[test]
+    fn arch_list_loads_from_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = dir.path().join("gentoo");
+        std::fs::create_dir_all(loc.join("profiles")).unwrap();
+        std::fs::write(loc.join("profiles/repo_name"), "gentoo\n").unwrap();
+        std::fs::write(loc.join("profiles/arch.list"), "amd64\narm64\n# x86\n").unwrap();
+        let conf = dir.path().join("repos.conf");
+        std::fs::write(&conf, format!("[gentoo]\nlocation = {}\n", loc.display())).unwrap();
+        let repos = discover(&conf).unwrap();
+        assert_eq!(arch_list(Some(&repos)), vec!["amd64", "arm64"]);
+    }
+
+    #[test]
     fn thirdparty_mirrors_load_and_stack() {
         let dir = tempfile::tempdir().unwrap();
         let loc = dir.path().join("gentoo");
