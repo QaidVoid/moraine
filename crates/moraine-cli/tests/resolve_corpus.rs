@@ -37,10 +37,12 @@ fn resolves_an_atom_with_dependencies_from_corpus() {
 
     // A minimal resolved configuration is enough to exercise the path; a full one
     // would read the corpus profile, which the loader supports.
+    let repo_masks = moraine_cli::config::repo_mask_inputs(&repo_set);
     let config = resolve_config(
         &Default::default(),
         &Default::default(),
         &root,
+        &repo_masks,
         Vec::new(),
         Vec::new(),
         &interner,

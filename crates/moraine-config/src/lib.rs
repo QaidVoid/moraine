@@ -15,7 +15,8 @@ pub mod use_resolution;
 pub mod visibility;
 
 pub use error::ConfigError;
-pub use loader::resolve_config;
+pub use loader::{RepoMaskInput, resolve_config};
 pub use makeconf::VarMap;
 pub use profile::{ProfileNode, ProfileStack};
-pub use snapshot::ResolvedConfig;
+pub use snapshot::{ResolvedConfig, Visibility};
+pub use visibility::MaskReason;

@@ -135,16 +135,18 @@ impl ResolveSource for RealSource<'_> {
                 subslot: entry.subslot,
                 repo: Some(entry.repository),
             };
-            if self.config.is_masked(&pref) {
-                return false;
-            }
             let keywords: Vec<String> = entry
                 .keywords
                 .iter()
                 .filter_map(|k| interner.resolve(*k).map(|x| x.to_string()))
                 .collect();
-            let kw = self.config.keyword_result(&keywords, &[]);
-            return matches!(kw, moraine_config::visibility::KeywordResult::Accepted);
+            // Compute the structured visibility so a hard-mask reason stays
+            // distinct from a missing-keyword reason; the resolver only needs the
+            // accept/reject decision here.
+            return matches!(
+                self.config.visibility(&pref, &keywords, &[]),
+                moraine_config::Visibility::Visible
+            );
         }
         false
     }

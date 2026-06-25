@@ -12,17 +12,36 @@
 //! same interner. Parsing every file with one shared interner is what makes
 //! masking and USE actually apply during resolution.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use moraine_atom::Atom;
 use moraine_common::Interner;
-use moraine_eapi::PERMISSIVE;
+use moraine_eapi::{EapiFeatures, PERMISSIVE, features_for};
 
 use crate::makeconf::VarMap;
 use crate::profile::ProfileStack;
 use crate::snapshot::ResolvedConfig;
 use crate::use_resolution::{PkgUseEntry, UseManager, global_use, iuse_effective};
-use crate::visibility::{MaskManager, ProvidedManager};
+use crate::visibility::{MaskBuilder, ProvidedManager, parse_mask_pattern};
+
+/// A repository's masking input: its name (for `::repo` scoping), its default
+/// profile EAPI (for parsing its mask atoms), and the ordered `profiles`
+/// directories whose `package.mask`/`package.unmask` to stack (masters first,
+/// then the repository itself).
+#[derive(Debug, Clone)]
+pub struct RepoMaskInput {
+    /// The repository name, used to scope its masks with `::repo`.
+    pub name: String,
+    /// The repository's default profile EAPI, if known.
+    pub eapi: Option<String>,
+    /// The `profiles` directories to stack masks from, masters first.
+    pub profiles_dirs: Vec<PathBuf>,
+}
+
+/// The EAPI feature set for an optional EAPI string, permissive when absent.
+fn features_for_opt(eapi: Option<&str>) -> EapiFeatures {
+    eapi.map(features_for).unwrap_or(PERMISSIVE)
+}
 
 /// Assemble a [`ResolvedConfig`] from the active profile stack, the merged
 /// environment, and `/etc/portage` under `config_root`.
@@ -33,6 +52,7 @@ pub fn resolve_config(
     profile: &ProfileStack,
     env: &VarMap,
     config_root: &Path,
+    repo_masks: &[RepoMaskInput],
     system: Vec<String>,
     world: Vec<String>,
     interner: &Interner,
@@ -98,26 +118,62 @@ pub fn resolve_config(
         }
     }
 
-    // Package masking: profile package.mask/unmask then /etc/portage.
-    let mut mask_manager = MaskManager::new();
-    for node in &profile.nodes {
-        apply_mask_file(&mut mask_manager, &node.path.join("package.mask"), interner);
-        apply_unmask_file(
-            &mut mask_manager,
-            &node.path.join("package.unmask"),
-            interner,
-        );
+    // Package masking, lowest layer first:
+    //   1. repository-wide masks (per repo, stacked over masters, `::repo`-scoped),
+    //   2. the selected profile chain (global incremental stack),
+    //   3. `/etc/portage` (plain lines mask, `-atoms` are standing unmasks).
+    let mut mask_builder = MaskBuilder::new();
+
+    for repo in repo_masks {
+        let repo_sym = interner.intern(&repo.name);
+        let features = features_for_opt(repo.eapi.as_deref());
+        for token in stack_mask_tokens(&repo.profiles_dirs, "package.mask") {
+            if let Some(pattern) = parse_mask_pattern(&token, interner, features) {
+                mask_builder.push(&token, pattern, Some((&repo.name, repo_sym)));
+            }
+        }
+        for dir in &repo.profiles_dirs {
+            for line in read_lines(&dir.join("package.unmask")) {
+                let text = line.strip_prefix('-').unwrap_or(&line);
+                if let Some(pattern) = parse_mask_pattern(text, interner, features) {
+                    mask_builder.add_standing_unmask(pattern);
+                }
+            }
+        }
     }
-    apply_mask_file(
-        &mut mask_manager,
-        &config_root.join("etc/portage/package.mask"),
-        interner,
-    );
-    apply_unmask_file(
-        &mut mask_manager,
-        &config_root.join("etc/portage/package.unmask"),
-        interner,
-    );
+
+    for node in &profile.nodes {
+        let features = features_for(&node.eapi);
+        for line in read_lines(&node.path.join("package.mask")) {
+            apply_profile_mask_line(&mut mask_builder, &line, interner, features);
+        }
+        for line in read_lines(&node.path.join("package.unmask")) {
+            let text = line.strip_prefix('-').unwrap_or(&line);
+            if let Some(pattern) = parse_mask_pattern(text, interner, features) {
+                mask_builder.add_standing_unmask(pattern);
+            }
+        }
+    }
+
+    for line in read_lines(&config_root.join("etc/portage/package.mask")) {
+        if line == "-*" {
+            mask_builder.clear();
+        } else if let Some(rest) = line.strip_prefix('-') {
+            if let Some(pattern) = parse_mask_pattern(rest, interner, PERMISSIVE) {
+                mask_builder.add_standing_unmask(pattern);
+            }
+        } else if let Some(pattern) = parse_mask_pattern(&line, interner, PERMISSIVE) {
+            mask_builder.push(&line, pattern, None);
+        }
+    }
+    for line in read_lines(&config_root.join("etc/portage/package.unmask")) {
+        let text = line.strip_prefix('-').unwrap_or(&line);
+        if let Some(pattern) = parse_mask_pattern(text, interner, PERMISSIVE) {
+            mask_builder.add_standing_unmask(pattern);
+        }
+    }
+
+    let mask_manager = mask_builder.build();
 
     // Externally provided packages.
     let mut provided = ProvidedManager::new();
@@ -248,27 +304,40 @@ fn parse_pkg_use(line: &str, interner: &Interner) -> Option<PkgUseEntry> {
     Some(PkgUseEntry { atom, mods })
 }
 
-/// Apply a `package.mask` file: plain lines mask, `-` lines unmask.
-fn apply_mask_file(manager: &mut MaskManager, path: &Path, interner: &Interner) {
-    for line in read_lines(path) {
-        if let Some(rest) = line.strip_prefix('-') {
-            if let Some(atom) = parse_atom(rest, interner) {
-                manager.add_unmask(atom);
-            }
-        } else if let Some(atom) = parse_atom(&line, interner) {
-            manager.add_mask(atom);
-        }
+/// Apply one profile-chain `package.mask` line to the builder: `-*` clears, a
+/// `-atom` pops the matching prior mask, and a plain line pushes a mask.
+fn apply_profile_mask_line(
+    builder: &mut MaskBuilder,
+    line: &str,
+    interner: &Interner,
+    features: EapiFeatures,
+) {
+    if line == "-*" {
+        builder.clear();
+    } else if let Some(rest) = line.strip_prefix('-') {
+        builder.pop(rest);
+    } else if let Some(pattern) = parse_mask_pattern(line, interner, features) {
+        builder.push(line, pattern, None);
     }
 }
 
-/// Apply a `package.unmask` file: every line unmasks.
-fn apply_unmask_file(manager: &mut MaskManager, path: &Path, interner: &Interner) {
-    for line in read_lines(path) {
-        let text = line.strip_prefix('-').unwrap_or(&line);
-        if let Some(atom) = parse_atom(text, interner) {
-            manager.add_unmask(atom);
+/// Incrementally stack the tokens of `filename` across `dirs` (masters first):
+/// a plain token is appended once, a `-token` removes the matching prior token,
+/// and `-*` clears the accumulator, mirroring `stack_lists`.
+fn stack_mask_tokens(dirs: &[PathBuf], filename: &str) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for dir in dirs {
+        for token in read_lines(&dir.join(filename)) {
+            if token == "-*" {
+                order.clear();
+            } else if let Some(rest) = token.strip_prefix('-') {
+                order.retain(|t| t != rest);
+            } else if !order.iter().any(|t| t == &token) {
+                order.push(token);
+            }
         }
     }
+    order
 }
 
 /// Parse one atom against `interner`, returning `None` on a parse error so a bad
@@ -317,6 +386,7 @@ mod tests {
             &profile_with(dir.path()),
             &VarMap::new(),
             dir.path(),
+            &[],
             vec![],
             vec![],
             &interner,
@@ -341,12 +411,53 @@ mod tests {
             &profile_with(dir.path()),
             &VarMap::new(),
             dir.path(),
+            &[],
             vec![],
             vec![],
             &interner,
         );
         let version = Version::parse("1.0").unwrap();
         assert!(!cfg.is_masked(&pref(&interner, "dev-libs", "x", &version)));
+    }
+
+    #[test]
+    fn repo_wide_mask_applies_and_is_repo_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("repo/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(profiles.join("package.mask"), "dev-libs/foo\n").unwrap();
+        let interner = Interner::new();
+        let repo_masks = vec![RepoMaskInput {
+            name: "gentoo".to_owned(),
+            eapi: Some("8".to_owned()),
+            profiles_dirs: vec![profiles],
+        }];
+        let cfg = resolve_config(
+            &ProfileStack::default(),
+            &VarMap::new(),
+            dir.path(),
+            &repo_masks,
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("1.0").unwrap();
+        let gentoo = interner.intern("gentoo");
+        let from_gentoo = PackageRef {
+            category: interner.intern("dev-libs"),
+            package: interner.intern("foo"),
+            version: &version,
+            slot: None,
+            subslot: None,
+            repo: Some(gentoo),
+        };
+        assert!(cfg.is_masked(&from_gentoo));
+        // The same cp from another repository is not masked by gentoo's scope.
+        let from_overlay = PackageRef {
+            repo: Some(interner.intern("overlay")),
+            ..from_gentoo
+        };
+        assert!(!cfg.is_masked(&from_overlay));
     }
 
     #[test]
@@ -358,6 +469,7 @@ mod tests {
             &profile_with(dir.path()),
             &VarMap::new(),
             dir.path(),
+            &[],
             vec![],
             vec![],
             &interner,
@@ -385,6 +497,7 @@ mod tests {
             &profile_with_eapi(dir.path(), "6"),
             &VarMap::new(),
             dir.path(),
+            &[],
             vec![],
             vec![],
             &interner,
@@ -406,6 +519,7 @@ mod tests {
             &profile_with_eapi(dir.path(), "7"),
             &VarMap::new(),
             dir.path(),
+            &[],
             vec![],
             vec![],
             &interner,
@@ -426,6 +540,7 @@ mod tests {
             &profile_with_eapi(dir.path(), "4"),
             &VarMap::new(),
             dir.path(),
+            &[],
             vec![],
             vec![],
             &interner,
@@ -442,6 +557,7 @@ mod tests {
             &profile_with_eapi(dir.path(), "8"),
             &VarMap::new(),
             dir.path(),
+            &[],
             vec![],
             vec![],
             &interner,
@@ -464,6 +580,7 @@ mod tests {
             &profile_with(dir.path()),
             &env,
             dir.path(),
+            &[],
             vec![],
             vec![],
             &interner,

@@ -223,6 +223,31 @@ fn owning_repo<'a>(set: &'a RepoSet, path: &Path) -> Option<&'a RepoConfig> {
     best
 }
 
+/// Build the per-repository masking inputs for `resolve_config`: each
+/// repository contributes its own `profiles/package.mask`, stacked over its
+/// masters' (in resolved order) so a child repository inherits and may override
+/// its masters, with every atom scoped to the repository.
+pub fn repo_mask_inputs(repos: &RepoSet) -> Vec<moraine_config::RepoMaskInput> {
+    repos
+        .ordered()
+        .map(|repo| {
+            let mut profiles_dirs: Vec<PathBuf> = repos
+                .order()
+                .iter()
+                .filter(|name| repo.masters.iter().any(|m| m == *name))
+                .filter_map(|name| repos.get(name))
+                .map(|m| m.location.join("profiles"))
+                .collect();
+            profiles_dirs.push(repo.location.join("profiles"));
+            moraine_config::RepoMaskInput {
+                name: repo.name.clone(),
+                eapi: repo_default_eapi(&repo.location),
+                profiles_dirs,
+            }
+        })
+        .collect()
+}
+
 /// A repository's default profile EAPI: `layout.conf`'s
 /// `profile_eapi_when_unspecified`, else the `profiles/eapi` file, else none.
 fn repo_default_eapi(location: &Path) -> Option<String> {

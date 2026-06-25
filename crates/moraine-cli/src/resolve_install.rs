@@ -86,10 +86,12 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let repo_set =
         discover(&repos_conf).map_err(|e| miette!("repository discovery failed: {e}"))?;
     let vdb = crate::write::load_installed_store(&wr.vdb_dir)?;
+    let repo_masks = crate::config::repo_mask_inputs(&repo_set);
     let config = resolve_config(
         &ctx.profile,
         &ctx.vars,
         &config_dir,
+        &repo_masks,
         ctx.system.clone(),
         ctx.world.clone(),
         &interner,
@@ -999,6 +1001,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             dir.path(),
+            &[],
             Vec::new(),
             Vec::new(),
             &interner,
