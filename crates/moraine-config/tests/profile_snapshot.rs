@@ -2,7 +2,7 @@
 
 use std::fs;
 
-use moraine_config::profile::{ProfileContext, ProfileStack};
+use moraine_config::profile::{ProfileContext, ProfileStack, RepoProfileInfo};
 
 #[test]
 fn profile_chain_orders_parents_first() {
@@ -15,7 +15,7 @@ fn profile_chain_orders_parents_first() {
 
     let ctx = ProfileContext {
         repo_profiles: &|_| None,
-        formats: &[],
+        node_repo: &|_| RepoProfileInfo::default(),
     };
     let stack = ProfileStack::from_profile(&dir.path().join("desktop"), &ctx).unwrap();
     let names: Vec<String> = stack

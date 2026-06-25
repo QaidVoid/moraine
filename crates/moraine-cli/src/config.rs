@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 
 use miette::Diagnostic;
 use moraine_config::makeconf::VarMap;
-use moraine_config::profile::{ProfileContext, ProfileStack, read_profile_formats};
+use moraine_config::profile::{ProfileContext, ProfileStack, RepoProfileInfo};
 use moraine_config::sets::{selected_set, system_set, world_set};
+use moraine_repo::{RepoConfig, RepoSet, discover};
 use thiserror::Error;
 use tracing::instrument;
 
@@ -90,7 +91,17 @@ impl ConfigContext {
     #[instrument(skip(roots))]
     pub fn load(roots: &Roots) -> Result<ConfigContext, ConfigLoadError> {
         let config_dir = roots.config_dir();
-        let profile = load_profile(&config_dir, roots.profile.as_deref());
+        // Discover repositories so profile parents (`repo:path` and leading-colon
+        // `:path`) resolve and per-node `profile-formats` and default EAPI come
+        // from the owning repository. A missing or unreadable repos.conf is
+        // tolerated as no repositories.
+        let repos_conf = config_dir.join("etc/portage/repos.conf");
+        let repos = if repos_conf.exists() {
+            discover(&repos_conf).ok()
+        } else {
+            None
+        };
+        let profile = load_profile(&config_dir, roots.profile.as_deref(), repos.as_ref())?;
 
         let mut env = VarMap::new();
         // make.globals is the lowest configuration layer, below profile
@@ -150,17 +161,88 @@ impl ConfigContext {
     }
 }
 
-/// Resolve the profile stack, tolerating an unresolvable profile.
-fn load_profile(config_dir: &Path, explicit: Option<&Path>) -> ProfileStack {
-    let formats: Vec<String> = explicit.map(read_profile_formats).unwrap_or_default();
-    let ctx = ProfileContext {
-        repo_profiles: &|_| None,
-        formats: &formats,
+/// Resolve the profile stack against the discovered repositories.
+///
+/// A missing profile selection (no `make.profile`) is tolerated as an empty
+/// stack so the read-only path still runs, but a malformed parent chain or an
+/// unsupported EAPI surfaces as an error rather than silently zeroing the stack.
+fn load_profile(
+    config_dir: &Path,
+    explicit: Option<&Path>,
+    repos: Option<&RepoSet>,
+) -> Result<ProfileStack, ConfigLoadError> {
+    let repo_profiles =
+        |name: &str| -> Option<PathBuf> { repos?.get(name).map(|c| c.location.join("profiles")) };
+    let node_repo = |path: &Path| -> RepoProfileInfo {
+        let Some(set) = repos else {
+            return RepoProfileInfo::default();
+        };
+        match owning_repo(set, path) {
+            Some(c) => RepoProfileInfo {
+                profiles_dir: Some(c.location.join("profiles")),
+                formats: c.profile_formats.clone(),
+                default_eapi: repo_default_eapi(&c.location),
+            },
+            None => RepoProfileInfo::default(),
+        }
     };
+    let ctx = ProfileContext {
+        repo_profiles: &repo_profiles,
+        node_repo: &node_repo,
+    };
+
     if let Some(profile) = explicit {
-        return ProfileStack::from_profile(profile, &ctx).unwrap_or_default();
+        return ProfileStack::from_profile(profile, &ctx).map_err(ConfigLoadError::Profile);
     }
-    ProfileStack::resolve_active(config_dir, &ctx).unwrap_or_default()
+    match ProfileStack::resolve_active(config_dir, &ctx) {
+        Ok(stack) => Ok(stack),
+        // No selected profile (absent or unresolvable make.profile) stays
+        // tolerant so a bare root still runs read-only.
+        Err(moraine_config::ConfigError::Io { .. }) => Ok(ProfileStack::default()),
+        Err(other) => Err(ConfigLoadError::Profile(other)),
+    }
+}
+
+/// The repository whose `profiles` directory is the longest ancestor of `path`,
+/// canonicalizing both sides so symlinked profiles and `..` components match.
+fn owning_repo<'a>(set: &'a RepoSet, path: &Path) -> Option<&'a RepoConfig> {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut best: Option<&RepoConfig> = None;
+    let mut best_len = 0;
+    for cfg in set.ordered() {
+        let profiles = cfg.location.join("profiles");
+        let profiles = std::fs::canonicalize(&profiles).unwrap_or(profiles);
+        if path.starts_with(&profiles) {
+            let len = profiles.as_os_str().len();
+            if len >= best_len {
+                best = Some(cfg);
+                best_len = len;
+            }
+        }
+    }
+    best
+}
+
+/// A repository's default profile EAPI: `layout.conf`'s
+/// `profile_eapi_when_unspecified`, else the `profiles/eapi` file, else none.
+fn repo_default_eapi(location: &Path) -> Option<String> {
+    if let Ok(layout) = std::fs::read_to_string(location.join("metadata/layout.conf")) {
+        for line in layout.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("profile_eapi_when_unspecified")
+                && let Some(value) = rest.trim_start().strip_prefix('=')
+            {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_owned());
+                }
+            }
+        }
+    }
+    std::fs::read_to_string(location.join("profiles/eapi"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 impl SetSource for ConfigContext {
