@@ -267,7 +267,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
 
         // virtual/* atoms expand to a disjunction over providers.
         if atom.cp.starts_with("virtual/") {
-            match self.expand_virtual(atom, parent_use, features) {
+            match self.expand_virtual(atom, features) {
                 Some(alts) => push_disjunction(clauses, alts),
                 None => return Err(format!("no provider for {}", atom.cp)),
             }
@@ -318,7 +318,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                     continue;
                 }
                 if atom.cp.starts_with("virtual/") {
-                    match self.expand_virtual(atom, parent_use, features) {
+                    match self.expand_virtual(atom, features) {
                         Some(alts) => reps.extend(alts),
                         None => {
                             satisfiable = false;
@@ -415,22 +415,16 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
     }
 
     /// Public wrapper used for request atoms, applying permissive EAPI features.
-    pub fn expand_virtual_pub(
-        &self,
-        atom: &NormAtom,
-        parent_use: &BTreeSet<String>,
-    ) -> Option<Vec<Alt>> {
-        self.expand_virtual(atom, parent_use, moraine_eapi::PERMISSIVE)
+    pub fn expand_virtual_pub(&self, atom: &NormAtom) -> Option<Vec<Alt>> {
+        self.expand_virtual(atom, moraine_eapi::PERMISSIVE)
     }
 
-    /// Expand a `virtual/*` atom into the disjunction alternatives over its
-    /// providers, highest virtual version first, following only RDEPEND.
-    fn expand_virtual(
-        &self,
-        atom: &NormAtom,
-        parent_use: &BTreeSet<String>,
-        features: EapiFeatures,
-    ) -> Option<Vec<Alt>> {
+    /// Expand a `virtual/*` atom into provider alternatives, highest virtual
+    /// version first, following only RDEPEND. A provider dependency is evaluated
+    /// against the virtual's own USE (resolved per virtual version below), not
+    /// the outer package that pulled the virtual in, so the outer USE is not a
+    /// parameter.
+    fn expand_virtual(&self, atom: &NormAtom, features: EapiFeatures) -> Option<Vec<Alt>> {
         let mut providers: Vec<Alt> = Vec::new();
         let mut virtuals = self.source.versions_of(&atom.cp);
         // Highest virtual version first.
@@ -454,8 +448,12 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 }
             }
             for pa in collected {
+                // A provider dependency is parented by the virtual, so its USE
+                // dependencies (`flag=`, `flag?`, ...) are evaluated against the
+                // virtual's own USE, not the outer package that pulled the
+                // virtual in.
                 if pa.cp.starts_with("virtual/") {
-                    if let Some(nested) = self.expand_virtual(pa, parent_use, features) {
+                    if let Some(nested) = self.expand_virtual(pa, features) {
                         providers.extend(nested);
                     }
                     continue;
@@ -463,7 +461,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 if self.atom_is_provided(pa) {
                     continue;
                 }
-                if let Some(term) = self.required_term(pa, parent_use, features) {
+                if let Some(term) = self.required_term(pa, &vuse, features) {
                     providers.push((pa.cp.clone(), term));
                 }
             }

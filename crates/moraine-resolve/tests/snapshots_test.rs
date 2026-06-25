@@ -49,6 +49,7 @@ fn serialized_order_snapshot() {
             edge("cat/tool", "sys-libs/glibc", DepClass::Depend),
         ],
         blockers: Vec::new(),
+        backtracks: 0,
     };
     let tasks = serialize(&solution).expect("serializes");
     let rendered: String = tasks

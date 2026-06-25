@@ -108,10 +108,17 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         return Ok(());
     }
 
-    // Resolve and serialize the merge order.
+    // Resolve and serialize the merge order, timing the solve.
     let source = RealSource::new(&repo_index, &vdb, &config);
     let atom_refs: Vec<&str> = request.atoms.iter().map(String::as_str).collect();
+    let started = std::time::Instant::now();
     let solution = resolve(&source, &atom_refs).map_err(|e| miette!("resolution failed:\n{e}"))?;
+    let elapsed = started.elapsed();
+    println!(
+        "Dependency resolution took {:.2} s (backtracks: {})",
+        elapsed.as_secs_f64(),
+        solution.backtracks
+    );
     let raw_order = serialize(&solution).map_err(|e| miette!("merge ordering failed: {e}"))?;
 
     // Drop blocker uninstalls for packages that are not installed, and resolve

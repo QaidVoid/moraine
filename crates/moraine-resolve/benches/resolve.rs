@@ -37,6 +37,7 @@ fn linear_solution(n: usize) -> ResolvedSolution {
         packages,
         edges,
         blockers: Vec::new(),
+        backtracks: 0,
     }
 }
 

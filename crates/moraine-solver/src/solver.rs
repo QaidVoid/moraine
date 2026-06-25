@@ -23,12 +23,20 @@ enum IncompatRelation {
     None,
 }
 
+/// Statistics gathered while solving, for reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SolveStats {
+    /// The number of conflict-driven backjumps performed.
+    pub backtracks: u32,
+}
+
 struct Solver<'p, DP: DependencyProvider> {
     provider: &'p DP,
     incompatibilities: Vec<Incompatibility<DP::Package, DP::Version>>,
     by_package: BTreeMap<DP::Package, Vec<IncompatId>>,
     partial: PartialSolution<DP::Package, DP::Version>,
     root: DP::Package,
+    backtracks: u32,
 }
 
 /// Solve for a conflict-free set of package versions starting from a root
@@ -38,12 +46,22 @@ pub fn solve<DP: DependencyProvider>(
     root_package: DP::Package,
     root_version: DP::Version,
 ) -> Solution<DP::Package, DP::Version> {
+    solve_with_stats(provider, root_package, root_version).0
+}
+
+/// Solve as [`solve`], also returning the [`SolveStats`] gathered during the run.
+pub fn solve_with_stats<DP: DependencyProvider>(
+    provider: &DP,
+    root_package: DP::Package,
+    root_version: DP::Version,
+) -> (Solution<DP::Package, DP::Version>, SolveStats) {
     let mut solver = Solver {
         provider,
         incompatibilities: Vec::new(),
         by_package: BTreeMap::new(),
         partial: PartialSolution::default(),
         root: root_package.clone(),
+        backtracks: 0,
     };
     solver.add_incompat(Incompatibility {
         terms: vec![(
@@ -52,7 +70,11 @@ pub fn solve<DP: DependencyProvider>(
         )],
         cause: Cause::Root,
     });
-    solver.run(root_package)
+    let result = solver.run(root_package);
+    let stats = SolveStats {
+        backtracks: solver.backtracks,
+    };
+    (result, stats)
 }
 
 impl<DP: DependencyProvider> Solver<'_, DP> {
@@ -243,6 +265,7 @@ impl<DP: DependencyProvider> Solver<'_, DP> {
             let (mr_pkg, mr_term) = terms[most_recent_term].clone();
 
             if previous_level < satisfier.decision_level || satisfier.cause.is_none() {
+                self.backtracks += 1;
                 self.partial.backtrack(previous_level);
                 return Ok(incompat);
             }

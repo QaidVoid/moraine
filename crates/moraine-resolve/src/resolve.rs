@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use moraine_atom::Atom;
 use moraine_common::Interner;
 use moraine_eapi::{PERMISSIVE, features_for};
-use moraine_solver::{Explanation, solve};
+use moraine_solver::{Explanation, solve_with_stats};
 use moraine_version::Version;
 use tracing::instrument;
 
@@ -40,7 +40,7 @@ pub fn resolve<S: ResolveSource>(
     let provider = GentooProvider::with_request(source, request_atoms.clone());
     let root_version = Version::parse("0").expect("synthetic version parses");
 
-    let solution = solve(&provider, REQUEST_CP.to_owned(), root_version);
+    let (solution, stats) = solve_with_stats(&provider, REQUEST_CP.to_owned(), root_version);
     let decisions = match solution {
         Ok(map) => map,
         Err(failure) => {
@@ -50,7 +50,9 @@ pub fn resolve<S: ResolveSource>(
         }
     };
 
-    assemble_solution(source, &decisions)
+    let mut resolved = assemble_solution(source, &decisions)?;
+    resolved.backtracks = stats.backtracks;
+    Ok(resolved)
 }
 
 /// Build the resolved solution from the solver's `cp -> version` decisions.
@@ -156,6 +158,7 @@ fn assemble_solution<S: ResolveSource>(
         packages,
         edges,
         blockers,
+        backtracks: 0,
     })
 }
 

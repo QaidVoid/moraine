@@ -17,5 +17,5 @@ pub mod term;
 pub use provider::{Clause, Dependencies, DependencyProvider, MapProvider, Requirements};
 pub use range::Range;
 pub use report::{Explanation, Failure, Solution};
-pub use solver::solve;
+pub use solver::{SolveStats, solve, solve_with_stats};
 pub use term::{Relation, Term};

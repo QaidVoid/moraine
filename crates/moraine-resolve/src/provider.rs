@@ -140,7 +140,7 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
             let parent_use = BTreeSet::new();
             for atom in &self.request {
                 if atom.cp.starts_with("virtual/") {
-                    match encoder.expand_virtual_pub(atom, &parent_use) {
+                    match encoder.expand_virtual_pub(atom) {
                         Some(alts) => {
                             if let Some((cp, term)) = alts.first() {
                                 reqs.clauses

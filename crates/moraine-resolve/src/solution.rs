@@ -140,6 +140,8 @@ pub struct ResolvedSolution {
     pub edges: Vec<DepEdge>,
     /// Blockers recorded for the merge-order phase.
     pub blockers: Vec<RecordedBlocker>,
+    /// The number of conflict-driven backjumps the solver performed.
+    pub backtracks: u32,
 }
 
 impl ResolvedSolution {
