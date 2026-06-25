@@ -60,9 +60,45 @@ impl VarMap {
                 });
             }
             let value = parse_value(rest, &self.vars);
-            self.vars.insert(key.to_owned(), value);
+            if self.is_incremental(key) {
+                // Incremental variables (USE, ACCEPT_KEYWORDS, USE_EXPAND, the
+                // USE_EXPAND value vars, ...) accumulate across the profile
+                // cascade and make.conf: each token adds, `-token` removes, and
+                // `-*` clears, rather than the whole value being replaced.
+                let merged = stack_incremental(self.vars.get(key), &value);
+                self.vars.insert(key.to_owned(), merged);
+            } else {
+                self.vars.insert(key.to_owned(), value);
+            }
         }
         Ok(())
+    }
+
+    /// Whether `key` is an incremental variable: a fixed core set plus every
+    /// variable named in the current `USE_EXPAND` list.
+    fn is_incremental(&self, key: &str) -> bool {
+        const CORE: &[&str] = &[
+            "USE",
+            "USE_EXPAND",
+            "USE_EXPAND_HIDDEN",
+            "USE_EXPAND_IMPLICIT",
+            "USE_EXPAND_UNPREFIXED",
+            "IUSE_IMPLICIT",
+            "CONFIG_PROTECT",
+            "CONFIG_PROTECT_MASK",
+            "FEATURES",
+            "ACCEPT_KEYWORDS",
+            "ACCEPT_LICENSE",
+            "ACCEPT_PROPERTIES",
+            "ACCEPT_RESTRICT",
+            "ENV_UNSET",
+        ];
+        CORE.contains(&key)
+            || self
+                .vars
+                .get("USE_EXPAND")
+                .map(|ue| ue.split_whitespace().any(|v| v == key))
+                .unwrap_or(false)
     }
 
     /// Parse a file or directory path into this map.
@@ -109,6 +145,24 @@ fn join_continuations(content: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Apply an incremental assignment's tokens onto the accumulated value: a plain
+/// token adds, `-token` removes, and `-*` clears, preserving order.
+fn stack_incremental(current: Option<&String>, value: &str) -> String {
+    let mut acc: Vec<String> = current
+        .map(|s| s.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default();
+    for token in value.split_whitespace() {
+        if token == "-*" {
+            acc.clear();
+        } else if let Some(name) = token.strip_prefix('-') {
+            acc.retain(|t| t != name);
+        } else if !acc.iter().any(|t| t == token) {
+            acc.push(token.to_owned());
+        }
+    }
+    acc.join(" ")
 }
 
 fn parse_value(rest: &str, vars: &BTreeMap<String, String>) -> String {
