@@ -1,7 +1,8 @@
 ---
 source: crates/moraine-resolve/tests/snapshots_test.rs
+assertion_line: 81
 expression: explanation
 ---
 - conflict [@request] derived from:
-  - "@request" depends on "cat/main" [@request, cat/main]
-  - "cat/main" is unavailable: REQUIRED_USE violated: || ( foo bar ) [cat/main]
+  - "@request" depends on "cat/main:0" [@request, cat/main:0]
+  - "cat/main:0" is unavailable: REQUIRED_USE violated: || ( foo bar ) [cat/main:0]

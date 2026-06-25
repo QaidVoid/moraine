@@ -494,6 +494,68 @@ fn slot_collision_is_a_conflict() {
 }
 
 #[test]
+fn two_slots_of_one_cp_coinstall() {
+    // The headline of slot-keying: two distinct slots of one cp are independent
+    // solver variables and install together rather than colliding.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "dev-lang/python",
+        version: "3.11",
+        slot: "3.11",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "dev-lang/python",
+        version: "3.12",
+        slot: "3.12",
+        ..Default::default()
+    });
+
+    let sol = resolve(&f, &["dev-lang/python:3.11", "dev-lang/python:3.12"]).expect("resolves");
+    let pythons: Vec<_> = sol
+        .packages
+        .iter()
+        .filter(|p| p.cp == "dev-lang/python")
+        .collect();
+    assert_eq!(pythons.len(), 2, "both slots co-install: {pythons:?}");
+    assert!(pythons.iter().any(|p| p.slot == "3.11"));
+    assert!(pythons.iter().any(|p| p.slot == "3.12"));
+}
+
+#[test]
+fn slotless_dep_satisfied_by_existing_slot() {
+    // A slotless dep does not force a new slot when an available slot already
+    // satisfies it: it expands to a disjunction over the cp's slots.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "dev-lang/python",
+        version: "3.11",
+        slot: "3.11",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "dev-lang/python",
+        version: "3.12",
+        slot: "3.12",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "app/uses-python",
+        version: "1",
+        rdepend: "dev-lang/python",
+        ..Default::default()
+    });
+
+    let sol = resolve(&f, &["app/uses-python"]).expect("resolves");
+    let pythons = sol
+        .packages
+        .iter()
+        .filter(|p| p.cp == "dev-lang/python")
+        .count();
+    assert_eq!(pythons, 1, "a slotless dep selects exactly one slot");
+}
+
+#[test]
 fn non_overlapping_any_of_is_plain_disjunction() {
     let mut f = Fixture::new();
     f.add(PkgSpec {

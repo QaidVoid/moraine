@@ -103,9 +103,18 @@ pub(crate) fn use_deps_satisfied(
 /// conjunction of atoms.
 pub(crate) type Group<'a> = Vec<Vec<&'a NormAtom>>;
 
-/// A solver disjunction alternative: a target package and the term that
-/// constrains its candidates.
+/// A solver disjunction alternative: a target `(cp, slot)` key and the term that
+/// constrains its candidate versions.
 pub(crate) type Alt = (String, Term<Version>);
+
+/// The package currently being encoded, whose own `(cp, slot, version)` is
+/// excluded from its blocker target sets.
+#[derive(Clone, Copy)]
+pub(crate) struct Parent<'a> {
+    pub cp: &'a str,
+    pub slot: &'a str,
+    pub version: &'a Version,
+}
 
 /// Recursively reduce a dependency node against the parent's USE, collecting the
 /// live top-level atoms and the any-of groups (with branch structure preserved).
@@ -238,13 +247,29 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             (&meta.idepend, DepClass::Idepend),
         ];
 
+        // The parent's own (cp, slot, version) is excluded from its blocker
+        // target sets so a self/other-slot block constrains only the other
+        // instance.
+        let parent = Parent {
+            cp: meta.cp.as_str(),
+            slot: meta.slot.as_str(),
+            version: &meta.version,
+        };
+
         for (node, _class) in class_nodes {
             let mut atoms: Vec<&NormAtom> = Vec::new();
             let mut groups: Vec<Group> = Vec::new();
             reduce(node, parent_use, &mut atoms, &mut groups);
 
             for atom in atoms {
-                self.encode_atom(atom, parent_use, &mut clauses, &mut conflicts, features)?;
+                self.encode_atom(
+                    atom,
+                    parent_use,
+                    parent,
+                    &mut clauses,
+                    &mut conflicts,
+                    features,
+                )?;
             }
             for group in &groups {
                 self.encode_group(group, parent_use, &mut clauses, features)?;
@@ -254,20 +279,63 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         Ok(Requirements { clauses, conflicts })
     }
 
+    /// Build the request root's requirements from the request atoms, keyed by
+    /// `(cp, slot)` like any other package. A no-provider atom yields a clause the
+    /// solver cannot satisfy (a bare `cp` key), so the failure names the `cp`.
+    pub fn request_requirements(&self, atoms: &[NormAtom]) -> Requirements<String, Version> {
+        let mut clauses: Vec<Clause<String, Version>> = Vec::new();
+        let mut conflicts: Vec<(String, Term<Version>)> = Vec::new();
+        let parent_use = BTreeSet::new();
+        let features = moraine_eapi::PERMISSIVE;
+        for atom in atoms {
+            if atom.blocker != BlockerKind::None {
+                for alt in self.blocked_alternatives(atom, None, &parent_use, features) {
+                    conflicts.push(alt);
+                }
+                continue;
+            }
+            if atom.cp.starts_with("virtual/") {
+                match self.expand_virtual(atom, features) {
+                    Some(alts) => push_disjunction(&mut clauses, alts),
+                    None => clauses.push(Clause::single(
+                        atom.cp.clone(),
+                        Term::positive(Range::full()),
+                    )),
+                }
+                continue;
+            }
+            if self.atom_is_provided(atom) {
+                continue;
+            }
+            let alts = self.required_alternatives(atom, &parent_use, features);
+            if alts.is_empty() {
+                clauses.push(Clause::single(
+                    atom.cp.clone(),
+                    Term::positive(Range::full()),
+                ));
+            } else {
+                push_disjunction(&mut clauses, alts);
+            }
+        }
+        Requirements { clauses, conflicts }
+    }
+
     /// Encode one plain (required) atom into a clause or a conflict. Returns
     /// `Err(reason)` if a required atom has no candidate at all.
     fn encode_atom(
         &self,
         atom: &NormAtom,
         parent_use: &BTreeSet<String>,
+        parent: Parent<'_>,
         clauses: &mut Vec<Clause<String, Version>>,
         conflicts: &mut Vec<(String, Term<Version>)>,
         features: EapiFeatures,
     ) -> Result<(), String> {
-        // Blockers become conflicts.
+        // Blockers become conflicts, one per blocked `(cp, slot)`, excluding the
+        // parent's own instance.
         if atom.blocker != BlockerKind::None {
-            if let Some(term) = self.blocked_term(atom, parent_use, features) {
-                conflicts.push((atom.cp.clone(), term));
+            for alt in self.blocked_alternatives(atom, Some(parent), parent_use, features) {
+                conflicts.push(alt);
             }
             return Ok(());
         }
@@ -289,13 +357,12 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             return Ok(());
         }
 
-        match self.required_term(atom, parent_use, features) {
-            Some(term) => {
-                clauses.push(Clause::single(atom.cp.clone(), term));
-                Ok(())
-            }
-            None => Err(format!("no provider for {}", atom.cp)),
+        let alts = self.required_alternatives(atom, parent_use, features);
+        if alts.is_empty() {
+            return Err(format!("no provider for {}", atom.cp));
         }
+        push_disjunction(clauses, alts);
+        Ok(())
     }
 
     /// Encode a `||` any-of group into a disjunction clause.
@@ -313,13 +380,14 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         clauses: &mut Vec<Clause<String, Version>>,
         features: EapiFeatures,
     ) -> Result<(), String> {
-        // Resolve each branch to its representative alternatives, dropping
-        // branches that cannot be satisfied.
+        // Resolve each branch to its leading representative atom's `(cp, slot)`
+        // alternatives, dropping branches that cannot be satisfied.
         let overlapping = branches_overlap(group);
         let mut branch_reps: Vec<(usize, Vec<Alt>)> = Vec::new();
         for (idx, branch) in group.iter().enumerate() {
-            let mut reps: Vec<Alt> = Vec::new();
+            let mut leading: Option<Vec<Alt>> = None;
             let mut satisfiable = true;
+            let mut any_required = false;
             for atom in branch {
                 if atom.blocker != BlockerKind::None {
                     continue;
@@ -327,18 +395,19 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 if self.atom_is_provided(atom) {
                     continue;
                 }
-                if atom.cp.starts_with("virtual/") {
-                    match self.expand_virtual(atom, features) {
-                        Some(alts) => reps.extend(alts),
-                        None => {
-                            satisfiable = false;
-                            break;
+                any_required = true;
+                let alts = if atom.cp.starts_with("virtual/") {
+                    self.expand_virtual(atom, features)
+                } else {
+                    let a = self.required_alternatives(atom, parent_use, features);
+                    if a.is_empty() { None } else { Some(a) }
+                };
+                match alts {
+                    Some(a) => {
+                        if leading.is_none() {
+                            leading = Some(a);
                         }
                     }
-                    continue;
-                }
-                match self.required_term(atom, parent_use, features) {
-                    Some(term) => reps.push((atom.cp.clone(), term)),
                     None => {
                         satisfiable = false;
                         break;
@@ -347,11 +416,11 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             }
             // A branch whose atoms are all provided satisfies the group with no
             // install.
-            if satisfiable && reps.is_empty() {
+            if satisfiable && !any_required {
                 return Ok(());
             }
-            if satisfiable {
-                branch_reps.push((idx, reps));
+            if satisfiable && let Some(alts) = leading {
+                branch_reps.push((idx, alts));
             }
         }
 
@@ -368,13 +437,8 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             });
         }
 
-        // The disjunction over each branch's leading representative atom.
-        let mut alternatives: Vec<Alt> = Vec::new();
-        for (_, reps) in &branch_reps {
-            if let Some(first) = reps.first() {
-                alternatives.push(first.clone());
-            }
-        }
+        // The disjunction over each branch's leading representative.
+        let alternatives: Vec<Alt> = branch_reps.into_iter().flat_map(|(_, alts)| alts).collect();
         push_disjunction(clauses, alternatives);
         Ok(())
     }
@@ -383,56 +447,118 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
     /// installed, used to prefer DNF branches that add the fewest new slots.
     fn new_slot_count(&self, reps: &[Alt]) -> usize {
         reps.iter()
-            .filter(|(cp, _)| self.source.installed(cp).is_empty())
+            .filter(|(key, _)| {
+                let cp = crate::provider::split_key(key).map_or(key.as_str(), |(c, _)| c);
+                self.source.installed(cp).is_empty()
+            })
             .count()
     }
 
-    /// The positive term constraining a required atom's candidates, narrowed so
-    /// only USE-compatible and slot-compatible versions remain. Returns `None`
-    /// when no version satisfies the atom plus its USE/slot constraints.
-    fn required_term(
+    /// The required atom's matching visible versions grouped into one `(cp,
+    /// slot)` alternative per slot, ordered installed-slot first then by highest
+    /// version, so a slotless atom becomes a disjunction over its available slots
+    /// and a slotted atom maps to its single slot variable.
+    fn required_alternatives(
         &self,
         atom: &NormAtom,
         parent_use: &BTreeSet<String>,
         features: EapiFeatures,
-    ) -> Option<Term<Version>> {
-        let allowed = self.matching_versions(atom, parent_use, features);
-        if allowed.is_empty() {
-            return None;
+    ) -> Vec<Alt> {
+        let mut by_slot: std::collections::BTreeMap<String, Vec<Version>> =
+            std::collections::BTreeMap::new();
+        for m in self.source.versions_of(&atom.cp) {
+            if !version_satisfies(atom, &m.version) || !slot_matches(atom, &m) {
+                continue;
+            }
+            if !self.source.is_visible(&m) {
+                continue;
+            }
+            let cand_use = self.source.resolved_use(&m);
+            if !use_deps_satisfied(atom, &cand_use, &m.iuse, parent_use, features) {
+                continue;
+            }
+            by_slot.entry(m.slot.clone()).or_default().push(m.version);
         }
-        Some(Term::positive(versions_to_range(&allowed)))
+        self.to_alternatives(&atom.cp, by_slot)
     }
 
-    /// The negative term for a blocker: the set of versions that must NOT be
-    /// selected.
-    fn blocked_term(
+    /// The blocker atom's matching versions (repository and installed) grouped
+    /// into one `(cp, slot)` alternative per slot, excluding the parent's own
+    /// instance so a self/other-slot block constrains only the other instance.
+    fn blocked_alternatives(
         &self,
         atom: &NormAtom,
+        parent: Option<Parent<'_>>,
         parent_use: &BTreeSet<String>,
         features: EapiFeatures,
-    ) -> Option<Term<Version>> {
-        // The versions of the blocked cp that match the blocker, including its
-        // USE condition: `!pkg[-flag]` blocks only instances with the flag off.
-        let blocked = self.matching_versions_simple(atom, parent_use, features);
-        if blocked.is_empty() {
-            return None;
+    ) -> Vec<Alt> {
+        let excluded = |slot: &str, version: &Version| -> bool {
+            matches!(parent, Some(p) if p.cp == atom.cp && p.slot == slot && p.version == version)
+        };
+        let mut by_slot: std::collections::BTreeMap<String, Vec<Version>> =
+            std::collections::BTreeMap::new();
+        for m in self.source.versions_of(&atom.cp) {
+            if version_satisfies(atom, &m.version)
+                && slot_matches(atom, &m)
+                && use_deps_satisfied(
+                    atom,
+                    &self.source.resolved_use(&m),
+                    &m.iuse,
+                    parent_use,
+                    features,
+                )
+                && !excluded(&m.slot, &m.version)
+            {
+                by_slot.entry(m.slot.clone()).or_default().push(m.version);
+            }
         }
-        // The conflict term: the dependency must NOT be in this set.
-        Some(Term::positive(versions_to_range(&blocked)))
+        for m in self.source.installed(&atom.cp) {
+            // An installed package's USE is fixed; its enabled set serves as both
+            // its USE and its known IUSE for the blocker's USE condition. A
+            // slotted blocker (`!pkg:slot`) does not match a different slot.
+            let slot_ok = atom.slot.as_ref().is_none_or(|s| &m.slot == s);
+            if slot_ok
+                && version_satisfies(atom, &m.version)
+                && use_deps_satisfied(atom, &m.use_enabled, &m.use_enabled, parent_use, features)
+                && !excluded(&m.slot, &m.version)
+            {
+                by_slot.entry(m.slot.clone()).or_default().push(m.version);
+            }
+        }
+        self.to_alternatives(&atom.cp, by_slot)
     }
 
-    /// Public wrapper used for request atoms, applying permissive EAPI features.
-    pub fn required_term_pub(
+    /// Turn a slot-to-versions map into ordered `(cp, slot)` alternatives:
+    /// installed slots first, then by highest version.
+    fn to_alternatives(
         &self,
-        atom: &NormAtom,
-        parent_use: &BTreeSet<String>,
-    ) -> Option<Term<Version>> {
-        self.required_term(atom, parent_use, moraine_eapi::PERMISSIVE)
-    }
-
-    /// Public wrapper used for request atoms, applying permissive EAPI features.
-    pub fn expand_virtual_pub(&self, atom: &NormAtom) -> Option<Vec<Alt>> {
-        self.expand_virtual(atom, moraine_eapi::PERMISSIVE)
+        cp: &str,
+        by_slot: std::collections::BTreeMap<String, Vec<Version>>,
+    ) -> Vec<Alt> {
+        let installed_slots: BTreeSet<String> = self
+            .source
+            .installed(cp)
+            .iter()
+            .map(|i| i.slot.clone())
+            .collect();
+        let mut slots: Vec<(String, Vec<Version>)> = by_slot.into_iter().collect();
+        slots.sort_by(|a, b| {
+            let ai = installed_slots.contains(&a.0);
+            let bi = installed_slots.contains(&b.0);
+            bi.cmp(&ai)
+                .then_with(|| b.1.iter().max().cmp(&a.1.iter().max()))
+        });
+        slots
+            .into_iter()
+            .map(|(slot, mut versions)| {
+                versions.sort();
+                versions.dedup();
+                (
+                    crate::provider::package_key(cp, &slot),
+                    Term::positive(versions_to_range(&versions)),
+                )
+            })
+            .collect()
     }
 
     /// Expand a `virtual/*` atom into provider alternatives, highest virtual
@@ -471,9 +597,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 if self.atom_is_provided(pa) {
                     continue;
                 }
-                if let Some(term) = self.required_term(pa, &vuse, features) {
-                    providers.push((pa.cp.clone(), term));
-                }
+                providers.extend(self.required_alternatives(pa, &vuse, features));
             }
         }
         if providers.is_empty() {
@@ -489,80 +613,6 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         self.source.versions_of(&atom.cp).iter().any(|m| {
             version_satisfies(atom, &m.version) && self.source.is_provided(&atom.cp, &m.version)
         })
-    }
-
-    /// The visible versions of an atom's cp that satisfy its version, slot, and
-    /// USE constraints, in ascending order.
-    fn matching_versions(
-        &self,
-        atom: &NormAtom,
-        parent_use: &BTreeSet<String>,
-        features: EapiFeatures,
-    ) -> Vec<Version> {
-        let mut out = Vec::new();
-        for m in self.source.versions_of(&atom.cp) {
-            if !version_satisfies(atom, &m.version) {
-                continue;
-            }
-            if !slot_matches(atom, &m) {
-                continue;
-            }
-            if !self.source.is_visible(&m) {
-                continue;
-            }
-            let cand_use = self.source.resolved_use(&m);
-            if !use_deps_satisfied(atom, &cand_use, &m.iuse, parent_use, features) {
-                continue;
-            }
-            out.push(m.version.clone());
-        }
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    /// The versions of an atom's cp that match version and slot, ignoring
-    /// visibility and USE (used for blocker target sets).
-    fn matching_versions_simple(
-        &self,
-        atom: &NormAtom,
-        parent_use: &BTreeSet<String>,
-        features: EapiFeatures,
-    ) -> Vec<Version> {
-        let mut out = Vec::new();
-        for m in self.source.versions_of(&atom.cp) {
-            if version_satisfies(atom, &m.version)
-                && slot_matches(atom, &m)
-                && use_deps_satisfied(
-                    atom,
-                    &self.source.resolved_use(&m),
-                    &m.iuse,
-                    parent_use,
-                    features,
-                )
-            {
-                out.push(m.version.clone());
-            }
-        }
-        for m in self.source.installed(&atom.cp) {
-            // An installed package's USE is fixed; its enabled set serves as both
-            // its USE and its known IUSE for the blocker's USE condition. The
-            // slot is checked too, so a slotted blocker (`!pkg:slot`) does not
-            // match an installed package in a different slot.
-            let slot_ok = match &atom.slot {
-                None => true,
-                Some(s) => &m.slot == s,
-            };
-            if slot_ok
-                && version_satisfies(atom, &m.version)
-                && use_deps_satisfied(atom, &m.use_enabled, &m.use_enabled, parent_use, features)
-            {
-                out.push(m.version.clone());
-            }
-        }
-        out.sort();
-        out.dedup();
-        out
     }
 }
 

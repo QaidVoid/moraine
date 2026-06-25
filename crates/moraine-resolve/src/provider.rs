@@ -17,10 +17,8 @@
 //! REQUIRED_USE on the chosen USE, and reports a sub-slot rebuild trigger when
 //! the chosen provider's sub-slot differs from an installed `:=` binding.
 
-use std::collections::BTreeSet;
-
 use moraine_eapi::features_for;
-use moraine_solver::{Dependencies, DependencyProvider, Range, Requirements, Term};
+use moraine_solver::{Dependencies, DependencyProvider, Range};
 use moraine_version::Version;
 
 use crate::depnode::DepNode;
@@ -30,6 +28,23 @@ use crate::source::{PackageMeta, ResolveSource};
 
 /// The synthetic root package name for a resolution request.
 pub(crate) const REQUEST_CP: &str = "@request";
+
+/// The solver package key for a `(cp, slot)`: `cp:slot`. A `cp`
+/// (`category/package`) contains no colon and a main slot contains neither colon
+/// nor slash, so the split is unambiguous and two slots of one `cp` are distinct
+/// solver variables that can co-install.
+pub(crate) fn package_key(cp: &str, slot: &str) -> String {
+    format!("{cp}:{slot}")
+}
+
+/// Split a solver package key back into `(cp, slot)`. Returns `None` for the
+/// synthetic root or any key without a slot separator.
+pub(crate) fn split_key(key: &str) -> Option<(&str, &str)> {
+    if key == REQUEST_CP {
+        return None;
+    }
+    key.split_once(':')
+}
 
 /// The Gentoo dependency-provider.
 pub struct GentooProvider<'s, S: ResolveSource> {
@@ -58,61 +73,49 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
         self.source
     }
 
-    /// The metadata for a concrete `cp` at `version`, if known.
-    pub(crate) fn meta(&self, cp: &str, version: &Version) -> Option<PackageMeta> {
+    /// The metadata for a concrete `(cp, slot)` at `version`, if known.
+    pub(crate) fn meta(&self, cp: &str, slot: &str, version: &Version) -> Option<PackageMeta> {
         self.source
             .versions_of(cp)
             .into_iter()
-            .find(|m| &m.version == version)
+            .find(|m| m.slot == slot && &m.version == version)
     }
 
-    /// Rank the visible candidate versions of `cp` within `range`, best first.
-    fn ranked_candidates(&self, cp: &str, range: &Range<Version>) -> Vec<Version> {
+    /// Rank the visible candidate versions of one `(cp, slot)` within `range`,
+    /// highest version first. The slot is fixed by the solver key, so multiple
+    /// slots of one `cp` are independent variables.
+    fn ranked_candidates(&self, cp: &str, slot: &str, range: &Range<Version>) -> Vec<Version> {
         let installed = self.source.installed(cp);
-        let installed_slots: BTreeSet<String> = installed.iter().map(|i| i.slot.clone()).collect();
 
-        // Strict pass: only visible candidates.
+        // Strict pass: only visible candidates of this slot.
         let mut strict: Vec<PackageMeta> = self
             .source
             .versions_of(cp)
             .into_iter()
-            .filter(|m| range.contains(&m.version) && self.source.is_visible(m))
+            .filter(|m| m.slot == slot && range.contains(&m.version) && self.source.is_visible(m))
             .collect();
 
         if strict.is_empty() {
-            // Relaxed pass: include masked-installed candidates.
+            // Relaxed pass: include masked-installed candidates of this slot.
             let mut relaxed: Vec<PackageMeta> = self
                 .source
                 .versions_of(cp)
                 .into_iter()
                 .filter(|m| {
-                    range.contains(&m.version)
+                    m.slot == slot
+                        && range.contains(&m.version)
                         && installed
                             .iter()
                             .any(|i| i.version == m.version && i.slot == m.slot)
                 })
                 .collect();
-            sort_candidates(&mut relaxed, &installed_slots);
+            relaxed.sort_by(|a, b| b.version.cmp(&a.version));
             return relaxed.into_iter().map(|m| m.version).collect();
         }
 
-        sort_candidates(&mut strict, &installed_slots);
+        strict.sort_by(|a, b| b.version.cmp(&a.version));
         strict.into_iter().map(|m| m.version).collect()
     }
-}
-
-/// Sort candidates in Portage preference order: installed-slot matches first
-/// (highest version within), then upgrades (highest version overall).
-fn sort_candidates(metas: &mut [PackageMeta], installed_slots: &BTreeSet<String>) {
-    metas.sort_by(|a, b| {
-        let a_inst = installed_slots.contains(&a.slot);
-        let b_inst = installed_slots.contains(&b.slot);
-        // Installed-slot match first.
-        b_inst
-            .cmp(&a_inst)
-            // Then highest version first.
-            .then_with(|| b.version.cmp(&a.version))
-    });
 }
 
 impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
@@ -128,7 +131,10 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
                 Vec::new()
             };
         }
-        self.ranked_candidates(package, range)
+        match split_key(package) {
+            Some((cp, slot)) => self.ranked_candidates(cp, slot, range),
+            None => Vec::new(),
+        }
     }
 
     fn dependencies(&self, package: &String, version: &Version) -> Dependencies<String, Version> {
@@ -136,45 +142,15 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
             let encoder = Encoder {
                 source: self.source,
             };
-            let mut reqs: Requirements<String, Version> = Requirements::new();
-            let parent_use = BTreeSet::new();
-            for atom in &self.request {
-                if atom.cp.starts_with("virtual/") {
-                    match encoder.expand_virtual_pub(atom) {
-                        Some(alts) => {
-                            if let Some((cp, term)) = alts.first() {
-                                reqs.clauses
-                                    .push(moraine_solver::Clause::single(cp.clone(), term.clone()));
-                            }
-                            if alts.len() > 1 {
-                                reqs.clauses.push(moraine_solver::Clause::any_of(alts));
-                            }
-                        }
-                        // No provider: force a clause the solver cannot satisfy.
-                        None => reqs.clauses.push(moraine_solver::Clause::single(
-                            atom.cp.clone(),
-                            Term::positive(Range::full()),
-                        )),
-                    }
-                    continue;
-                }
-                match encoder.required_term_pub(atom, &parent_use) {
-                    Some(term) => reqs
-                        .clauses
-                        .push(moraine_solver::Clause::single(atom.cp.clone(), term)),
-                    // No candidate: require any version so the solver fails with
-                    // a clean "no versions" explanation for this cp.
-                    None => reqs.clauses.push(moraine_solver::Clause::single(
-                        atom.cp.clone(),
-                        Term::positive(Range::full()),
-                    )),
-                }
-            }
-            return Dependencies::Known(reqs);
+            return Dependencies::Known(encoder.request_requirements(&self.request));
         }
-        let Some(meta) = self.meta(package, version) else {
+        let Some((cp, slot)) = split_key(package) else {
+            return Dependencies::Unavailable(format!("malformed package key {package}"));
+        };
+        let Some(meta) = self.meta(cp, slot, version) else {
             return Dependencies::Unavailable(format!("no metadata for {package}-{version}"));
         };
+        let package = cp;
         let features = features_for(&meta.eapi);
         let resolved_use = self.source.resolved_use(&meta);
 

@@ -13,7 +13,7 @@ use crate::depnode::{BlockerKind, DepNode, NormAtom, SlotOpKind};
 use crate::encode::{CLASSES, root_for, slot_matches, version_satisfies};
 use crate::error::ResolveError;
 use crate::normalize::normalize_atom;
-use crate::provider::{GentooProvider, REQUEST_CP};
+use crate::provider::{GentooProvider, REQUEST_CP, split_key};
 use crate::solution::{
     DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, SlotBinding,
 };
@@ -55,23 +55,26 @@ pub fn resolve<S: ResolveSource>(
     Ok(resolved)
 }
 
-/// Build the resolved solution from the solver's `cp -> version` decisions.
+/// Build the resolved solution from the solver's `cp:slot -> version` decisions.
 fn assemble_solution<S: ResolveSource>(
     source: &S,
     decisions: &BTreeMap<String, Version>,
 ) -> Result<ResolvedSolution, ResolveError> {
-    // The set of selected (cp, version) excluding the synthetic root.
-    let mut selected: BTreeMap<String, (Version, PackageMeta)> = BTreeMap::new();
-    for (cp, version) in decisions {
-        if cp == REQUEST_CP {
+    // The selected packages, grouped by cp so two slots of one cp both appear.
+    let mut selected: BTreeMap<String, Vec<(Version, PackageMeta)>> = BTreeMap::new();
+    for (key, version) in decisions {
+        let Some((cp, slot)) = split_key(key) else {
             continue;
-        }
+        };
         if let Some(meta) = source
             .versions_of(cp)
             .into_iter()
-            .find(|m| &m.version == version)
+            .find(|m| m.slot == slot && &m.version == version)
         {
-            selected.insert(cp.clone(), (version.clone(), meta));
+            selected
+                .entry(cp.to_owned())
+                .or_default()
+                .push((version.clone(), meta));
         }
     }
 
@@ -79,65 +82,68 @@ fn assemble_solution<S: ResolveSource>(
     let mut edges: Vec<DepEdge> = Vec::new();
     let mut blockers: Vec<RecordedBlocker> = Vec::new();
 
-    for (cp, (version, meta)) in &selected {
-        let resolved_use = source.resolved_use(meta);
-        let features = features_for(&meta.eapi);
-        let already_installed = source.installed_matches(cp, version, &meta.slot);
+    for (cp, slots) in &selected {
+        for (version, meta) in slots {
+            let resolved_use = source.resolved_use(meta);
+            let features = features_for(&meta.eapi);
+            let already_installed = source.installed_matches(cp, version, &meta.slot);
 
-        // Slot-operator rebuild detection: if this package is installed and
-        // recorded a `:=` binding whose provider is now selected with a
-        // different sub-slot, the existing build is stale and must be rebuilt.
-        let mut subslot_rebuild = false;
-        for inst in source.installed(cp) {
-            for (dep_cp, bslot, bsub) in &inst.slot_bindings {
-                if let Some((_, dep_meta)) = selected.get(dep_cp)
-                    && &dep_meta.slot == bslot
-                    && &dep_meta.subslot != bsub
-                {
-                    subslot_rebuild = true;
+            // Slot-operator rebuild detection: if this package is installed and
+            // recorded a `:=` binding whose provider is now selected with a
+            // different sub-slot, the existing build is stale and must be rebuilt.
+            let mut subslot_rebuild = false;
+            for inst in source.installed(cp) {
+                for (dep_cp, bslot, bsub) in &inst.slot_bindings {
+                    if let Some(dep_slots) = selected.get(dep_cp)
+                        && dep_slots
+                            .iter()
+                            .any(|(_, dm)| &dm.slot == bslot && &dm.subslot != bsub)
+                    {
+                        subslot_rebuild = true;
+                    }
                 }
             }
-        }
 
-        let mut slot_bindings: Vec<SlotBinding> = Vec::new();
+            let mut slot_bindings: Vec<SlotBinding> = Vec::new();
 
-        let class_nodes: [(&DepNode, DepClass); 5] = [
-            (&meta.bdepend, DepClass::Bdepend),
-            (&meta.depend, DepClass::Depend),
-            (&meta.rdepend, DepClass::Rdepend),
-            (&meta.pdepend, DepClass::Pdepend),
-            (&meta.idepend, DepClass::Idepend),
-        ];
+            let class_nodes: [(&DepNode, DepClass); 5] = [
+                (&meta.bdepend, DepClass::Bdepend),
+                (&meta.depend, DepClass::Depend),
+                (&meta.rdepend, DepClass::Rdepend),
+                (&meta.pdepend, DepClass::Pdepend),
+                (&meta.idepend, DepClass::Idepend),
+            ];
 
-        for (node, class) in class_nodes {
-            let mut atoms: Vec<(&NormAtom, bool)> = Vec::new();
-            collect_atoms(node, &resolved_use, false, &mut atoms);
-            for (atom, optional) in atoms {
-                emit_edge_for_atom(
-                    source,
-                    cp,
-                    atom,
-                    class,
-                    optional,
-                    features,
-                    &selected,
-                    &mut edges,
-                    &mut blockers,
-                    &mut slot_bindings,
-                );
+            for (node, class) in class_nodes {
+                let mut atoms: Vec<(&NormAtom, bool)> = Vec::new();
+                collect_atoms(node, &resolved_use, false, &mut atoms);
+                for (atom, optional) in atoms {
+                    emit_edge_for_atom(
+                        source,
+                        cp,
+                        atom,
+                        class,
+                        optional,
+                        features,
+                        &selected,
+                        &mut edges,
+                        &mut blockers,
+                        &mut slot_bindings,
+                    );
+                }
             }
-        }
 
-        packages.push(ResolvedPackage {
-            cp: cp.clone(),
-            version: version.clone(),
-            slot: meta.slot.clone(),
-            subslot: meta.subslot.clone(),
-            use_enabled: resolved_use,
-            slot_bindings,
-            already_installed,
-            subslot_rebuild,
-        });
+            packages.push(ResolvedPackage {
+                cp: cp.clone(),
+                version: version.clone(),
+                slot: meta.slot.clone(),
+                subslot: meta.subslot.clone(),
+                use_enabled: resolved_use,
+                slot_bindings,
+                already_installed,
+                subslot_rebuild,
+            });
+        }
     }
 
     edges.sort_by(|a, b| {
@@ -194,6 +200,17 @@ fn collect_atoms<'a>(
     }
 }
 
+/// Find a selected provider of `cp` that satisfies the atom's version and slot.
+fn find_provider<'a>(
+    selected: &'a BTreeMap<String, Vec<(Version, PackageMeta)>>,
+    atom: &NormAtom,
+) -> Option<&'a (Version, PackageMeta)> {
+    selected
+        .get(&atom.cp)?
+        .iter()
+        .find(|(v, m)| version_satisfies(atom, v) && slot_matches(atom, m))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_edge_for_atom<S: ResolveSource>(
     source: &S,
@@ -202,7 +219,7 @@ fn emit_edge_for_atom<S: ResolveSource>(
     class: DepClass,
     optional: bool,
     features: moraine_eapi::EapiFeatures,
-    selected: &BTreeMap<String, (Version, PackageMeta)>,
+    selected: &BTreeMap<String, Vec<(Version, PackageMeta)>>,
     edges: &mut Vec<DepEdge>,
     blockers: &mut Vec<RecordedBlocker>,
     slot_bindings: &mut Vec<SlotBinding>,
@@ -228,10 +245,7 @@ fn emit_edge_for_atom<S: ResolveSource>(
     }
 
     // Find the selected provider satisfying this atom.
-    if let Some((dep_version, dep_meta)) = selected.get(&atom.cp) {
-        if !version_satisfies(atom, dep_version) || !slot_matches(atom, dep_meta) {
-            return;
-        }
+    if let Some((_, dep_meta)) = find_provider(selected, atom) {
         let slot_op = atom.slot_op.is_some();
         edges.push(DepEdge {
             from: from.to_owned(),
@@ -262,14 +276,12 @@ fn emit_virtual_edges<S: ResolveSource>(
     class: DepClass,
     optional: bool,
     features: moraine_eapi::EapiFeatures,
-    selected: &BTreeMap<String, (Version, PackageMeta)>,
+    selected: &BTreeMap<String, Vec<(Version, PackageMeta)>>,
     edges: &mut Vec<DepEdge>,
 ) {
     let root = root_for(class, features);
     // Edge to the virtual itself if it is selected.
-    if let Some((vv, _)) = selected.get(&atom.cp)
-        && version_satisfies(atom, vv)
-    {
+    if find_provider(selected, atom).is_some() {
         edges.push(DepEdge {
             from: from.to_owned(),
             to: atom.cp.clone(),
@@ -295,10 +307,7 @@ fn emit_virtual_edges<S: ResolveSource>(
                 emit_virtual_edges(source, from, patom, class, true, features, selected, edges);
                 continue;
             }
-            if let Some((dv, dm)) = selected.get(&patom.cp)
-                && version_satisfies(patom, dv)
-                && slot_matches(patom, dm)
-            {
+            if find_provider(selected, patom).is_some() {
                 edges.push(DepEdge {
                     from: from.to_owned(),
                     to: patom.cp.clone(),
