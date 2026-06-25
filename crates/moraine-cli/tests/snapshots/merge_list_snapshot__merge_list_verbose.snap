@@ -1,6 +1,5 @@
 ---
 source: crates/moraine-cli/tests/merge_list_snapshot.rs
-assertion_line: 145
 expression: "render_merge_list(&plan, true)"
 ---
 These are the packages that would be merged, in order:
@@ -9,4 +8,4 @@ These are the packages that would be merged, in order:
 [ebuild R] app-misc/tool-2.0 USE="ssl"
 [ebuild N] dev-lang/python-3.12.1:3.12::gentoo
 
-Total: 3 packages (1 new), Size of downloads: 9.06 MiB
+Total: 3 packages (1 upgrade, 1 new, 1 reinstall), Size of downloads: 9.06 MiB

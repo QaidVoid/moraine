@@ -478,44 +478,58 @@ fn render_flag_group(flags: &[&UseFlag]) -> String {
 }
 
 /// Render the package-count and total-download summary.
+///
+/// Mirrors `emerge`'s counters: the package total sums only the install
+/// operations (upgrade, downgrade, new, reinstall), while `binary` and
+/// `uninstall` appear in the parenthesized breakdown without inflating the
+/// count. A subslot rebuild replaces the same cpv, so it counts as a reinstall.
 pub fn render_totals(plan: &MergePlan) -> String {
-    let merge_entries: Vec<&MergeEntry> = plan
+    let count = |op: Operation| plan.entries.iter().filter(|e| e.operation == op).count();
+    let upgrades = count(Operation::Upgrade);
+    let downgrades = count(Operation::Downgrade);
+    let new = count(Operation::New);
+    let reinst = count(Operation::Reinstall) + count(Operation::Rebuild);
+    let uninst = count(Operation::Uninstall);
+    let binary = plan
         .entries
         .iter()
-        .filter(|e| e.operation != Operation::Uninstall)
-        .collect();
-    let merges = merge_entries.len();
-    let new = merge_entries
-        .iter()
-        .filter(|e| e.operation == Operation::New)
+        .filter(|e| e.operation != Operation::Uninstall && e.binary)
         .count();
-    let binary = merge_entries.iter().filter(|e| e.binary).count();
-    let uninstalls = plan
-        .entries
-        .iter()
-        .filter(|e| e.operation == Operation::Uninstall)
-        .count();
+
+    let installs = upgrades + downgrades + new + reinst;
     let total: u64 = plan.entries.iter().filter_map(|e| e.fetch_size).sum();
 
-    let mut breakdown = Vec::new();
+    let plural = |n: usize| if n > 1 { "s" } else { "" };
+    let mut details = Vec::new();
+    if upgrades > 0 {
+        details.push(format!("{upgrades} upgrade{}", plural(upgrades)));
+    }
+    if downgrades > 0 {
+        details.push(format!("{downgrades} downgrade{}", plural(downgrades)));
+    }
     if new > 0 {
-        breakdown.push(format!("{new} new"));
+        details.push(format!("{new} new"));
+    }
+    if reinst > 0 {
+        details.push(format!("{reinst} reinstall{}", plural(reinst)));
     }
     if binary > 0 {
-        breakdown.push(format!("{binary} binary"));
+        let word = if binary > 1 { "binaries" } else { "binary" };
+        details.push(format!("{binary} {word}"));
     }
-    if uninstalls > 0 {
-        breakdown.push(format!("{uninstalls} uninstall"));
+    if uninst > 0 {
+        details.push(format!("{uninst} uninstall{}", plural(uninst)));
     }
-    let breakdown = if breakdown.is_empty() {
+
+    let breakdown = if details.is_empty() {
         String::new()
     } else {
-        format!(" ({})", breakdown.join(", "))
+        format!(" ({})", details.join(", "))
     };
 
     format!(
-        "Total: {merges} package{}{breakdown}, Size of downloads: {}\n",
-        if merges == 1 { "" } else { "s" },
+        "Total: {installs} package{}{breakdown}, Size of downloads: {}\n",
+        if installs == 1 { "" } else { "s" },
         human_size(total)
     )
 }

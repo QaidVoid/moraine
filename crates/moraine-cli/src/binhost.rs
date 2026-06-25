@@ -162,8 +162,21 @@ impl IndexedBinhost {
     }
 
     /// The index stanza for `cpv`.
+    ///
+    /// With `binpkg-multi-instance` a cpv can have several stanzas differing
+    /// only by `BUILD_ID`; like `emerge`, the newest build (highest `BUILD_ID`)
+    /// is chosen so the displayed id and the fetched container agree.
     fn entry(&self, cpv: &str) -> Option<&moraine_binpkg::PackageEntry> {
-        self.index.packages.iter().find(|e| e.cpv == cpv)
+        self.index
+            .packages
+            .iter()
+            .filter(|e| e.cpv == cpv)
+            .max_by_key(|e| {
+                e.metadata
+                    .get_str("BUILD_ID")
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+            })
     }
 
     /// The on-host relative path of `cpv`'s container, from `PATH` or derived.
@@ -243,6 +256,31 @@ mod tests {
         .unwrap();
         let uris = parse_binrepos(&path);
         assert_eq!(uris, vec!["https://b/binpkgs", "https://a/binpkgs"]);
+    }
+
+    #[test]
+    fn entry_picks_highest_build_id() {
+        use moraine_binpkg::{MetadataMap, PackageEntry, PackagesIndex};
+
+        let mut index = PackagesIndex::new();
+        for id in ["1", "21", "3"] {
+            let mut meta = MetadataMap::new();
+            meta.set_str("BUILD_ID", id);
+            index.packages.push(PackageEntry {
+                cpv: "app-text/xmlto-0.0.28-r11".into(),
+                metadata: meta,
+            });
+        }
+        let binhost = IndexedBinhost {
+            base_uri: "https://binhost".into(),
+            index,
+            fetch: FetchCommand::default(),
+            stage: PathBuf::from("/tmp"),
+        };
+        assert_eq!(
+            binhost.build_id("app-text/xmlto-0.0.28-r11").as_deref(),
+            Some("21")
+        );
     }
 
     #[test]
