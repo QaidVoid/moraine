@@ -146,6 +146,12 @@ impl Parser<'_> {
                 self.pos += 1;
                 let inner = self.parse_grouped()?;
                 items.push(DepSpec::AnyOf(inner));
+            } else if tok == "^^" || tok == "??" {
+                // Exactly-one-of and at-most-one-of are REQUIRED_USE-only; they
+                // are not valid in a dependency-spec string.
+                return Err(DepError::Structure {
+                    reason: "^^/?? groups are only valid in REQUIRED_USE",
+                });
             } else if let Some(cond) = tok.strip_suffix('?') {
                 self.pos += 1;
                 let (flag, sense) = if let Some(flag) = cond.strip_prefix('!') {

@@ -210,6 +210,11 @@ impl Atom {
                 let (cp, ver_str) =
                     split_cp_version(body).ok_or_else(|| err("expected a version"))?;
                 let version = Version::parse(ver_str).map_err(|_| err("invalid version"))?;
+                // PMS: the `~` operator ignores the revision, so specifying one is
+                // invalid.
+                if op == Operator::Tilde && version.revision() != 0 {
+                    return Err(err("the ~ operator may not specify a revision"));
+                }
                 (cp, Some((op, version)))
             }
         };
@@ -293,7 +298,7 @@ impl Atom {
                 Operator::Greater => pkg.version > ver,
                 Operator::Less => pkg.version < ver,
                 Operator::Tilde => pkg.version.matches_any_revision(ver),
-                Operator::EqualGlob => pkg.version.as_str().starts_with(ver.as_str()),
+                Operator::EqualGlob => version_glob_matches(pkg.version.as_str(), ver.as_str()),
             };
             if !ok {
                 return false;
@@ -434,6 +439,21 @@ fn render_use_dep(out: &mut String, dep: &UseDep, resolve: &impl Fn(Symbol) -> S
         UseDepKind::EqualToParent | UseDepKind::OppositeToParent => out.push('='),
         _ => {}
     }
+}
+
+/// Whether `candidate` matches an `=...*` glob whose version string is `prefix`.
+///
+/// PMS treats the asterisk as wildcarding any further version components, so the
+/// match must end at a component boundary: `=1.2*` matches `1.2`, `1.2.3`, and
+/// `1.2_alpha`, but not `1.20` (the next character continues the same numeric
+/// component).
+fn version_glob_matches(candidate: &str, prefix: &str) -> bool {
+    candidate.starts_with(prefix)
+        && candidate
+            .as_bytes()
+            .get(prefix.len())
+            .map(|b| !b.is_ascii_digit())
+            .unwrap_or(true)
 }
 
 fn parse_operator(s: &str) -> (Option<Operator>, &str) {
@@ -640,8 +660,22 @@ fn is_valid_flag(s: &str) -> bool {
     if !first.is_ascii_alphanumeric() {
         return false;
     }
+    // PMS USE-flag names: `[A-Za-z0-9][A-Za-z0-9+_@-]*` (no `.`).
     s.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'_' | b'-' | b'@' | b'.'))
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'_' | b'-' | b'@'))
+}
+
+/// PMS repository names: `[A-Za-z0-9_][A-Za-z0-9_-]*` (no `+`, no `.`).
+fn is_valid_repo_name(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let first = s.as_bytes()[0];
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
+        return false;
+    }
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
 fn parse_repo(
@@ -653,7 +687,7 @@ fn parse_repo(
     if !features.repo_deps {
         return Err(err("repository specifiers are not permitted for this EAPI"));
     }
-    if s.is_empty() || !is_valid_name(s) {
+    if !is_valid_repo_name(s) {
         return Err(err("invalid repository name"));
     }
     Ok(interner.intern(s))

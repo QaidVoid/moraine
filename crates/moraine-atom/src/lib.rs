@@ -92,6 +92,50 @@ mod tests {
     }
 
     #[test]
+    fn prefix_glob_respects_component_boundary() {
+        let i = Interner::new();
+        let a = Atom::parse("=dev-libs/openssl-3.0*", eapi8(), &i).unwrap();
+        // `3.05` shares the textual prefix `3.0` but its next character is a
+        // digit, so it is a different version component and must not match.
+        let no = Version::parse("3.05").unwrap();
+        let base = PackageRef {
+            category: i.intern("dev-libs"),
+            package: i.intern("openssl"),
+            version: &no,
+            slot: None,
+            subslot: None,
+            repo: None,
+        };
+        assert!(!a.matches(&base));
+    }
+
+    #[test]
+    fn tilde_with_revision_is_rejected() {
+        let i = Interner::new();
+        assert!(Atom::parse("~dev-libs/openssl-3.0-r1", eapi8(), &i).is_err());
+        assert!(Atom::parse("~dev-libs/openssl-3.0", eapi8(), &i).is_ok());
+    }
+
+    #[test]
+    fn invalid_repo_and_flag_charsets_are_rejected() {
+        let i = Interner::new();
+        // Repository names may not contain `.` (repo specifiers need PERMISSIVE).
+        assert!(Atom::parse("dev-libs/openssl::bad.repo", PERMISSIVE, &i).is_err());
+        assert!(Atom::parse("dev-libs/openssl::good_repo", PERMISSIVE, &i).is_ok());
+        // USE-flag names may not contain `.`.
+        assert!(Atom::parse("dev-libs/openssl[bad.flag]", eapi8(), &i).is_err());
+        assert!(Atom::parse("dev-libs/openssl[good_flag]", eapi8(), &i).is_ok());
+    }
+
+    #[test]
+    fn exactly_one_and_at_most_one_rejected_in_depspec() {
+        let i = Interner::new();
+        assert!(DepSpec::parse("^^ ( a/b c/d )", eapi8(), &i).is_err());
+        assert!(DepSpec::parse("?? ( a/b c/d )", eapi8(), &i).is_err());
+        assert!(DepSpec::parse("|| ( a/b c/d )", eapi8(), &i).is_ok());
+    }
+
+    #[test]
     fn slot_parses_and_slot_operator_gating() {
         let i = Interner::new();
         let a = Atom::parse("dev-libs/openssl:0", eapi8(), &i).unwrap();
