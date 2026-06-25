@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use moraine_atom::{Atom, PackageRef};
 
 use crate::makeconf::VarMap;
-use crate::stacking::stack_layers;
+use crate::stacking::stack_layers_signed;
 
 /// The effective USE flags for a package, plus the subset marked hidden.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -69,15 +69,31 @@ pub fn iuse_effective(env: &VarMap) -> BTreeSet<String> {
     out
 }
 
+/// The global USE configuration derived from the environment.
+#[derive(Debug, Clone, Default)]
+pub struct GlobalUse {
+    /// The enabled USE flags.
+    pub enabled: Vec<String>,
+    /// Flags explicitly disabled by a `-flag`, so they override IUSE `+` defaults.
+    pub disabled: BTreeSet<String>,
+    /// Flags marked hidden from display.
+    pub hidden: BTreeSet<String>,
+}
+
 /// Build the global USE set from the environment: USE_EXPAND flattened flags
 /// first, then the explicit `USE` value, stacked incrementally.
-pub fn global_use(env: &VarMap) -> (Vec<String>, BTreeSet<String>) {
+pub fn global_use(env: &VarMap) -> GlobalUse {
     let (expanded, hidden) = flatten_use_expand(env);
     let use_value = env.get("USE").unwrap_or_default();
     let mut layers: Vec<String> = expanded;
     layers.push(use_value.to_owned());
     let joined: Vec<&str> = layers.iter().map(String::as_str).collect();
-    (stack_layers(joined), hidden)
+    let (enabled, disabled) = stack_layers_signed(joined);
+    GlobalUse {
+        enabled,
+        disabled,
+        hidden,
+    }
 }
 
 /// A single `package.use`-style entry: an atom and its flag modifications.
@@ -98,6 +114,7 @@ pub struct PkgUseEntry {
 #[derive(Debug, Clone, Default)]
 pub struct UseManager {
     global: BTreeSet<String>,
+    global_disabled: BTreeSet<String>,
     hidden: BTreeSet<String>,
     mask: BTreeSet<String>,
     force: BTreeSet<String>,
@@ -130,6 +147,13 @@ impl UseManager {
     /// Set the globally forced flags.
     pub fn with_force(mut self, force: impl IntoIterator<Item = String>) -> Self {
         self.force = force.into_iter().collect();
+        self
+    }
+
+    /// Set the flags explicitly disabled in the global USE configuration, which
+    /// override IUSE `+` defaults.
+    pub fn with_disabled(mut self, disabled: impl IntoIterator<Item = String>) -> Self {
+        self.global_disabled = disabled.into_iter().collect();
         self
     }
 
@@ -199,6 +223,11 @@ impl UseManager {
             .iter()
             .filter_map(|f| f.strip_prefix('+').map(str::to_owned))
             .collect();
+        // An explicit `-flag` in the global USE config overrides an IUSE `+`
+        // default for that flag.
+        for flag in &self.global_disabled {
+            enabled.remove(flag);
+        }
         enabled.extend(self.global.iter().cloned());
 
         for entry in &self.pkg_use {
@@ -351,6 +380,26 @@ mod tests {
         // `+`-prefixed IUSE flags default to enabled; bare ones do not.
         assert!(eff.enabled.contains("native-symlinks"));
         assert!(!eff.enabled.contains("test"));
+    }
+
+    #[test]
+    fn explicit_disable_overrides_iuse_plus_default() {
+        let i = Interner::new();
+        let v = Version::parse("1.0").unwrap();
+        let mgr =
+            UseManager::new(vec![], BTreeSet::new()).with_disabled(["native-symlinks".to_owned()]);
+        let iuse = vec!["+native-symlinks".to_owned()];
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &iuse, false);
+        // A `-flag` in global USE wins over an IUSE `+` default.
+        assert!(!eff.enabled.contains("native-symlinks"));
+    }
+
+    #[test]
+    fn iuse_effective_recognizes_implicit() {
+        let mgr = UseManager::new(vec![], BTreeSet::new())
+            .with_iuse_effective(["amd64".to_owned()].into_iter().collect());
+        assert!(mgr.is_iuse_effective("amd64"));
+        assert!(!mgr.is_iuse_effective("ppc"));
     }
 
     #[test]

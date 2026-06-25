@@ -21,7 +21,7 @@ use moraine_eapi::PERMISSIVE;
 use crate::makeconf::VarMap;
 use crate::profile::ProfileStack;
 use crate::snapshot::ResolvedConfig;
-use crate::use_resolution::{PkgUseEntry, UseManager, global_use};
+use crate::use_resolution::{PkgUseEntry, UseManager, global_use, iuse_effective};
 use crate::visibility::{MaskManager, ProvidedManager};
 
 /// Assemble a [`ResolvedConfig`] from the active profile stack, the merged
@@ -38,7 +38,7 @@ pub fn resolve_config(
     interner: &Interner,
 ) -> ResolvedConfig {
     let arch = env.get("ARCH").unwrap_or_default().to_owned();
-    let (global, hidden) = global_use(env);
+    let global = global_use(env);
 
     // USE masking/forcing fold across the profile stack.
     let mut use_mask = StackSet::default();
@@ -50,10 +50,12 @@ pub fn resolve_config(
         use_stable_mask.apply(&read_flag_file(&node.path.join("use.stable.mask")));
     }
 
-    let mut use_manager = UseManager::new(global, hidden)
+    let mut use_manager = UseManager::new(global.enabled, global.hidden)
+        .with_disabled(global.disabled)
         .with_mask(use_mask.into_sorted())
         .with_force(use_force.into_sorted())
-        .with_stable_mask(use_stable_mask.into_sorted(), true);
+        .with_stable_mask(use_stable_mask.into_sorted(), true)
+        .with_iuse_effective(iuse_effective(env));
 
     // package.use across the profile stack then /etc/portage.
     for node in &profile.nodes {

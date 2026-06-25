@@ -48,6 +48,36 @@ where
     acc
 }
 
+/// Apply incremental stacking like [`stack_layers`], but also return the set of
+/// flags left explicitly disabled (a trailing `-flag` not later re-added). This
+/// lets a `-flag` in USE override an IUSE `+` default rather than silently
+/// leaving the default in force. A `-*` clears both the enabled and disabled
+/// accumulators.
+pub fn stack_layers_signed<'a, I>(layers: I) -> (Vec<String>, std::collections::BTreeSet<String>)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut acc: Vec<String> = Vec::new();
+    let mut disabled = std::collections::BTreeSet::new();
+    for layer in layers {
+        for token in layer.split_whitespace() {
+            if token == "-*" {
+                acc.clear();
+                disabled.clear();
+            } else if let Some(rest) = token.strip_prefix('-') {
+                acc.retain(|existing| existing != rest);
+                disabled.insert(rest.to_owned());
+            } else {
+                disabled.remove(token);
+                if !acc.iter().any(|existing| existing == token) {
+                    acc.push(token.to_owned());
+                }
+            }
+        }
+    }
+    (acc, disabled)
+}
+
 /// The set of variables treated as incremental, mirroring stock `INCREMENTALS`.
 pub const INCREMENTALS: &[&str] = &[
     "USE",
@@ -94,6 +124,17 @@ mod tests {
     #[test]
     fn layers_stack_in_order() {
         assert_eq!(stack_layers(["a b", "-a c", "d"]), vec!["b", "c", "d"]);
+    }
+
+    #[test]
+    fn signed_tracks_disabled_flags() {
+        let (enabled, disabled) = stack_layers_signed(["a b", "-a c"]);
+        assert_eq!(enabled, vec!["b", "c"]);
+        assert!(disabled.contains("a"));
+        // A re-enabled flag is no longer disabled.
+        let (enabled, disabled) = stack_layers_signed(["-a", "a"]);
+        assert_eq!(enabled, vec!["a"]);
+        assert!(disabled.is_empty());
     }
 
     #[test]
