@@ -144,16 +144,34 @@ impl VarMap {
 /// Fold physical lines into logical assignment lines: a trailing backslash is a
 /// continuation, and a newline inside an open quote becomes a space so a quoted
 /// value may span several lines (as `make.globals` and `make.conf` both do).
+///
+/// Comments (an unquoted `#` at the start of a token through end of line) are
+/// skipped without tracking quotes, so an apostrophe in a comment such as
+/// `# the user's session` does not open a spurious string that swallows the
+/// following assignment lines.
 fn join_continuations(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     let mut in_single = false;
     let mut in_double = false;
+    let mut in_comment = false;
+    // A `#` only begins a comment at the start of a token (line start or after
+    // whitespace), matching `parse_value`'s comment rule.
+    let mut prev_ws = true;
     let mut chars = content.chars().peekable();
     while let Some(c) = chars.next() {
+        if in_comment {
+            if c == '\n' {
+                in_comment = false;
+                prev_ws = true;
+                out.push('\n');
+            }
+            continue;
+        }
         match c {
             '\\' if !in_single && chars.peek() == Some(&'\n') => {
                 // Backslash line continuation: drop both characters.
                 chars.next();
+                prev_ws = true;
             }
             '\\' if !in_single => {
                 // A backslash escape; keep it for `parse_value` to interpret.
@@ -161,17 +179,29 @@ fn join_continuations(content: &str) -> String {
                 if let Some(next) = chars.next() {
                     out.push(next);
                 }
+                prev_ws = false;
+            }
+            '#' if !in_single && !in_double && prev_ws => {
+                in_comment = true;
             }
             '\'' if !in_double => {
                 in_single = !in_single;
                 out.push(c);
+                prev_ws = false;
             }
             '"' if !in_single => {
                 in_double = !in_double;
                 out.push(c);
+                prev_ws = false;
             }
-            '\n' if in_single || in_double => out.push(' '),
-            _ => out.push(c),
+            '\n' if in_single || in_double => {
+                out.push(' ');
+                prev_ws = true;
+            }
+            c => {
+                out.push(c);
+                prev_ws = c.is_whitespace();
+            }
         }
     }
     out
@@ -300,6 +330,24 @@ mod tests {
     fn line_continuation_and_comments() {
         let m = parse("# comment\nUSE=\"a \\\nb\"\n");
         assert_eq!(m.get("USE"), Some("a b"));
+    }
+
+    #[test]
+    fn apostrophe_in_comment_does_not_swallow_assignments() {
+        // A comment apostrophe must not open a string that consumes the
+        // following assignment lines (the base/make.defaults bug).
+        let m = parse(
+            "# avoid the user's session\nUSE=\"acl unicode\"\n# another's note\nARCH=\"amd64\"\n",
+        );
+        assert_eq!(m.get("USE"), Some("acl unicode"));
+        assert_eq!(m.get("ARCH"), Some("amd64"));
+    }
+
+    #[test]
+    fn quotes_inside_a_comment_are_ignored() {
+        // A `#` comment containing `USE="..."` must not affect the real USE.
+        let m = parse("# stage1 breaks because of USE=\"-* foo\"\nUSE=\"acl\"\n");
+        assert_eq!(m.get("USE"), Some("acl"));
     }
 
     #[test]
