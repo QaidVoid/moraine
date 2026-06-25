@@ -118,9 +118,17 @@ impl ResolvedConfig {
         }
         let mut accepted = self.accepted_keywords.clone();
         for kw in extra {
-            // A bare atom with no keyword defaults to accepting the testing arch.
             if kw.is_empty() {
-                accepted.insert(format!("~{}", self.arch));
+                // A bare per-package atom accepts the testing keyword for every
+                // stable arch already in the effective ACCEPT_KEYWORDS, not only
+                // the profile arch.
+                let testing: Vec<String> = self
+                    .accepted_keywords
+                    .iter()
+                    .filter(|k| k.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()))
+                    .map(|k| format!("~{k}"))
+                    .collect();
+                accepted.extend(testing);
             } else {
                 accepted.insert(kw.clone());
             }
@@ -201,6 +209,30 @@ mod tests {
             Vec::new(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn bare_atom_extra_accepts_testing_for_accepted_arches() {
+        let cfg = ResolvedConfig::new(
+            ProfileStack::default(),
+            "amd64".to_owned(),
+            ["amd64".to_owned()].into_iter().collect(),
+            UseManager::default(),
+            MaskManager::new(),
+            ProvidedManager::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        // A bare per-package atom (empty extra) accepts ~amd64.
+        assert_eq!(
+            cfg.keyword_result(&["~amd64".to_owned()], &["".to_owned()]),
+            KeywordResult::Accepted
+        );
+        // Without the bare-atom entry, ~amd64 is not accepted.
+        assert_eq!(
+            cfg.keyword_result(&["~amd64".to_owned()], &[]),
+            KeywordResult::NeedsKeyword
+        );
     }
 
     #[test]

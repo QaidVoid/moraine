@@ -48,13 +48,11 @@ pub fn accept_keywords(
             if accepted.contains("~*") {
                 return KeywordResult::Accepted;
             }
-        } else {
-            if accepted.contains("*") {
-                return KeywordResult::Accepted;
-            }
-            if accepted.contains(&format!("~{kw}")) {
-                return KeywordResult::Accepted;
-            }
+        } else if accepted.contains("*") {
+            // A stable keyword is accepted only by exact membership, `*`, or
+            // `**`; a `~arch` in ACCEPT_KEYWORDS does not by itself accept the
+            // stable `arch` keyword.
+            return KeywordResult::Accepted;
         }
     }
     if !saw_real {
@@ -332,6 +330,19 @@ mod tests {
         assert_eq!(
             accept_keywords(&[], &accepted(&["amd64"]), "amd64"),
             KeywordResult::NeedsDoubleStar
+        );
+    }
+
+    #[test]
+    fn stable_not_accepted_by_testing_keyword_only() {
+        // ACCEPT_KEYWORDS = {~amd64} accepts ~amd64 but not stable amd64.
+        assert_eq!(
+            accept_keywords(&["amd64".into()], &accepted(&["~amd64"]), "amd64"),
+            KeywordResult::NeedsKeyword
+        );
+        assert_eq!(
+            accept_keywords(&["~amd64".into()], &accepted(&["~amd64"]), "amd64"),
+            KeywordResult::Accepted
         );
     }
 
