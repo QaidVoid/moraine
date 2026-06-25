@@ -155,8 +155,19 @@ impl UseManager {
 
     /// Compute the effective USE for a package. `stable` selects whether
     /// stable-only masks apply.
-    pub fn effective_use(&self, pkg: &PackageRef<'_>, stable: bool) -> EffectiveUse {
-        let mut enabled = self.global.clone();
+    pub fn effective_use(
+        &self,
+        pkg: &PackageRef<'_>,
+        iuse: &[String],
+        stable: bool,
+    ) -> EffectiveUse {
+        // IUSE `+`-prefixed flags are the lowest-priority defaults; global and
+        // per-package settings layer on top.
+        let mut enabled: BTreeSet<String> = iuse
+            .iter()
+            .filter_map(|f| f.strip_prefix('+').map(str::to_owned))
+            .collect();
+        enabled.extend(self.global.iter().cloned());
 
         for entry in &self.pkg_use {
             if entry.atom.matches(pkg) {
@@ -264,13 +275,39 @@ mod tests {
     }
 
     #[test]
+    fn iuse_plus_default_is_enabled() {
+        let i = Interner::new();
+        let v = Version::parse("1.0").unwrap();
+        let mgr = UseManager::new(vec![], BTreeSet::new());
+        let iuse = vec!["+native-symlinks".to_owned(), "test".to_owned()];
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &iuse, false);
+        // `+`-prefixed IUSE flags default to enabled; bare ones do not.
+        assert!(eff.enabled.contains("native-symlinks"));
+        assert!(!eff.enabled.contains("test"));
+    }
+
+    #[test]
+    fn pkg_use_overrides_iuse_default() {
+        let i = Interner::new();
+        let v = Version::parse("1.0").unwrap();
+        let mut mgr = UseManager::new(vec![], BTreeSet::new());
+        mgr.add_pkg_use(PkgUseEntry {
+            atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
+            mods: vec![("native-symlinks".to_owned(), false)],
+        });
+        let iuse = vec!["+native-symlinks".to_owned()];
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &iuse, false);
+        assert!(!eff.enabled.contains("native-symlinks"));
+    }
+
+    #[test]
     fn mask_and_force() {
         let i = Interner::new();
         let v = Version::parse("1.0").unwrap();
         let mgr = UseManager::new(vec!["ssl".into()], BTreeSet::new())
             .with_mask(["ssl".to_owned()])
             .with_force(["forced".to_owned()]);
-        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), true);
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &[], true);
         assert!(!eff.enabled.contains("ssl"));
         assert!(eff.enabled.contains("forced"));
     }
@@ -282,12 +319,12 @@ mod tests {
         let mgr = UseManager::new(vec!["exp".into()], BTreeSet::new())
             .with_stable_mask(["exp".to_owned()], true);
         assert!(
-            !mgr.effective_use(&pkg(&i, "a", "b", &v), true)
+            !mgr.effective_use(&pkg(&i, "a", "b", &v), &[], true)
                 .enabled
                 .contains("exp")
         );
         assert!(
-            mgr.effective_use(&pkg(&i, "a", "b", &v), false)
+            mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false)
                 .enabled
                 .contains("exp")
         );
@@ -296,7 +333,7 @@ mod tests {
             .with_stable_mask(["exp".to_owned()], false);
         assert!(
             ungated
-                .effective_use(&pkg(&i, "a", "b", &v), true)
+                .effective_use(&pkg(&i, "a", "b", &v), &[], true)
                 .enabled
                 .contains("exp")
         );
@@ -316,7 +353,7 @@ mod tests {
             mods: vec![("ssl".into(), false)],
         });
         let v = Version::parse("2.0").unwrap();
-        let eff = mgr.effective_use(&pkg(&i, "dev-libs", "foo", &v), true);
+        let eff = mgr.effective_use(&pkg(&i, "dev-libs", "foo", &v), &[], true);
         // The more specific versioned entry (applied last) disables ssl.
         assert!(!eff.enabled.contains("ssl"));
     }

@@ -321,7 +321,11 @@ mod tests {
             &interner,
         );
         let version = Version::parse("3.0").unwrap();
-        let eff = cfg.effective_use(&pref(&interner, "dev-libs", "openssl", &version), false);
+        let eff = cfg.effective_use(
+            &pref(&interner, "dev-libs", "openssl", &version),
+            &[],
+            false,
+        );
         assert!(eff.enabled.contains("ssl"));
     }
 

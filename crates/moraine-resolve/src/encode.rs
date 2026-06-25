@@ -420,10 +420,8 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
     }
 
     /// Expand a `virtual/*` atom into provider alternatives, highest virtual
-    /// version first, following only RDEPEND. A provider dependency is evaluated
-    /// against the virtual's own USE (resolved per virtual version below), not
-    /// the outer package that pulled the virtual in, so the outer USE is not a
-    /// parameter.
+    /// version first, following only RDEPEND. Each provider dependency is
+    /// evaluated against the virtual's own USE.
     fn expand_virtual(&self, atom: &NormAtom, features: EapiFeatures) -> Option<Vec<Alt>> {
         let mut providers: Vec<Alt> = Vec::new();
         let mut virtuals = self.source.versions_of(&atom.cp);
@@ -448,10 +446,6 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 }
             }
             for pa in collected {
-                // A provider dependency is parented by the virtual, so its USE
-                // dependencies (`flag=`, `flag?`, ...) are evaluated against the
-                // virtual's own USE, not the outer package that pulled the
-                // virtual in.
                 if pa.cp.starts_with("virtual/") {
                     if let Some(nested) = self.expand_virtual(pa, features) {
                         providers.extend(nested);

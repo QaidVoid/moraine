@@ -52,9 +52,15 @@ impl ResolvedConfig {
         }
     }
 
-    /// The effective USE for a package.
-    pub fn effective_use(&self, pkg: &PackageRef<'_>, stable: bool) -> EffectiveUse {
-        self.use_manager.effective_use(pkg, stable)
+    /// The effective USE for a package, given its raw `IUSE` tokens (with `+`/`-`
+    /// default prefixes) so defaults are applied.
+    pub fn effective_use(
+        &self,
+        pkg: &PackageRef<'_>,
+        iuse: &[String],
+        stable: bool,
+    ) -> EffectiveUse {
+        self.use_manager.effective_use(pkg, iuse, stable)
     }
 
     /// Whether a package is masked.

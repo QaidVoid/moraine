@@ -79,10 +79,16 @@ impl ResolveSource for RealSource<'_> {
                 .subslot
                 .and_then(|s| interner.resolve(s))
                 .map(|s| s.to_string());
+            // Bare flag names, with the `+`/`-` IUSE default prefix stripped, so
+            // membership checks work; defaults are applied in `resolved_use`.
             let iuse = entry
                 .iuse
                 .iter()
-                .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
+                .filter_map(|s| {
+                    interner
+                        .resolve(*s)
+                        .map(|x| x.trim_start_matches(['+', '-']).to_string())
+                })
                 .collect();
             out.push(PackageMeta {
                 cp: cp_str,
@@ -166,7 +172,13 @@ impl ResolveSource for RealSource<'_> {
                 subslot: entry.subslot,
                 repo: Some(entry.repository),
             };
-            return self.config.effective_use(&pref, self.stable).enabled;
+            // Pass the raw IUSE (with `+`/`-` prefixes) so defaults apply.
+            let iuse: Vec<String> = entry
+                .iuse
+                .iter()
+                .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
+                .collect();
+            return self.config.effective_use(&pref, &iuse, self.stable).enabled;
         }
         BTreeSet::new()
     }

@@ -370,7 +370,7 @@ impl CliPlanner<'_> {
             repo: Some(self.interner.intern(&entry.repository)),
         };
         self.config
-            .effective_use(&pref, false)
+            .effective_use(&pref, &entry.iuse, false)
             .enabled
             .into_iter()
             .collect()
@@ -689,7 +689,7 @@ fn source_size(
         repo: Some(interner.intern(&stored.repository)),
     };
     let use_flags: HashSet<String> = config
-        .effective_use(&pref, false)
+        .effective_use(&pref, &stored.iuse, false)
         .enabled
         .into_iter()
         .collect();
