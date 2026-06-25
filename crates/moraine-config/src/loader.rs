@@ -340,6 +340,15 @@ fn node_level(node: &crate::profile::ProfileNode) -> u8 {
     moraine_eapi::level(&node.eapi).unwrap_or(0)
 }
 
+/// Whether a path's final component begins with `.` (a hidden file or a
+/// CONFIG_PROTECT merge artifact such as `._cfg0000_foo` / `._mrg0000_foo`).
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with('.'))
+        .unwrap_or(false)
+}
+
 /// A set folded across stacked files, where a leading `-` removes a prior entry.
 #[derive(Debug, Default)]
 struct StackSet {
@@ -377,6 +386,11 @@ fn read_flag_file(path: &Path) -> Vec<String> {
 
 /// Read non-comment, non-blank lines from a path that may be a file or a
 /// directory of files (read in sorted name order).
+///
+/// Files whose name starts with `.` are skipped, matching Portage's
+/// `_recursive_basenames` filter. This excludes CONFIG_PROTECT merge artifacts
+/// (`._cfg*`, `._mrg*`) so a pending, unapplied config update does not leak into
+/// the active configuration.
 fn read_lines(path: &Path) -> Vec<String> {
     let mut bodies = Vec::new();
     if path.is_dir() {
@@ -384,7 +398,7 @@ fn read_lines(path: &Path) -> Vec<String> {
             let mut files: Vec<_> = entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| p.is_file())
+                .filter(|p| p.is_file() && !is_hidden(p))
                 .collect();
             files.sort();
             for file in files {

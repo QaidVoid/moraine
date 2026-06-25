@@ -115,13 +115,21 @@ impl VarMap {
     /// Parse a file or directory path into this map.
     pub fn merge_path(&mut self, path: &Path) -> Result<(), ConfigError> {
         if path.is_dir() {
+            // Skip files whose name starts with `.` (CONFIG_PROTECT merge
+            // artifacts and other hidden files), matching Portage.
             let mut entries: Vec<_> = std::fs::read_dir(path)
                 .map_err(|_| ConfigError::Io {
                     path: path.to_path_buf(),
                 })?
                 .filter_map(Result::ok)
                 .map(|e| e.path())
-                .filter(|p| p.is_file())
+                .filter(|p| {
+                    p.is_file()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| !n.starts_with('.'))
+                            .unwrap_or(false)
+                })
                 .collect();
             entries.sort();
             for entry in entries {
