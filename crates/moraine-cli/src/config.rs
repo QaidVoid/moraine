@@ -104,6 +104,9 @@ impl ConfigContext {
             None
         };
         let profile = load_profile(&config_dir, roots.profile.as_deref(), repos.as_ref())?;
+        if let Some(note) = profile.deprecation() {
+            tracing::warn!("the selected profile is deprecated; replacement: {note}");
+        }
 
         let mut env = VarMap::new();
         // make.globals is the lowest configuration layer, below profile
@@ -122,6 +125,12 @@ impl ConfigContext {
         if make_conf.exists() {
             env.merge_path(&make_conf)
                 .map_err(ConfigLoadError::MakeConf)?;
+        }
+        // The known architecture keywords come from each repository's
+        // `profiles/arch.list`, exported as PORTAGE_ARCHLIST.
+        let archlist = arch_list(repos.as_ref());
+        if !archlist.is_empty() {
+            env.set("PORTAGE_ARCHLIST", archlist.join(" "));
         }
         let arch = env.get("ARCH").unwrap_or_default().to_owned();
         let tokens = |key: &str| {
@@ -274,6 +283,30 @@ pub fn repo_mask_inputs(repos: &RepoSet) -> Vec<moraine_config::RepoMaskInput> {
             }
         })
         .collect()
+}
+
+/// Collect the known architecture keywords from each repository's
+/// `profiles/arch.list`, in repository order with duplicates removed.
+fn arch_list(repos: Option<&RepoSet>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(set) = repos else {
+        return out;
+    };
+    for repo in set.ordered() {
+        let Ok(content) = std::fs::read_to_string(repo.location.join("profiles/arch.list")) else {
+            continue;
+        };
+        for line in content.lines() {
+            let arch = line.trim();
+            if arch.is_empty() || arch.starts_with('#') {
+                continue;
+            }
+            if !out.iter().any(|a| a == arch) {
+                out.push(arch.to_owned());
+            }
+        }
+    }
+    out
 }
 
 /// Load and stack `profiles/thirdpartymirrors` across the discovered

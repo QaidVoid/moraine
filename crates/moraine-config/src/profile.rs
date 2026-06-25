@@ -105,6 +105,17 @@ impl ProfileStack {
         Ok(stack)
     }
 
+    /// The deprecation notice from the selected (deepest non-user) profile node,
+    /// if it ships a `deprecated` file. The content's first line names the
+    /// replacement profile, mirroring `deprecated_profile_check`.
+    pub fn deprecation(&self) -> Option<String> {
+        let node = self.nodes.iter().rev().find(|n| !n.is_user)?;
+        std::fs::read_to_string(node.path.join("deprecated"))
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    }
+
     /// Merge each node's `make.defaults` in stack order.
     pub fn make_defaults(&self) -> Result<VarMap, ConfigError> {
         let mut vars = VarMap::new();
