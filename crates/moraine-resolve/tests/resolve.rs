@@ -233,6 +233,53 @@ fn use_dependency_default_applies_when_absent() {
 }
 
 #[test]
+fn any_of_branch_pulls_in_all_atoms() {
+    // `|| ( ( a b ) c )`: the chosen branch is a conjunction, so selecting it
+    // pulls in both a and b, not just the first atom.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/main",
+        version: "1",
+        rdepend: "|| ( ( cat/a cat/b ) cat/c )",
+        ..Default::default()
+    });
+    f.add(pkg("cat/a", "1"));
+    f.add(pkg("cat/b", "1"));
+    f.add(pkg("cat/c", "1"));
+
+    let sol = resolve(&f, &["cat/main"]).expect("resolves");
+    assert!(sol.package("cat/a").is_some(), "a pulled in");
+    assert!(
+        sol.package("cat/b").is_some(),
+        "b pulled in (the whole branch is a conjunction)"
+    );
+}
+
+#[test]
+fn any_of_branch_blocker_is_asserted() {
+    // A chosen `||` branch carrying a blocker asserts it: `|| ( ( cat/a !cat/bad ) )`
+    // pulls in cat/a and blocks cat/bad.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/main",
+        version: "1",
+        rdepend: "|| ( ( cat/a !cat/bad ) )",
+        ..Default::default()
+    });
+    f.add(pkg("cat/a", "1"));
+    f.add(pkg("cat/bad", "1"));
+    f.add_installed(installed("cat/bad", "1", "0", None, &[]));
+
+    let sol = resolve(&f, &["cat/main"]).expect("resolves");
+    assert!(sol.package("cat/a").is_some());
+    let victims: Vec<_> = sol.blockers.iter().flat_map(|b| &b.victims).collect();
+    assert!(
+        victims.iter().any(|v| v.cp == "cat/bad"),
+        "the branch's blocker schedules cat/bad's unmerge: {victims:?}"
+    );
+}
+
+#[test]
 fn any_of_group_falls_back() {
     let mut f = Fixture::new();
     f.add(PkgSpec {

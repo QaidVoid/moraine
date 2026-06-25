@@ -115,6 +115,10 @@ pub(crate) struct Parent<'a> {
     pub slot: &'a str,
 }
 
+/// A satisfiable `||` branch reduced for encoding: its declaration index, one
+/// alternative list per required atom, and the branch's blocker atoms.
+type EncodedBranch<'a> = (usize, Vec<Vec<Alt>>, Vec<&'a NormAtom>);
+
 /// Recursively reduce a dependency node against the parent's USE, collecting the
 /// live top-level atoms and the any-of groups (with branch structure preserved).
 fn reduce<'a>(
@@ -269,7 +273,14 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 )?;
             }
             for group in &groups {
-                self.encode_group(group, parent_use, &mut clauses, features)?;
+                self.encode_group(
+                    group,
+                    parent_use,
+                    parent,
+                    &mut clauses,
+                    &mut conflicts,
+                    features,
+                )?;
             }
         }
 
@@ -362,31 +373,38 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         Ok(())
     }
 
-    /// Encode a `||` any-of group into a disjunction clause.
+    /// Encode a `||` any-of group.
     ///
-    /// Branches whose category/package sets overlap are reordered so that the
-    /// branch adding the fewest new slots is preferred (a lightweight form of
-    /// the DNF preference Portage applies only to overlapping groups, avoiding
-    /// the exponential blow-up of unconditional DNF). Non-overlapping branches
-    /// stay a plain disjunction in declaration order. Each branch contributes
-    /// its first satisfiable atom as its representative alternative.
+    /// Each satisfiable branch is reduced to its full atom list (every required
+    /// atom's `(cp, slot)` alternatives, plus its blocker atoms), mirroring
+    /// `dep_zapdeps` returning the entire selected branch rather than only its
+    /// first atom. Overlapping branches are reordered so the branch adding the
+    /// fewest new slots is preferred. The chosen (first, after ordering) branch
+    /// is emitted as a conjunction of all its atoms (so `|| ( ( a b ) c )` pulls
+    /// in both `a` and `b`), and its blockers are asserted. An any-of over every
+    /// satisfiable branch's leading atom is also emitted so the solver can fall
+    /// back to another branch on a learned conflict.
     fn encode_group(
         &self,
         group: &Group,
         parent_use: &BTreeSet<String>,
+        parent: Parent<'_>,
         clauses: &mut Vec<Clause<String, Version>>,
+        conflicts: &mut Vec<(String, Term<Version>)>,
         features: EapiFeatures,
     ) -> Result<(), String> {
-        // Resolve each branch to its leading representative atom's `(cp, slot)`
-        // alternatives, dropping branches that cannot be satisfied.
         let overlapping = branches_overlap(group);
-        let mut branch_reps: Vec<(usize, Vec<Alt>)> = Vec::new();
+        // Each satisfiable branch: its index, the per-atom alternative lists (one
+        // disjunction per required atom), and its blocker atoms.
+        let mut branches: Vec<EncodedBranch> = Vec::new();
         for (idx, branch) in group.iter().enumerate() {
-            let mut leading: Option<Vec<Alt>> = None;
+            let mut atom_alts: Vec<Vec<Alt>> = Vec::new();
+            let mut blockers: Vec<&NormAtom> = Vec::new();
             let mut satisfiable = true;
             let mut any_required = false;
             for atom in branch {
                 if atom.blocker != BlockerKind::None {
+                    blockers.push(atom);
                     continue;
                 }
                 if self.atom_is_provided(atom) {
@@ -400,43 +418,58 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                     if a.is_empty() { None } else { Some(a) }
                 };
                 match alts {
-                    Some(a) => {
-                        if leading.is_none() {
-                            leading = Some(a);
-                        }
-                    }
+                    Some(a) => atom_alts.push(a),
                     None => {
                         satisfiable = false;
                         break;
                     }
                 }
             }
-            // A branch whose atoms are all provided satisfies the group with no
-            // install.
+            // A branch with no required atom (all provided, or pure blockers)
+            // satisfies the group with no install.
             if satisfiable && !any_required {
                 return Ok(());
             }
-            if satisfiable && let Some(alts) = leading {
-                branch_reps.push((idx, alts));
+            if satisfiable {
+                branches.push((idx, atom_alts, blockers));
             }
         }
 
-        if branch_reps.is_empty() {
+        if branches.is_empty() {
             return Err("no satisfiable branch in any-of group".to_owned());
         }
 
         if overlapping {
-            // Prefer the branch adding the fewest new slots.
-            branch_reps.sort_by(|a, b| {
-                self.new_slot_count(&a.1)
-                    .cmp(&self.new_slot_count(&b.1))
-                    .then(a.0.cmp(&b.0))
+            // Prefer the branch adding the fewest new slots (by its leading atom).
+            branches.sort_by(|a, b| {
+                let an = a.1.first().map_or(0, |alts| self.new_slot_count(alts));
+                let bn = b.1.first().map_or(0, |alts| self.new_slot_count(alts));
+                an.cmp(&bn).then(a.0.cmp(&b.0))
             });
         }
 
-        // The disjunction over each branch's leading representative.
-        let alternatives: Vec<Alt> = branch_reps.into_iter().flat_map(|(_, alts)| alts).collect();
-        push_disjunction(clauses, alternatives);
+        // The chosen branch is the first after ordering: emit its full
+        // conjunction (every atom required) and assert its blockers.
+        let (_, chosen_atoms, chosen_blockers) = &branches[0];
+        for alts in chosen_atoms {
+            push_disjunction(clauses, alts.clone());
+        }
+        for blocker in chosen_blockers {
+            for alt in self.blocked_alternatives(blocker, Some(parent), parent_use, features) {
+                conflicts.push(alt);
+            }
+        }
+
+        // Any-of fallback over every satisfiable branch's leading atom, so the
+        // solver can switch branches when the chosen one hits a learned conflict.
+        let leaders: Vec<Alt> = branches
+            .iter()
+            .filter_map(|(_, atoms, _)| atoms.first())
+            .flat_map(|alts| alts.iter().cloned())
+            .collect();
+        if leaders.len() > 1 {
+            clauses.push(Clause::any_of(leaders));
+        }
         Ok(())
     }
 
