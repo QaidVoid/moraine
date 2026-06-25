@@ -265,12 +265,15 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             return Ok(());
         }
 
-        // virtual/* atoms expand to a disjunction over providers.
-        if atom.cp.starts_with("virtual/") {
-            match self.expand_virtual(atom, features) {
-                Some(alts) => push_disjunction(clauses, alts),
-                None => return Err(format!("no provider for {}", atom.cp)),
-            }
+        // virtual/* atoms expand to a disjunction over their providers. When the
+        // virtual's reduced RDEPEND lists no providers (for example
+        // virtual/libiconv on glibc, where the provider branch is USE-gated off),
+        // fall through to require the virtual package itself: selecting it
+        // processes its own RDEPEND, which is then trivially satisfied.
+        if atom.cp.starts_with("virtual/")
+            && let Some(alts) = self.expand_virtual(atom, features)
+        {
+            push_disjunction(clauses, alts);
             return Ok(());
         }
 
@@ -284,7 +287,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 clauses.push(Clause::single(atom.cp.clone(), term));
                 Ok(())
             }
-            None => Err(format!("no candidate satisfies {}", atom.cp)),
+            None => Err(format!("no provider for {}", atom.cp)),
         }
     }
 
@@ -536,8 +539,15 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         }
         for m in self.source.installed(&atom.cp) {
             // An installed package's USE is fixed; its enabled set serves as both
-            // its USE and its known IUSE for the blocker's USE condition.
-            if version_satisfies(atom, &m.version)
+            // its USE and its known IUSE for the blocker's USE condition. The
+            // slot is checked too, so a slotted blocker (`!pkg:slot`) does not
+            // match an installed package in a different slot.
+            let slot_ok = match &atom.slot {
+                None => true,
+                Some(s) => &m.slot == s,
+            };
+            if slot_ok
+                && version_satisfies(atom, &m.version)
                 && use_deps_satisfied(atom, &m.use_enabled, &m.use_enabled, parent_use, features)
             {
                 out.push(m.version.clone());
