@@ -17,6 +17,8 @@
 //! REQUIRED_USE on the chosen USE, and reports a sub-slot rebuild trigger when
 //! the chosen provider's sub-slot differs from an installed `:=` binding.
 
+use std::collections::BTreeSet;
+
 use moraine_eapi::features_for;
 use moraine_solver::{Dependencies, DependencyProvider, Range};
 use moraine_version::Version;
@@ -113,7 +115,19 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
             return relaxed.into_iter().map(|m| m.version).collect();
         }
 
-        strict.sort_by(|a, b| b.version.cmp(&a.version));
+        // Prefer the version installed in this slot (Portage's default keeps an
+        // installed package rather than needlessly upgrading or downgrading it),
+        // then the highest version.
+        let installed_versions: BTreeSet<Version> = installed
+            .iter()
+            .filter(|i| i.slot == slot)
+            .map(|i| i.version.clone())
+            .collect();
+        strict.sort_by(|a, b| {
+            let ai = installed_versions.contains(&a.version);
+            let bi = installed_versions.contains(&b.version);
+            bi.cmp(&ai).then_with(|| b.version.cmp(&a.version))
+        });
         strict.into_iter().map(|m| m.version).collect()
     }
 }
