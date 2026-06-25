@@ -193,7 +193,13 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
             return Dependencies::Unavailable(format!("REQUIRED_USE violated: {constraint}"));
         }
 
-        match encoder.requirements(&meta, &resolved_use, features) {
+        // An already-installed package at this exact version and slot is not
+        // rebuilt, so its build-time dependencies are not pulled into the graph
+        // (matching Portage's default and a binary install). A new install or
+        // upgrade still pulls its build deps.
+        let skip_build = self.source.installed_matches(cp, &meta.version, slot);
+
+        match encoder.requirements(&meta, &resolved_use, features, skip_build) {
             Ok(reqs) => Dependencies::Known(reqs),
             Err(reason) => Dependencies::Unavailable(reason),
         }

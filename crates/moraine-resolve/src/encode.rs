@@ -238,6 +238,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         meta: &crate::source::PackageMeta,
         parent_use: &BTreeSet<String>,
         features: EapiFeatures,
+        skip_build: bool,
     ) -> Result<Requirements<String, Version>, String> {
         let mut clauses: Vec<Clause<String, Version>> = Vec::new();
         let mut conflicts: Vec<(String, Term<Version>)> = Vec::new();
@@ -257,7 +258,14 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             slot: meta.slot.as_str(),
         };
 
-        for (node, _class) in class_nodes {
+        for (node, class) in class_nodes {
+            // An already-built (installed, not rebuilt) package does not need its
+            // build-time dependencies pulled into the graph; only its runtime
+            // dependencies matter. This also matches a binary install, where the
+            // build deps are never required.
+            if skip_build && class.is_build_time() {
+                continue;
+            }
             let mut atoms: Vec<&NormAtom> = Vec::new();
             let mut groups: Vec<Group> = Vec::new();
             reduce(node, parent_use, &mut atoms, &mut groups);
