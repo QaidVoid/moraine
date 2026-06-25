@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use miette::Diagnostic;
 use moraine_config::makeconf::VarMap;
 use moraine_config::profile::{ProfileContext, ProfileStack, RepoProfileInfo};
-use moraine_config::sets::{selected_set, system_set, world_set};
+use moraine_config::sets::{profile_set, selected_set, system_set, world_set};
 use moraine_repo::{RepoConfig, RepoSet, discover};
 use thiserror::Error;
 use tracing::instrument;
@@ -78,6 +78,8 @@ pub struct ConfigContext {
     pub system: Vec<String>,
     /// The `@selected` set members (world file contents).
     pub selected: Vec<String>,
+    /// The `@profile` set members (only under the `profile-set` format).
+    pub profile_set: Vec<String>,
     /// The `@world` set members.
     pub world: Vec<String>,
 }
@@ -145,7 +147,20 @@ impl ConfigContext {
         let world_contents = std::fs::read_to_string(&world_path).unwrap_or_default();
         let selected = selected_set(&world_contents);
 
-        let world = world_set(&selected, &system);
+        // Under the profile-set format the non-`*` `packages` entries form the
+        // `@profile` set, which is part of world selection.
+        let profile_set_members = if profile_set_active(&profile, repos.as_ref()) {
+            profile_set(&layer_refs)
+        } else {
+            Vec::new()
+        };
+
+        let mut world = world_set(&selected, &system);
+        for member in &profile_set_members {
+            if !world.iter().any(|w| w == member) {
+                world.push(member.clone());
+            }
+        }
 
         Ok(ConfigContext {
             profile,
@@ -156,6 +171,7 @@ impl ConfigContext {
             config_protect_mask,
             system,
             selected,
+            profile_set: profile_set_members,
             world,
         })
     }
@@ -203,6 +219,18 @@ fn load_profile(
     }
 }
 
+/// Whether the selected profile's owning repository declares the `profile-set`
+/// format, under which the `packages` file's non-`*` entries are the `@profile`
+/// set.
+fn profile_set_active(profile: &ProfileStack, repos: Option<&RepoSet>) -> bool {
+    let (Some(node), Some(set)) = (profile.nodes.last(), repos) else {
+        return false;
+    };
+    owning_repo(set, &node.path)
+        .map(|c| c.profile_formats.iter().any(|f| f == "profile-set"))
+        .unwrap_or(false)
+}
+
 /// The repository whose `profiles` directory is the longest ancestor of `path`,
 /// canonicalizing both sides so symlinked profiles and `..` components match.
 fn owning_repo<'a>(set: &'a RepoSet, path: &Path) -> Option<&'a RepoConfig> {
@@ -248,6 +276,38 @@ pub fn repo_mask_inputs(repos: &RepoSet) -> Vec<moraine_config::RepoMaskInput> {
         .collect()
 }
 
+/// Load and stack `profiles/thirdpartymirrors` across the discovered
+/// repositories (masters first), mapping a named mirror group to its base URIs
+/// so `mirror://group/path` resolves. Each line is `group uri1 uri2 ...`; URIs
+/// for a repeated group are appended, mirroring `stack_dictlist`.
+pub fn thirdparty_mirrors(repos: &RepoSet) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for repo in repos.ordered() {
+        let path = repo.location.join("profiles/thirdpartymirrors");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let Some(group) = parts.next() else {
+                continue;
+            };
+            let entry = groups.entry(group.to_owned()).or_default();
+            for uri in parts {
+                if !entry.iter().any(|u| u == uri) {
+                    entry.push(uri.to_owned());
+                }
+            }
+        }
+    }
+    groups
+}
+
 /// A repository's default profile EAPI: `layout.conf`'s
 /// `profile_eapi_when_unspecified`, else the `profiles/eapi` file, else none.
 fn repo_default_eapi(location: &Path) -> Option<String> {
@@ -276,6 +336,7 @@ impl SetSource for ConfigContext {
             "world" => Some(self.world.clone()),
             "system" => Some(self.system.clone()),
             "selected" => Some(self.selected.clone()),
+            "profile" => Some(self.profile_set.clone()),
             _ => None,
         }
     }
@@ -347,6 +408,7 @@ mod tests {
             config_protect_mask: Vec::new(),
             system: vec!["sys-apps/baselayout".to_owned()],
             selected: vec!["app/editor".to_owned()],
+            profile_set: Vec::new(),
             world: vec!["app/editor".to_owned(), "sys-apps/baselayout".to_owned()],
         };
         assert_eq!(ctx.members("system").unwrap(), ctx.system);
@@ -372,6 +434,31 @@ mod tests {
         let ctx = ConfigContext::load(&roots).unwrap();
         // make.globals supplies the base USE, make.conf stacks onto it.
         assert_eq!(ctx.vars.get("USE"), Some("a b c"));
+    }
+
+    #[test]
+    fn thirdparty_mirrors_load_and_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = dir.path().join("gentoo");
+        std::fs::create_dir_all(loc.join("profiles")).unwrap();
+        std::fs::write(loc.join("profiles/repo_name"), "gentoo\n").unwrap();
+        std::fs::write(
+            loc.join("profiles/thirdpartymirrors"),
+            "gnu https://a/gnu https://b/gnu\nkernel https://k/\n",
+        )
+        .unwrap();
+        let conf = dir.path().join("repos.conf");
+        std::fs::write(&conf, format!("[gentoo]\nlocation = {}\n", loc.display())).unwrap();
+        let repos = discover(&conf).unwrap();
+        let groups = thirdparty_mirrors(&repos);
+        assert_eq!(
+            groups.get("gnu").unwrap(),
+            &vec!["https://a/gnu".to_owned(), "https://b/gnu".to_owned()]
+        );
+        assert_eq!(
+            groups.get("kernel").unwrap(),
+            &vec!["https://k/".to_owned()]
+        );
     }
 
     #[test]

@@ -4,26 +4,46 @@ use std::path::Path;
 
 use crate::error::ConfigError;
 
-/// Materialize `@system` from stacked `packages` files. Only `*`-prefixed
-/// entries are system members; a `-*entry` removes an inherited member.
-pub fn system_set(layers: &[&str]) -> Vec<String> {
+/// Incrementally stack the `packages` token lists across profile layers,
+/// mirroring `stack_lists`: a bare `-*` clears the accumulator, a `-token`
+/// removes the matching prior token, and a plain token is appended once. The
+/// `*` system prefix and `-` removal prefix are preserved in the result.
+fn stack_packages(layers: &[&str]) -> Vec<String> {
     let mut acc: Vec<String> = Vec::new();
     for layer in layers {
         for raw in layer.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
+            let token = raw.trim();
+            if token.is_empty() || token.starts_with('#') {
                 continue;
             }
-            if let Some(rest) = line.strip_prefix("-*") {
-                acc.retain(|x| x != rest);
-            } else if let Some(rest) = line.strip_prefix('*')
-                && !acc.iter().any(|x| x == rest)
-            {
-                acc.push(rest.to_owned());
+            if token == "-*" {
+                acc.clear();
+            } else if let Some(rest) = token.strip_prefix('-') {
+                acc.retain(|t| t != rest);
+            } else if !acc.iter().any(|t| t == token) {
+                acc.push(token.to_owned());
             }
         }
     }
     acc
+}
+
+/// Materialize `@system` from stacked `packages` files: the `*`-prefixed
+/// survivors with the `*` stripped, matching `PackagesSystemSet.load`.
+pub fn system_set(layers: &[&str]) -> Vec<String> {
+    stack_packages(layers)
+        .into_iter()
+        .filter_map(|t| t.strip_prefix('*').map(str::to_owned))
+        .collect()
+}
+
+/// Materialize `@profile` from stacked `packages` files: the non-`*` survivors.
+/// Only meaningful under the `profile-set` profile format.
+pub fn profile_set(layers: &[&str]) -> Vec<String> {
+    stack_packages(layers)
+        .into_iter()
+        .filter(|t| !t.starts_with('*'))
+        .collect()
 }
 
 /// Read `@selected` from the world file contents (one atom per non-empty line).
@@ -84,6 +104,22 @@ mod tests {
             system_set(&["*sys-apps/foo", "-*sys-apps/foo"]),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn bare_star_dash_clears_accumulated_system() {
+        // A bare `-*` clears every entry stacked so far.
+        assert_eq!(
+            system_set(&["*sys-apps/foo\n*sys-apps/bar", "-*\n*sys-apps/baz"]),
+            vec!["sys-apps/baz"]
+        );
+    }
+
+    #[test]
+    fn profile_set_takes_non_star_entries() {
+        let layer = "*sys-apps/portage\napp-misc/profileonly\n";
+        assert_eq!(profile_set(&[layer]), vec!["app-misc/profileonly"]);
+        assert_eq!(system_set(&[layer]), vec!["sys-apps/portage"]);
     }
 
     #[test]

@@ -436,7 +436,7 @@ impl CliPlanner<'_> {
             fetchcommand,
             resumecommand,
             mirrors,
-            thirdparty: std::collections::BTreeMap::new(),
+            thirdparty: crate::config::thirdparty_mirrors(self.repo_set),
             resume_min_size: 350_000,
             max_attempts: 3,
         }
@@ -1015,6 +1015,7 @@ mod tests {
             config_protect_mask: Vec::new(),
             system: Vec::new(),
             selected: Vec::new(),
+            profile_set: Vec::new(),
             world: Vec::new(),
         };
         let planner = CliPlanner {
