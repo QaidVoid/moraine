@@ -16,9 +16,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::io::{IsTerminal as _, Write as _};
+
 use miette::{Result, miette};
 use moraine_build::{
-    BuildRequest, ConfigEnv, FetchConfig, NamespaceSupport, PackageIdent, PackageSpec, SystemRunner,
+    BuildRequest, ConfigEnv, FetchConfig, Manifest, NamespaceSupport, PackageIdent, PackageSpec,
+    SystemRunner, srcuri,
 };
 use moraine_common::Interner;
 use moraine_config::{ResolvedConfig, resolve_config};
@@ -28,22 +31,41 @@ use moraine_install::{
     Transaction, TransactionEngine,
 };
 use moraine_repo::store::{StoredEntry, read_entries};
-use moraine_repo::{RepoSet, build_index_with, discover};
+use moraine_repo::{RepoIndex, RepoSet, build_index_with, discover};
 use moraine_resolve::{RealSource, Task, TaskKind as ResolveTaskKind, resolve, serialize};
 use moraine_vdb::store::{Store, StorePaths};
 use moraine_version::Version;
 
 use crate::args::Cli;
 use crate::config::{ConfigContext, Roots};
+use crate::plan::build_plan;
+use crate::render::{Operation, render_merge_list, render_tree};
 use crate::write::{WriteRoots, cp_of_atom, ensure_dirs, merge_context};
 
-/// Run the dependency-resolving install over the request's atoms.
-pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots, atoms: &[String]) -> Result<()> {
-    if atoms.is_empty() {
-        println!("No targets to install.");
-        return Ok(());
-    }
+/// The binary-package preferences in effect, combining the CLI switches with the
+/// `make.conf` `FEATURES` tokens (`getbinpkg`, `buildpkg`).
+struct BinaryPrefs {
+    getbinpkg: bool,
+    usepkg: bool,
+    buildpkg: bool,
+    buildpkgonly: bool,
+}
 
+impl BinaryPrefs {
+    fn from(cli: &Cli, features: &[String]) -> Self {
+        let has = |name: &str| features.iter().any(|f| f == name);
+        BinaryPrefs {
+            // `getbinpkg` also implies considering binary packages, like emerge.
+            getbinpkg: cli.getbinpkg || has("getbinpkg"),
+            usepkg: cli.usepkg || cli.getbinpkg || has("getbinpkg"),
+            buildpkg: cli.buildpkg || has("buildpkg"),
+            buildpkgonly: cli.buildpkgonly,
+        }
+    }
+}
+
+/// Run the dependency-resolving install over the command-line targets.
+pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let wr = WriteRoots::from(roots);
     let config_dir = roots.config_dir();
     let interner = Arc::new(Interner::new());
@@ -76,60 +98,48 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots, atoms: &[String]) -> R
         &interner,
     );
 
-    // Resolve and serialize the merge order.
-    let order = {
-        let source = RealSource::new(&repo_index, &vdb, &config);
-        let atom_refs: Vec<&str> = atoms.iter().map(String::as_str).collect();
-        let solution =
-            resolve(&source, &atom_refs).map_err(|e| miette!("resolution failed:\n{e}"))?;
-        serialize(&solution).map_err(|e| miette!("merge ordering failed: {e}"))?
-    };
-
-    // Convert to orchestrator tasks, choosing source or binary per task. An
-    // uninstall task from a blocker is dropped when the package is not actually
-    // installed (a non-installed blocker is nothing to remove), and resolved to
-    // the real installed version(s) otherwise.
-    let explicit = explicit_heads(cli);
-    let pkgdir = wr.eroot.join("var/cache/binpkgs");
-    let installed = installed_versions(&vdb);
-    let mut tasks: Vec<InstallTask> = Vec::new();
-    for task in &order {
-        match task.kind {
-            ResolveTaskKind::Merge => {
-                tasks.push(to_install_task(task, &explicit, cli, &pkgdir));
-            }
-            ResolveTaskKind::Uninstall => {
-                let Some(versions) = installed.get(&task.cp) else {
-                    continue;
-                };
-                for (version, slot) in versions {
-                    tasks.push(InstallTask::uninstall(
-                        format!("{}-{}", task.cp, version),
-                        task.cp.clone(),
-                        slot.clone(),
-                    ));
-                }
-            }
-        }
+    // Resolve each bare package name to a category, then expand sets and atoms.
+    let qualified = qualify_targets(&cli.targets, &repo_index)?;
+    let request = crate::sets::expand(
+        ctx,
+        &qualified,
+        &cli.exclude,
+        crate::run::modifiers_from(cli),
+    )?;
+    if request.atoms.is_empty() {
+        println!("No targets to install.");
+        return Ok(());
     }
 
-    if tasks.is_empty() {
+    // Resolve and serialize the merge order.
+    let source = RealSource::new(&repo_index, &vdb, &config);
+    let atom_refs: Vec<&str> = request.atoms.iter().map(String::as_str).collect();
+    let solution = resolve(&source, &atom_refs).map_err(|e| miette!("resolution failed:\n{e}"))?;
+    let raw_order = serialize(&solution).map_err(|e| miette!("merge ordering failed: {e}"))?;
+
+    // Drop blocker uninstalls for packages that are not installed, and resolve
+    // genuine ones to the real installed version(s).
+    let installed = installed_versions(&vdb);
+    let order = clean_order(&raw_order, &installed);
+    if order.is_empty() {
         println!("Nothing to do; the targets are already satisfied.");
         return Ok(());
     }
-    println!("These packages would be merged, in order:");
-    for task in &tasks {
-        match task.kind {
-            moraine_install::TaskKind::Uninstall => println!("  remove {}", task.cpv),
-            moraine_install::TaskKind::Merge => {
-                let kind = match task.source {
-                    SourceKind::Binary => "binary",
-                    SourceKind::Source => "source",
-                };
-                println!("  merge {} ({kind})", task.cpv);
-            }
-        }
+
+    let prefs = BinaryPrefs::from(cli, &ctx.features);
+    let pkgdir = wr.eroot.join("var/cache/binpkgs");
+
+    // Build the presentation plan and enrich it with source/binary, repository,
+    // and download size, then render it `emerge`-style.
+    let mut plan = build_plan(&order, &solution, &source);
+    enrich_plan(
+        &mut plan, &repo_set, &store_dir, &config, &interner, &prefs, &pkgdir,
+    );
+    print!("{}", render_merge_list(&plan, cli.is_verbose()));
+    if cli.show_tree() {
+        print!("{}", render_tree(&plan, cli.is_verbose()));
     }
+
     if cli.pretend {
         return Ok(());
     }
@@ -137,6 +147,13 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots, atoms: &[String]) -> R
         println!("Operation cancelled.");
         return Ok(());
     }
+
+    // Convert to orchestrator tasks, choosing source or binary per task.
+    let explicit = explicit_heads(cli);
+    let tasks: Vec<InstallTask> = order
+        .iter()
+        .map(|task| to_install_task(task, &explicit, &prefs, cli.oneshot, &pkgdir))
+        .collect();
 
     // Drive the orchestrator with a runner that dispatches source vs binary.
     ensure_dirs(&wr)?;
@@ -151,13 +168,13 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots, atoms: &[String]) -> R
     };
     let command_runner = SystemRunner;
     let options = BuildOptions {
-        buildpkg: cli.buildpkg,
-        buildpkgonly: cli.buildpkgonly,
+        buildpkg: prefs.buildpkg,
+        buildpkgonly: prefs.buildpkgonly,
         pkgdir: pkgdir.clone(),
         ..BuildOptions::default()
     };
     let stage = wr.state_dir.join("install-stage");
-    let binpkg_source: Box<dyn BinpkgSource> = if cli.getbinpkg {
+    let binpkg_source: Box<dyn BinpkgSource> = if prefs.getbinpkg {
         Box::new(BinhostSource {
             base_uri: ctx
                 .vars
@@ -391,11 +408,12 @@ impl CliPlanner<'_> {
     }
 }
 
-/// Convert a serialized merge task into an orchestrator task.
+/// Convert a serialized task into an orchestrator task.
 fn to_install_task(
     task: &Task,
     explicit: &BTreeSet<String>,
-    cli: &Cli,
+    prefs: &BinaryPrefs,
+    oneshot: bool,
     pkgdir: &Path,
 ) -> InstallTask {
     let cpv = format!("{}-{}", task.cp, task.version);
@@ -403,31 +421,246 @@ fn to_install_task(
         ResolveTaskKind::Uninstall => moraine_install::TaskKind::Uninstall,
         ResolveTaskKind::Merge => moraine_install::TaskKind::Merge,
     };
-    let source = select_source(&task.cp, &task.version, cli, pkgdir);
+    let (binary, _) = binary_choice(&task.cp, &task.version, prefs, pkgdir);
     InstallTask {
         cpv,
         cp: task.cp.clone(),
         slot: task.slot.clone(),
         kind,
-        source,
-        in_world: explicit.contains(&task.cp) && !cli.oneshot,
+        source: if binary {
+            SourceKind::Binary
+        } else {
+            SourceKind::Source
+        },
+        in_world: explicit.contains(&task.cp) && !oneshot,
         replaces: None,
     }
 }
 
-/// Choose source or binary for a task, honoring `--usepkg`/`--getbinpkg`.
-fn select_source(cp: &str, version: &str, cli: &Cli, pkgdir: &Path) -> SourceKind {
-    if cli.getbinpkg {
-        return SourceKind::Binary;
+/// Decide whether a task installs a binary package, and whether that package
+/// comes from a binhost (the `g` indicator). Honors `--usepkg`/`--getbinpkg` and
+/// the `getbinpkg` `FEATURE`. A local package is preferred over the binhost.
+fn binary_choice(cp: &str, version: &str, prefs: &BinaryPrefs, pkgdir: &Path) -> (bool, bool) {
+    let (category, _) = cp.split_once('/').unwrap_or((cp, ""));
+    let pf = format!("{}-{}", cp.rsplit('/').next().unwrap_or(cp), version);
+    let local = pkgdir.join(category).join(format!("{pf}.gpkg")).exists();
+    if (prefs.usepkg || prefs.getbinpkg) && local {
+        (true, false)
+    } else if prefs.getbinpkg {
+        // No local package, but the binhost may provide one.
+        (true, true)
+    } else {
+        (false, false)
     }
-    if cli.usepkg {
-        let (category, _) = cp.split_once('/').unwrap_or((cp, ""));
-        let pf = format!("{}-{}", cp.rsplit('/').next().unwrap_or(cp), version);
-        if pkgdir.join(category).join(format!("{pf}.gpkg")).exists() {
-            return SourceKind::Binary;
+}
+
+/// Clean the serialized order: drop blocker uninstalls for packages that are not
+/// installed, and expand genuine ones to the real installed `(version, slot)`.
+fn clean_order(order: &[Task], installed: &HashMap<String, Vec<(String, String)>>) -> Vec<Task> {
+    let mut out = Vec::with_capacity(order.len());
+    for task in order {
+        match task.kind {
+            ResolveTaskKind::Merge => out.push(task.clone()),
+            ResolveTaskKind::Uninstall => {
+                if let Some(versions) = installed.get(&task.cp) {
+                    for (version, slot) in versions {
+                        out.push(Task {
+                            kind: ResolveTaskKind::Uninstall,
+                            cp: task.cp.clone(),
+                            version: version.clone(),
+                            slot: slot.clone(),
+                            use_enabled: Vec::new(),
+                        });
+                    }
+                }
+            }
         }
     }
-    SourceKind::Source
+    out
+}
+
+/// Qualify each command-line target with a category. Sets (`@`-prefixed) and
+/// already-qualified atoms pass through; a bare package name is resolved against
+/// the repository index, prompting or erroring when it is ambiguous.
+fn qualify_targets(targets: &[String], index: &RepoIndex) -> Result<Vec<String>> {
+    targets.iter().map(|t| qualify_one(t, index)).collect()
+}
+
+/// Qualify one target.
+fn qualify_one(target: &str, index: &RepoIndex) -> Result<String> {
+    if target.starts_with('@') || target.contains('/') {
+        return Ok(target.to_owned());
+    }
+    let (op, rest) = split_operator(target);
+    let (pn, _) = split_pf(rest);
+    let mut categories = categories_for(index, &pn);
+    match categories.len() {
+        0 => Err(miette!(
+            "no package named `{pn}` found in any configured repository"
+        )),
+        1 => Ok(format!("{op}{}/{rest}", categories.remove(0))),
+        _ => choose_category(&pn, &categories).map(|cat| format!("{op}{cat}/{rest}")),
+    }
+}
+
+/// The categories that provide a package name, across all repositories.
+fn categories_for(index: &RepoIndex, pn: &str) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    for (store, category, package) in index.catalog() {
+        let interner = store.store.interner();
+        if interner.resolve(package).as_deref() == Some(pn)
+            && let Some(cat) = interner.resolve(category)
+        {
+            set.insert(cat.to_string());
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Resolve an ambiguous package name to a category: prompt when interactive,
+/// otherwise error listing the candidates.
+fn choose_category(pn: &str, categories: &[String]) -> Result<String> {
+    let listed = categories
+        .iter()
+        .map(|c| format!("{c}/{pn}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !std::io::stdin().is_terminal() {
+        return Err(miette!(
+            help = "qualify the name with its category, for example `cat/pkg`",
+            "the package name `{pn}` is ambiguous; it is provided by: {listed}"
+        ));
+    }
+    println!("Multiple categories provide `{pn}`:");
+    for (i, category) in categories.iter().enumerate() {
+        println!("  {}) {category}/{pn}", i + 1);
+    }
+    print!("Choose [1-{}]: ", categories.len());
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| miette!("could not read selection: {e}"))?;
+    let choice: usize = line
+        .trim()
+        .parse()
+        .ok()
+        .filter(|n| (1..=categories.len()).contains(n))
+        .ok_or_else(|| miette!("invalid selection"))?;
+    Ok(categories[choice - 1].clone())
+}
+
+/// Split a leading version operator (`>`, `<`, `=`, `~`, `!`) off a target.
+fn split_operator(target: &str) -> (&str, &str) {
+    let end = target
+        .find(|c: char| !matches!(c, '>' | '<' | '=' | '~' | '!'))
+        .unwrap_or(target.len());
+    target.split_at(end)
+}
+
+/// Enrich the presentation plan with source/binary kind, repository, and
+/// download size, reading each package's stored entry from disk once.
+fn enrich_plan(
+    plan: &mut crate::render::MergePlan,
+    repo_set: &RepoSet,
+    store_dir: &Path,
+    config: &ResolvedConfig,
+    interner: &Interner,
+    prefs: &BinaryPrefs,
+    pkgdir: &Path,
+) {
+    let mut cache: HashMap<String, Arc<Vec<StoredEntry>>> = HashMap::new();
+    for entry in &mut plan.entries {
+        if entry.operation == Operation::Uninstall {
+            continue;
+        }
+        let cpv = format!("{}-{}", entry.cp, entry.version);
+        let (binary, fetched) = binary_choice(&entry.cp, &entry.version, prefs, pkgdir);
+        entry.binary = binary;
+        entry.fetched = fetched;
+
+        let Some(stored) = lookup_entry(repo_set, store_dir, &mut cache, &cpv) else {
+            continue;
+        };
+        entry.repository = Some(stored.repository.clone());
+        entry.fetch_size = if binary {
+            binary_size(pkgdir, &cpv)
+        } else {
+            source_size(&stored, repo_set, config, interner)
+        };
+    }
+}
+
+/// Find the stored entry for `cpv`, reading each repository store once.
+fn lookup_entry(
+    repo_set: &RepoSet,
+    store_dir: &Path,
+    cache: &mut HashMap<String, Arc<Vec<StoredEntry>>>,
+    cpv: &str,
+) -> Option<StoredEntry> {
+    for cfg in repo_set.ordered() {
+        let entries = cache.entry(cfg.name.clone()).or_insert_with(|| {
+            Arc::new(
+                read_entries(store_dir.join(format!("{}.mrepo", cfg.name))).unwrap_or_default(),
+            )
+        });
+        if let Some(found) = entries
+            .iter()
+            .find(|e| format!("{}/{}-{}", e.category, e.package, e.version) == cpv)
+        {
+            return Some(found.clone());
+        }
+    }
+    None
+}
+
+/// The on-disk size of a local binary package, if present.
+fn binary_size(pkgdir: &Path, cpv: &str) -> Option<u64> {
+    let (category, pf) = split_cpv(cpv);
+    let path = pkgdir.join(category).join(format!("{pf}.gpkg"));
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// The total download size of a source package's distfiles, summed from the
+/// repository `Manifest` over the USE-reduced `SRC_URI`.
+fn source_size(
+    stored: &StoredEntry,
+    repo_set: &RepoSet,
+    config: &ResolvedConfig,
+    interner: &Interner,
+) -> Option<u64> {
+    if stored.src_uri.trim().is_empty() {
+        return None;
+    }
+    let version = Version::parse(&stored.version).ok()?;
+    let pref = moraine_atom::PackageRef {
+        category: interner.intern(&stored.category),
+        package: interner.intern(&stored.package),
+        version: &version,
+        slot: Some(interner.intern(&stored.slot)),
+        subslot: stored.subslot.as_deref().map(|s| interner.intern(s)),
+        repo: Some(interner.intern(&stored.repository)),
+    };
+    let use_flags: HashSet<String> = config
+        .effective_use(&pref, false)
+        .enabled
+        .into_iter()
+        .collect();
+    let features = moraine_eapi::features_for(&stored.eapi);
+    let src_map = srcuri::parse_and_reduce(&stored.src_uri, &use_flags, features).ok()?;
+
+    let location = repo_set.get(&stored.repository)?.location.clone();
+    let manifest_path = location
+        .join(&stored.category)
+        .join(&stored.package)
+        .join("Manifest");
+    let manifest = Manifest::read(manifest_path).ok()?;
+    let total: u64 = src_map
+        .a()
+        .iter()
+        .filter_map(|d| manifest.dist(&d.name).map(|e| e.size))
+        .sum();
+    Some(total)
 }
 
 /// Map each installed `category/package` to its installed `(version, slot)`
@@ -571,26 +804,50 @@ mod tests {
         assert_eq!(id.p, "openssl-3.0.1");
     }
 
+    fn prefs(getbinpkg: bool, usepkg: bool) -> BinaryPrefs {
+        BinaryPrefs {
+            getbinpkg,
+            usepkg,
+            buildpkg: false,
+            buildpkgonly: false,
+        }
+    }
+
     #[test]
-    fn select_source_defaults_to_source() {
-        let cli = Cli::parse_from_args(["cat/pkg"].map(String::from)).unwrap();
+    fn binary_choice_defaults_to_source() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            select_source("cat/pkg", "1", &cli, dir.path()),
-            SourceKind::Source
+            binary_choice("cat/pkg", "1", &prefs(false, false), dir.path()),
+            (false, false)
         );
     }
 
     #[test]
-    fn select_source_prefers_local_binpkg_with_usepkg() {
-        let cli = Cli::parse_from_args(["-k", "cat/pkg"].map(String::from)).unwrap();
+    fn binary_choice_prefers_local_with_usepkg() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("cat")).unwrap();
         std::fs::write(dir.path().join("cat/pkg-1.gpkg"), b"x").unwrap();
         assert_eq!(
-            select_source("cat/pkg", "1", &cli, dir.path()),
-            SourceKind::Binary
+            binary_choice("cat/pkg", "1", &prefs(false, true), dir.path()),
+            (true, false)
         );
+    }
+
+    #[test]
+    fn binary_choice_uses_binhost_when_no_local() {
+        let dir = tempfile::tempdir().unwrap();
+        // getbinpkg with no local package: binary from binhost (the `g` flag).
+        assert_eq!(
+            binary_choice("cat/pkg", "1", &prefs(true, true), dir.path()),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn features_drive_binary_prefs() {
+        let cli = Cli::parse_from_args(["cat/pkg"].map(String::from)).unwrap();
+        let p = BinaryPrefs::from(&cli, &["getbinpkg".to_owned(), "buildpkg".to_owned()]);
+        assert!(p.getbinpkg && p.usepkg && p.buildpkg);
     }
 
     #[test]

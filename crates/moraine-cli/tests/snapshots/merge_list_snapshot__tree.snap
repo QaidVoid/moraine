@@ -1,5 +1,6 @@
 ---
 source: crates/moraine-cli/tests/merge_list_snapshot.rs
+assertion_line: 149
 expression: "render_tree(&plan, false)"
 ---
 Dependency tree:
@@ -8,4 +9,4 @@ Dependency tree:
   [ebuild U] dev-libs/openssl-3.1.4 [3.0.9] USE="asm* zlib"
   [ebuild N] dev-lang/python:3.12-3.12.1
 
-Total: 3 packages, Size of downloads: 0 B
+Total: 3 packages (1 new), Size of downloads: 0 B

@@ -113,16 +113,7 @@ pub fn dispatch(cli: &Cli) -> miette::Result<()> {
                 println!("No targets given. Pass atoms or package sets such as @world.");
                 return Ok(());
             }
-            if cli.pretend {
-                return render_plan(cli);
-            }
-            let request = crate::sets::expand(
-                &ctx,
-                &cli.targets,
-                &cli.exclude,
-                crate::run::modifiers_from(cli),
-            )?;
-            crate::resolve_install::run(cli, &ctx, &roots, &request.atoms)
+            crate::resolve_install::run(cli, &ctx, &roots)
         }
     }
 }

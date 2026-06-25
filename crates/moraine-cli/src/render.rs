@@ -8,8 +8,24 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::io::IsTerminal as _;
 
 use tracing::instrument;
+
+/// Whether to emit ANSI color: true only when stdout is an interactive terminal,
+/// so captured output (tests, pipes, redirects) stays plain.
+fn color_enabled() -> bool {
+    std::io::stdout().is_terminal()
+}
+
+/// Wrap `text` in an ANSI color when color is enabled.
+fn paint(text: &str, code: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
 
 /// How a task changes the installed state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +108,11 @@ pub struct MergeEntry {
     pub subslot: Option<String>,
     /// The source repository.
     pub repository: Option<String>,
+    /// Whether this entry installs a binary package rather than building from
+    /// source.
+    pub binary: bool,
+    /// Whether the binary package is fetched from a binhost (`g`).
+    pub fetched: bool,
     /// The USE-flag diff against the installed package.
     pub use_flags: Vec<UseFlag>,
     /// The download size in bytes when a fetch is required.
@@ -141,14 +162,20 @@ pub fn render_entry(entry: &MergeEntry, verbose: bool) -> String {
         let _ = write!(slot_suffix, ":{slot}");
     }
 
+    let kind = if entry.binary { "binary" } else { "ebuild" };
+    let bracket = format!("[{kind} {}]", indicator_block(entry));
     let mut line = format!(
-        "[ebuild {}] {}{slot_suffix}-{}",
-        indicator_block(entry),
-        entry.cp,
+        "{} {}{slot_suffix}-{}",
+        paint(&bracket, operation_color(entry.operation)),
+        paint(&entry.cp, "32"),
         entry.version
     );
     if let Some(old) = &entry.old_version {
         let _ = write!(line, " [{old}]");
+    }
+
+    if verbose && let Some(repo) = &entry.repository {
+        let _ = write!(line, "::{repo}");
     }
 
     let use_str = render_use_string(&entry.use_flags);
@@ -157,17 +184,13 @@ pub fn render_entry(entry: &MergeEntry, verbose: bool) -> String {
     }
 
     if let Some(size) = entry.fetch_size {
-        let _ = write!(line, " {}", human_size(size));
-    }
-
-    if verbose && let Some(repo) = &entry.repository {
-        let _ = write!(line, "::{repo}");
+        let _ = write!(line, " {}", paint(&human_size(size), "33"));
     }
 
     line
 }
 
-/// Build the operation and keyword/mask indicator block.
+/// Build the operation, keyword/mask, and binhost indicator block.
 fn indicator_block(entry: &MergeEntry) -> String {
     let mut block = String::new();
     block.push(entry.operation.letter());
@@ -176,7 +199,21 @@ fn indicator_block(entry: &MergeEntry) -> String {
         Acceptance::Testing => block.push_str(" ~"),
         Acceptance::Masked => block.push_str(" *"),
     }
+    if entry.fetched {
+        block.push_str(" g");
+    }
     block
+}
+
+/// The ANSI color code for an operation's indicator.
+fn operation_color(op: Operation) -> &'static str {
+    match op {
+        Operation::New => "32",                            // green
+        Operation::Upgrade => "36",                        // cyan
+        Operation::Downgrade => "34",                      // blue
+        Operation::Reinstall | Operation::Rebuild => "33", // yellow
+        Operation::Uninstall => "31",                      // red
+    }
 }
 
 /// Render the `_create_use_string`-style USE diff.
@@ -240,14 +277,42 @@ fn render_flag_group(flags: &[&UseFlag]) -> String {
 
 /// Render the package-count and total-download summary.
 pub fn render_totals(plan: &MergePlan) -> String {
-    let merges = plan
+    let merge_entries: Vec<&MergeEntry> = plan
         .entries
         .iter()
         .filter(|e| e.operation != Operation::Uninstall)
+        .collect();
+    let merges = merge_entries.len();
+    let new = merge_entries
+        .iter()
+        .filter(|e| e.operation == Operation::New)
+        .count();
+    let binary = merge_entries.iter().filter(|e| e.binary).count();
+    let uninstalls = plan
+        .entries
+        .iter()
+        .filter(|e| e.operation == Operation::Uninstall)
         .count();
     let total: u64 = plan.entries.iter().filter_map(|e| e.fetch_size).sum();
+
+    let mut breakdown = Vec::new();
+    if new > 0 {
+        breakdown.push(format!("{new} new"));
+    }
+    if binary > 0 {
+        breakdown.push(format!("{binary} binary"));
+    }
+    if uninstalls > 0 {
+        breakdown.push(format!("{uninstalls} uninstall"));
+    }
+    let breakdown = if breakdown.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", breakdown.join(", "))
+    };
+
     format!(
-        "Total: {merges} package{}, Size of downloads: {}\n",
+        "Total: {merges} package{}{breakdown}, Size of downloads: {}\n",
         if merges == 1 { "" } else { "s" },
         human_size(total)
     )
@@ -345,10 +410,30 @@ mod tests {
             slot: "0".to_owned(),
             subslot: None,
             repository: Some("gentoo".to_owned()),
+            binary: false,
+            fetched: false,
             use_flags: vec![],
             fetch_size: None,
             parents: vec![],
         }
+    }
+
+    #[test]
+    fn binary_indicator_and_size() {
+        let mut entry = base_entry();
+        entry.binary = true;
+        entry.fetched = true;
+        entry.fetch_size = Some(2510 * 1024);
+        let line = render_entry(&entry, true);
+        assert!(line.contains("[binary N g]"));
+        assert!(line.contains("::gentoo"));
+        assert!(line.contains("2.45 MiB"));
+    }
+
+    #[test]
+    fn ebuild_indicator_for_source() {
+        let entry = base_entry();
+        assert!(render_entry(&entry, false).contains("[ebuild N]"));
     }
 
     #[test]
