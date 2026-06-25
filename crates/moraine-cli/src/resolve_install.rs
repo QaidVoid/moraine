@@ -85,25 +85,50 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots, atoms: &[String]) -> R
         serialize(&solution).map_err(|e| miette!("merge ordering failed: {e}"))?
     };
 
-    // Convert to orchestrator tasks, choosing source or binary per task.
+    // Convert to orchestrator tasks, choosing source or binary per task. An
+    // uninstall task from a blocker is dropped when the package is not actually
+    // installed (a non-installed blocker is nothing to remove), and resolved to
+    // the real installed version(s) otherwise.
     let explicit = explicit_heads(cli);
     let pkgdir = wr.eroot.join("var/cache/binpkgs");
-    let tasks: Vec<InstallTask> = order
-        .iter()
-        .map(|task| to_install_task(task, &explicit, cli, &pkgdir))
-        .collect();
+    let installed = installed_versions(&vdb);
+    let mut tasks: Vec<InstallTask> = Vec::new();
+    for task in &order {
+        match task.kind {
+            ResolveTaskKind::Merge => {
+                tasks.push(to_install_task(task, &explicit, cli, &pkgdir));
+            }
+            ResolveTaskKind::Uninstall => {
+                let Some(versions) = installed.get(&task.cp) else {
+                    continue;
+                };
+                for (version, slot) in versions {
+                    tasks.push(InstallTask::uninstall(
+                        format!("{}-{}", task.cp, version),
+                        task.cp.clone(),
+                        slot.clone(),
+                    ));
+                }
+            }
+        }
+    }
 
+    if tasks.is_empty() {
+        println!("Nothing to do; the targets are already satisfied.");
+        return Ok(());
+    }
     println!("These packages would be merged, in order:");
     for task in &tasks {
-        let kind = match task.source {
-            SourceKind::Binary => "binary",
-            SourceKind::Source => "source",
-        };
-        let verb = match task.kind {
-            moraine_install::TaskKind::Uninstall => "remove",
-            moraine_install::TaskKind::Merge => "merge",
-        };
-        println!("  {verb} {} ({kind})", task.cpv);
+        match task.kind {
+            moraine_install::TaskKind::Uninstall => println!("  remove {}", task.cpv),
+            moraine_install::TaskKind::Merge => {
+                let kind = match task.source {
+                    SourceKind::Binary => "binary",
+                    SourceKind::Source => "source",
+                };
+                println!("  merge {} ({kind})", task.cpv);
+            }
+        }
     }
     if cli.pretend {
         return Ok(());
@@ -342,13 +367,25 @@ impl CliPlanner<'_> {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
+        // `FETCHCOMMAND`/`RESUMECOMMAND` default in Portage's `make.globals`,
+        // which is not read here, so fall back to the build engine's built-in
+        // `wget` default when `make.conf` does not set them.
+        let defaults = FetchConfig::new(&distdir);
+        let fetchcommand = match tokenize(self.ctx.vars.get("FETCHCOMMAND").unwrap_or_default()) {
+            tokens if tokens.is_empty() => defaults.fetchcommand,
+            tokens => tokens,
+        };
+        let resumecommand = match tokenize(self.ctx.vars.get("RESUMECOMMAND").unwrap_or_default()) {
+            tokens if tokens.is_empty() => defaults.resumecommand,
+            tokens => tokens,
+        };
         FetchConfig {
             distdir,
-            fetchcommand: tokenize(self.ctx.vars.get("FETCHCOMMAND").unwrap_or_default()),
-            resumecommand: tokenize(self.ctx.vars.get("RESUMECOMMAND").unwrap_or_default()),
+            fetchcommand,
+            resumecommand,
             mirrors,
             thirdparty: std::collections::BTreeMap::new(),
-            resume_min_size: 350,
+            resume_min_size: 350_000,
             max_attempts: 3,
         }
     }
@@ -391,6 +428,26 @@ fn select_source(cp: &str, version: &str, cli: &Cli, pkgdir: &Path) -> SourceKin
         }
     }
     SourceKind::Source
+}
+
+/// Map each installed `category/package` to its installed `(version, slot)`
+/// pairs, used to resolve and filter blocker-driven uninstalls.
+fn installed_versions(vdb: &Store) -> HashMap<String, Vec<(String, String)>> {
+    let interner = vdb.interner();
+    let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for record in vdb.records() {
+        let category = interner.resolve(record.category).unwrap_or_default();
+        let package = interner.resolve(record.package).unwrap_or_default();
+        let cp = format!("{category}/{package}");
+        let slot = interner
+            .resolve(record.slot.slot)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        map.entry(cp)
+            .or_default()
+            .push((record.version.as_str().to_owned(), slot));
+    }
+    map
 }
 
 /// The `category/package` heads explicitly named on the command line (excluding
