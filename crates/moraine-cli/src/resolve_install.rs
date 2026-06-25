@@ -33,7 +33,7 @@ use moraine_install::{
 use moraine_repo::store::{StoredEntry, read_entries};
 use moraine_repo::{LoadedStore, RepoIndex, RepoSet, RepoStore, build_index_with, discover};
 use moraine_resolve::{RealSource, Task, TaskKind as ResolveTaskKind, resolve, serialize};
-use moraine_vdb::store::{Store, StorePaths};
+use moraine_vdb::store::Store;
 use moraine_version::Version;
 
 use crate::args::Cli;
@@ -85,8 +85,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     }
     let repo_set =
         discover(&repos_conf).map_err(|e| miette!("repository discovery failed: {e}"))?;
-    let vdb = Store::load(StorePaths::in_dir(&wr.vdb_dir))
-        .map_err(|e| miette!("could not load the installed store: {e}"))?;
+    let vdb = crate::write::load_installed_store(&wr.vdb_dir)?;
     let config = resolve_config(
         &ctx.profile,
         &ctx.vars,

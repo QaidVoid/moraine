@@ -85,9 +85,30 @@ pub(crate) fn merge_context(ctx: &ConfigContext, wr: &WriteRoots) -> MergeContex
     }
 }
 
+/// Load the installed store under `vdb_dir`, importing the classic Portage vdb
+/// (the `category/package` directories under `/var/db/pkg`) when moraine's own
+/// `installed.mvdb` is empty, so existing installs are visible. The import is
+/// persisted when the store is writable (root) and otherwise kept in memory.
+pub(crate) fn load_installed_store(vdb_dir: &Path) -> Result<Store> {
+    let store = Store::load(StorePaths::in_dir(vdb_dir)).into_diagnostic()?;
+    if !store.records().is_empty() {
+        return Ok(store);
+    }
+    let interner = std::sync::Arc::new(moraine_common::Interner::new());
+    let records = match moraine_vdb::import_vdb(vdb_dir, &interner) {
+        Ok(records) if !records.is_empty() => records,
+        _ => return Ok(store),
+    };
+    tracing::info!(count = records.len(), "imported classic vdb");
+    let imported = Store::from_records(StorePaths::in_dir(vdb_dir), interner, records);
+    // Best effort: persist so later runs load it directly.
+    let _ = imported.write_primary();
+    Ok(imported)
+}
+
 /// Read installed packages from the store under `vdb_dir`.
 fn read_installed(vdb_dir: &Path) -> Result<Vec<Installed>> {
-    let store = Store::load(StorePaths::in_dir(vdb_dir)).into_diagnostic()?;
+    let store = load_installed_store(vdb_dir)?;
     let interner = store.interner();
     let mut out = Vec::new();
     for record in store.records() {
