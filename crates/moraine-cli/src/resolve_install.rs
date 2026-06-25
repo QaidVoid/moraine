@@ -53,7 +53,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots, atoms: &[String]) -> R
     let repos_conf = config_dir.join("etc/portage/repos.conf");
     let store_dir = wr.eroot.join("var/cache/moraine/repos");
     let repo_index = build_index_with(&repos_conf, &store_dir, Some(Arc::clone(&interner)))
-        .map_err(|e| miette!("could not build the repository index: {e}"))?;
+        .map_err(|e| index_error(e, &store_dir))?;
     if repo_index
         .repos()
         .iter()
@@ -458,6 +458,31 @@ fn package_ident(
 /// Split a shell-style command template into tokens.
 fn tokenize(s: &str) -> Vec<String> {
     s.split_whitespace().map(str::to_owned).collect()
+}
+
+/// Turn a repository-index build failure into an actionable diagnostic. A
+/// permission failure on the store directory almost always means the command was
+/// run without root, so it earns a specific hint.
+fn index_error(error: moraine_repo::RepoError, store_dir: &Path) -> miette::Report {
+    let denied = error
+        .to_string()
+        .to_lowercase()
+        .contains("permission denied")
+        || matches!(
+            &error,
+            moraine_repo::RepoError::Common(moraine_common::CommonError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::PermissionDenied
+        );
+    if denied {
+        return miette!(
+            help = "installing modifies the system, so run it as root (for example \
+                    with `sudo`), or point `--root`/`--config-root` at a writable \
+                    location for testing",
+            "cannot write the repository cache at {}: permission denied",
+            store_dir.display()
+        );
+    }
+    miette!("could not build the repository index: {error}")
 }
 
 #[cfg(test)]

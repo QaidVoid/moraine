@@ -138,10 +138,21 @@ impl RepoSet {
 /// resolves the deterministic search order.
 #[instrument(skip_all, fields(path = %repos_conf.as_ref().display()))]
 pub fn discover(repos_conf: impl AsRef<Path>) -> Result<RepoSet, DiscoveryError> {
-    let sections = parse_repos_conf(repos_conf.as_ref())?;
+    let mut sections = parse_repos_conf(repos_conf.as_ref())?;
     let mut repos: HashMap<String, RepoConfig> = HashMap::new();
 
-    for (name, section) in sections {
+    // `[DEFAULT]` is the special defaults section, not a repository: its keys are
+    // inherited by every repository section (for example `main-repo`). Pull it
+    // out before iterating so it is not treated as a repo lacking a location.
+    let defaults = sections.remove("DEFAULT").unwrap_or_default();
+
+    for (name, mut own) in sections {
+        // A section's own keys take precedence over the inherited defaults.
+        let section = {
+            let mut merged = defaults.clone();
+            merged.append(&mut own);
+            merged
+        };
         let location = section
             .get("location")
             .map(|s| PathBuf::from(s.trim()))
@@ -471,6 +482,33 @@ mod tests {
         assert_eq!(set.len(), 2);
         assert!(set.get("a").is_some());
         assert!(set.get("b").is_some());
+    }
+
+    #[test]
+    fn default_section_is_not_a_repository() {
+        let tmp = TempDir::new().unwrap();
+        let loc = make_repo(tmp.path(), "gentoo", "");
+        let conf = tmp.path().join("repos.conf");
+        fs::write(
+            &conf,
+            format!(
+                "[DEFAULT]\nmain-repo = gentoo\nsync-rsync-verify-jobs = 1\n\n\
+                 [gentoo]\nlocation = {}\n",
+                loc.display()
+            ),
+        )
+        .unwrap();
+
+        let set = discover(&conf).unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(set.get("gentoo").is_some());
+        assert!(set.get("DEFAULT").is_none());
+        // Inherited DEFAULT keys flow into the repository's sync settings.
+        let cfg = set.get("gentoo").unwrap();
+        assert_eq!(
+            cfg.sync.get("sync-rsync-verify-jobs").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
