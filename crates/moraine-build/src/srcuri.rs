@@ -187,8 +187,7 @@ fn parse_uri(tokens: &[&str], pos: &mut usize, features: EapiFeatures) -> Result
     let mut fetch_restricted = false;
     let mut mirror_restricted = false;
     let uri = if let Some(rest) = raw.strip_prefix("fetch+") {
-        if !features.idepend {
-            // selective_src_uri_restriction is EAPI 8+; idepend gates at 8.
+        if !features.selective_src_uri_restriction {
             return Err(BuildError::src_uri(
                 "fetch+ selective restriction requires EAPI 8 or later",
             ));
@@ -196,7 +195,7 @@ fn parse_uri(tokens: &[&str], pos: &mut usize, features: EapiFeatures) -> Result
         fetch_restricted = true;
         rest.to_string()
     } else if let Some(rest) = raw.strip_prefix("mirror+") {
-        if !features.idepend {
+        if !features.selective_src_uri_restriction {
             return Err(BuildError::src_uri(
                 "mirror+ selective restriction requires EAPI 8 or later",
             ));

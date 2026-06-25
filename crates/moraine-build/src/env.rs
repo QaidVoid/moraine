@@ -200,28 +200,34 @@ impl EnvBuilder {
         config: &ConfigEnv,
         features: EapiFeatures,
     ) -> Result<()> {
-        let root = with_trailing_slash(&config.root);
-        let sysroot = with_trailing_slash(&config.sysroot);
+        // EAPI 7+ drops the trailing slash from the path variables.
+        let root = normalize_root_path(&config.root, features);
+        let sysroot = normalize_root_path(&config.sysroot, features);
         base.insert("ROOT".to_string(), root.clone());
         base.insert("SYSROOT".to_string(), sysroot.clone());
 
         if features.prefix {
             let eprefix = config.eprefix.clone();
             // EROOT/ED/ESYSROOT/BROOT compose the prefix onto the roots.
-            let eroot = join_offset(&root, &eprefix);
+            let eroot = normalize_root_path(&join_offset(&root, &eprefix), features);
             base.insert("EPREFIX".to_string(), eprefix.clone());
             base.insert("EROOT".to_string(), eroot);
-            base.insert("ED".to_string(), join_offset("/", &eprefix));
+            base.insert(
+                "ED".to_string(),
+                normalize_root_path(&join_offset("/", &eprefix), features),
+            );
         }
 
-        // ESYSROOT and BROOT are EAPI 7+ (the bdepend gate matches the broot and
-        // sysroot introduction in stock Portage's feature table).
-        if features.bdepend {
-            let esysroot = join_offset(&sysroot, &config.eprefix);
+        // ESYSROOT and BROOT are EAPI 7+.
+        if features.sysroot {
+            let esysroot = normalize_root_path(&join_offset(&sysroot, &config.eprefix), features);
             base.insert("ESYSROOT".to_string(), esysroot);
             // BROOT is the build (host) prefix root; for a non-cross build it is
             // the EPREFIX onto `/`.
-            base.insert("BROOT".to_string(), join_offset("/", &config.eprefix));
+            base.insert(
+                "BROOT".to_string(),
+                normalize_root_path(&join_offset("/", &config.eprefix), features),
+            );
         }
 
         let _ = ident;
@@ -368,6 +374,16 @@ fn path_str(path: &std::path::Path) -> Result<String> {
         .ok_or_else(|| BuildError::environment(format!("non-UTF-8 path: {}", path.display())))
 }
 
+/// Normalize a root-style path variable per EAPI: EAPI 0-6 keep a trailing
+/// slash, EAPI 7+ drop it (the filesystem root collapsing to an empty string).
+fn normalize_root_path(path: &str, features: EapiFeatures) -> String {
+    if features.trailing_slash_paths {
+        with_trailing_slash(path)
+    } else {
+        path.trim_end_matches('/').to_string()
+    }
+}
+
 /// Ensure a directory path ends with exactly one trailing slash, except the bare
 /// root which stays `/`.
 fn with_trailing_slash(path: &str) -> String {
@@ -466,6 +482,21 @@ mod tests {
         let e7 = b7.for_phase("compile", "src_compile");
         assert!(e7.get("ESYSROOT").is_some());
         assert!(e7.get("BROOT").is_some());
+    }
+
+    #[test]
+    fn root_paths_trailing_slash_by_eapi() {
+        let (_t, layout) = layout();
+        let cfg = ConfigEnv::rooted([]);
+        // EAPI 6: the filesystem root keeps its trailing slash.
+        let b6 = EnvBuilder::new(ident("6"), cfg.clone(), &layout).unwrap();
+        let e6 = b6.for_phase("compile", "src_compile");
+        assert_eq!(e6.get("ROOT"), Some("/"));
+        // EAPI 7: the trailing slash is dropped, collapsing `/` to empty.
+        let b7 = EnvBuilder::new(ident("7"), cfg, &layout).unwrap();
+        let e7 = b7.for_phase("compile", "src_compile");
+        assert_eq!(e7.get("ROOT"), Some(""));
+        assert!(!e7.get("EROOT").unwrap().ends_with('/'));
     }
 
     #[test]

@@ -36,8 +36,16 @@ pub struct EapiFeatures {
     pub required_use_at_most_one_of: bool,
     /// `BDEPEND` (build-host dependencies). EAPI 7+.
     pub bdepend: bool,
+    /// `SYSROOT`/`ESYSROOT`/`BROOT` build-environment variables. EAPI 7+.
+    pub sysroot: bool,
+    /// `ENV_UNSET` (variables stripped from the ebuild environment). EAPI 7+.
+    pub env_unset: bool,
+    /// Path variables (`ROOT`, `EROOT`, ...) carry a trailing slash. EAPI 0-6.
+    pub trailing_slash_paths: bool,
     /// `IDEPEND` (install-time dependencies). EAPI 8+.
     pub idepend: bool,
+    /// Selective `SRC_URI` restriction (`fetch+`/`mirror+` prefixes). EAPI 8+.
+    pub selective_src_uri_restriction: bool,
     /// Stable-use masking/forcing semantics. EAPI 9+.
     pub use_stable: bool,
     /// Repository dependencies (`::repo` in atoms). Never set for a real EAPI;
@@ -59,7 +67,11 @@ const fn for_level(n: u8) -> EapiFeatures {
         iuse_effective: n >= 5,
         required_use_at_most_one_of: n >= 5,
         bdepend: n >= 7,
+        sysroot: n >= 7,
+        env_unset: n >= 7,
+        trailing_slash_paths: n <= 6,
         idepend: n >= 8,
+        selective_src_uri_restriction: n >= 8,
         use_stable: n >= 9,
         repo_deps: false,
     }
@@ -80,7 +92,11 @@ pub const PERMISSIVE: EapiFeatures = EapiFeatures {
     iuse_effective: true,
     required_use_at_most_one_of: true,
     bdepend: true,
+    sysroot: true,
+    env_unset: true,
+    trailing_slash_paths: false,
     idepend: true,
+    selective_src_uri_restriction: true,
     use_stable: true,
     repo_deps: true,
 };
@@ -156,6 +172,28 @@ mod tests {
         assert!(features_for_level(8).idepend);
         assert!(!features_for_level(8).use_stable);
         assert!(features_for_level(9).use_stable);
+    }
+
+    #[test]
+    fn sysroot_env_unset_gate_at_seven() {
+        assert!(!features_for_level(6).sysroot);
+        assert!(features_for_level(7).sysroot);
+        assert!(!features_for_level(6).env_unset);
+        assert!(features_for_level(7).env_unset);
+    }
+
+    #[test]
+    fn selective_src_uri_restriction_gates_at_eight() {
+        assert!(!features_for_level(7).selective_src_uri_restriction);
+        assert!(features_for_level(8).selective_src_uri_restriction);
+    }
+
+    #[test]
+    fn trailing_slash_paths_drop_at_seven() {
+        assert!(features_for_level(6).trailing_slash_paths);
+        assert!(!features_for_level(7).trailing_slash_paths);
+        // The permissive fallback follows the modern no-slash behavior.
+        assert!(!features_for("banana").trailing_slash_paths);
     }
 
     #[test]
