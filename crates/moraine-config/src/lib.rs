@@ -5,6 +5,8 @@
 //! exposes it as an immutable, queryable [`snapshot::ResolvedConfig`].
 
 pub mod error;
+pub mod keywords;
+pub mod license;
 pub mod loader;
 pub mod makeconf;
 pub mod profile;
@@ -15,6 +17,8 @@ pub mod use_resolution;
 pub mod visibility;
 
 pub use error::ConfigError;
+pub use keywords::KeywordsManager;
+pub use license::{LicenseManager, LicenseReq};
 pub use loader::{RepoMaskInput, resolve_config};
 pub use makeconf::VarMap;
 pub use profile::{ProfileNode, ProfileStack};

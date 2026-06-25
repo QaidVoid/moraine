@@ -12,12 +12,15 @@
 //! same interner. Parsing every file with one shared interner is what makes
 //! masking and USE actually apply during resolution.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use moraine_atom::Atom;
 use moraine_common::Interner;
 use moraine_eapi::{EapiFeatures, PERMISSIVE, features_for};
 
+use crate::keywords::KeywordsManager;
+use crate::license::LicenseManager;
 use crate::makeconf::VarMap;
 use crate::profile::ProfileStack;
 use crate::snapshot::ResolvedConfig;
@@ -196,6 +199,73 @@ pub fn resolve_config(
         }
     }
 
+    // License acceptance: license groups stacked across the repository profiles
+    // roots, then the profile chain, then user, then the stacked ACCEPT_LICENSE
+    // (default `* -@EULA` when empty), and package.license.
+    let mut license_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // `license_groups` lives at each repository's `profiles/license_groups`, not
+    // in the make.profile cascade, so read the repository profiles roots first.
+    for repo in repo_masks {
+        for dir in &repo.profiles_dirs {
+            read_license_groups(&dir.join("license_groups"), &mut license_groups);
+        }
+    }
+    for node in &profile.nodes {
+        read_license_groups(&node.path.join("license_groups"), &mut license_groups);
+    }
+    read_license_groups(
+        &config_root.join("etc/portage/license_groups"),
+        &mut license_groups,
+    );
+
+    let mut accept_license: Vec<String> = env
+        .get("ACCEPT_LICENSE")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if accept_license.is_empty() {
+        accept_license = vec!["*".to_owned(), "-@EULA".to_owned()];
+    }
+
+    let mut pkg_license: Vec<(Atom, Vec<String>)> = Vec::new();
+    for node in &profile.nodes {
+        read_pkg_license(
+            &node.path.join("package.license"),
+            interner,
+            &mut pkg_license,
+        );
+    }
+    read_pkg_license(
+        &config_root.join("etc/portage/package.license"),
+        interner,
+        &mut pkg_license,
+    );
+
+    let license_manager = LicenseManager::new(license_groups, &accept_license, pkg_license);
+
+    // Per-package keywords: profile `package.keywords` modifies a package's
+    // KEYWORDS; profile and user `package.accept_keywords` (plus the deprecated
+    // user `package.keywords`) grant per-package acceptance.
+    let mut keywords_manager = KeywordsManager::new();
+    for node in &profile.nodes {
+        for (atom, tokens) in read_pkg_keyword_file(&node.path.join("package.keywords"), interner) {
+            keywords_manager.add_profile_keywords(atom, tokens);
+        }
+        for (atom, tokens) in
+            read_pkg_keyword_file(&node.path.join("package.accept_keywords"), interner)
+        {
+            keywords_manager.add_pkeywords(atom, tokens);
+        }
+    }
+    for name in ["package.accept_keywords", "package.keywords"] {
+        for (atom, tokens) in
+            read_pkg_keyword_file(&config_root.join("etc/portage").join(name), interner)
+        {
+            keywords_manager.add_pkeywords(atom, tokens);
+        }
+    }
+
     // Accepted keywords, defaulting to the profile arch.
     let mut accepted: std::collections::BTreeSet<String> = env
         .get("ACCEPT_KEYWORDS")
@@ -213,10 +283,56 @@ pub fn resolve_config(
         accepted,
         use_manager,
         mask_manager,
+        license_manager,
+        keywords_manager,
         provided,
         system,
         world,
     )
+}
+
+/// Read a per-package keyword file (`package.keywords` /
+/// `package.accept_keywords`): each line is `atom keyword1 keyword2 ...`, where
+/// a bare atom with no keyword yields an empty token list.
+fn read_pkg_keyword_file(path: &Path, interner: &Interner) -> Vec<(Atom, Vec<String>)> {
+    let mut out = Vec::new();
+    for line in read_lines(path) {
+        let mut parts = line.split_whitespace();
+        if let Some(atom_text) = parts.next()
+            && let Some(atom) = parse_atom(atom_text, interner)
+        {
+            out.push((atom, parts.map(str::to_owned).collect()));
+        }
+    }
+    out
+}
+
+/// Read a `license_groups` file: each line is `group member1 member2 ...`,
+/// accumulating members per group across stacked files.
+fn read_license_groups(path: &Path, groups: &mut BTreeMap<String, Vec<String>>) {
+    for line in read_lines(path) {
+        let mut parts = line.split_whitespace();
+        if let Some(group) = parts.next() {
+            let members = groups.entry(group.to_owned()).or_default();
+            for member in parts {
+                if !members.iter().any(|m| m == member) {
+                    members.push(member.to_owned());
+                }
+            }
+        }
+    }
+}
+
+/// Read a `package.license` file: each line is `atom token1 token2 ...`.
+fn read_pkg_license(path: &Path, interner: &Interner, out: &mut Vec<(Atom, Vec<String>)>) {
+    for line in read_lines(path) {
+        let mut parts = line.split_whitespace();
+        if let Some(atom_text) = parts.next()
+            && let Some(atom) = parse_atom(atom_text, interner)
+        {
+            out.push((atom, parts.map(str::to_owned).collect()));
+        }
+    }
 }
 
 /// The numeric EAPI level of a profile node, defaulting to 0 when unparseable.
@@ -458,6 +574,79 @@ mod tests {
             ..from_gentoo
         };
         assert!(!cfg.is_masked(&from_overlay));
+    }
+
+    #[test]
+    fn default_license_policy_masks_eula_from_repo_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("repo/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        // license_groups lives at the repository profiles root.
+        std::fs::write(profiles.join("license_groups"), "EULA skype-eula\n").unwrap();
+        let interner = Interner::new();
+        let repo_masks = vec![RepoMaskInput {
+            name: "gentoo".to_owned(),
+            eapi: Some("8".to_owned()),
+            profiles_dirs: vec![profiles],
+        }];
+        // No ACCEPT_LICENSE set: the default `* -@EULA` applies.
+        let cfg = resolve_config(
+            &ProfileStack::default(),
+            &VarMap::new(),
+            dir.path(),
+            &repo_masks,
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("1.0").unwrap();
+        let pkg = pref(&interner, "dev-libs", "foo", &version);
+        // A free license is accepted; an @EULA member is not.
+        assert!(
+            cfg.missing_licenses(&crate::LicenseReq::Token("GPL-2".to_owned()), &pkg)
+                .is_empty()
+        );
+        assert!(
+            !cfg.missing_licenses(&crate::LicenseReq::Token("skype-eula".to_owned()), &pkg)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn package_accept_keywords_grants_testing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("etc/portage")).unwrap();
+        std::fs::write(
+            dir.path().join("etc/portage/package.accept_keywords"),
+            "dev-libs/foo ~amd64\n",
+        )
+        .unwrap();
+        let mut env = VarMap::new();
+        env.set("ARCH".to_owned(), "amd64".to_owned());
+        let interner = Interner::new();
+        let cfg = resolve_config(
+            &ProfileStack::default(),
+            &env,
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("1.0").unwrap();
+        let pkg = pref(&interner, "dev-libs", "foo", &version);
+        let extra = cfg.package_keywords(&pkg);
+        // The per-package entry accepts the ~amd64 keyword for dev-libs/foo.
+        assert!(matches!(
+            cfg.keyword_result(&["~amd64".to_owned()], &extra),
+            crate::visibility::KeywordResult::Accepted
+        ));
+        // A package without the entry is not accepted.
+        let other = pref(&interner, "dev-libs", "bar", &version);
+        assert!(matches!(
+            cfg.keyword_result(&["~amd64".to_owned()], &cfg.package_keywords(&other)),
+            crate::visibility::KeywordResult::NeedsKeyword
+        ));
     }
 
     #[test]

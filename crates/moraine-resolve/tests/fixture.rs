@@ -93,6 +93,7 @@ impl Fixture {
             pdepend: parse_node(&self.interner, spec.pdepend),
             idepend: parse_node(&self.interner, spec.idepend),
             required_use: moraine_resolve::required_use::parse_required_use(spec.required_use),
+            license: String::new(),
             iuse: spec.iuse.iter().map(|s| (*s).to_owned()).collect(),
         };
         self.entries.push(Entry {

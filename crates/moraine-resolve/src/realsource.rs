@@ -104,6 +104,7 @@ impl ResolveSource for RealSource<'_> {
                 // REQUIRED_USE leaves are USE flags, not atoms; parse the raw
                 // text with the dedicated USE-constraint parser.
                 required_use: parse_required_use(&entry.required_use),
+                license: entry.license.clone(),
                 iuse,
             });
         }
@@ -135,18 +136,38 @@ impl ResolveSource for RealSource<'_> {
                 subslot: entry.subslot,
                 repo: Some(entry.repository),
             };
-            let keywords: Vec<String> = entry
+            let ebuild_keywords: Vec<String> = entry
                 .keywords
                 .iter()
                 .filter_map(|k| interner.resolve(*k).map(|x| x.to_string()))
                 .collect();
-            // Compute the structured visibility so a hard-mask reason stays
-            // distinct from a missing-keyword reason; the resolver only needs the
-            // accept/reject decision here.
-            return matches!(
-                self.config.visibility(&pref, &keywords, &[]),
+            // Apply profile `package.keywords` to the ebuild KEYWORDS, then judge
+            // acceptance with the per-package accepted keywords. The structured
+            // visibility keeps a hard-mask reason distinct from a keyword reason;
+            // the resolver only needs the accept/reject decision here.
+            let keywords = self.config.stacked_keywords(&pref, &ebuild_keywords);
+            let extra = self.config.package_keywords(&pref);
+            if !matches!(
+                self.config.visibility(&pref, &keywords, &extra),
                 moraine_config::Visibility::Visible
-            );
+            ) {
+                return false;
+            }
+            // License acceptance: reduce LICENSE against the resolved USE and
+            // mask the package when any required license is not accepted.
+            if !meta.license.is_empty() {
+                let iuse: Vec<String> = entry
+                    .iuse
+                    .iter()
+                    .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
+                    .collect();
+                let use_set = self.config.effective_use(&pref, &iuse, self.stable).enabled;
+                let reduced = crate::license::reduce_license(&meta.license, &use_set);
+                if !self.config.missing_licenses(&reduced, &pref).is_empty() {
+                    return false;
+                }
+            }
+            return true;
         }
         false
     }

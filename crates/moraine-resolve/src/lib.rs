@@ -16,6 +16,7 @@ pub mod depnode;
 pub mod encode;
 pub mod error;
 pub mod graph;
+pub mod license;
 pub mod normalize;
 pub mod provider;
 pub mod realsource;

@@ -38,6 +38,8 @@ pub struct PackageMeta {
     pub idepend: DepNode,
     /// `REQUIRED_USE` AST.
     pub required_use: DepNode,
+    /// Raw `LICENSE` text (a USE-conditional dep-string of license tokens).
+    pub license: String,
     /// The declared IUSE flags (without `+`/`-` prefixes).
     pub iuse: BTreeSet<String>,
 }

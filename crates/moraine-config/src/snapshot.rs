@@ -7,6 +7,8 @@ use std::time::SystemTime;
 
 use moraine_atom::PackageRef;
 
+use crate::keywords::KeywordsManager;
+use crate::license::{LicenseManager, LicenseReq};
 use crate::profile::ProfileStack;
 use crate::use_resolution::{EffectiveUse, UseManager};
 use crate::visibility::{KeywordResult, MaskManager, MaskReason, ProvidedManager, accept_keywords};
@@ -35,6 +37,8 @@ pub struct ResolvedConfig {
     accepted_keywords: BTreeSet<String>,
     use_manager: UseManager,
     mask_manager: MaskManager,
+    license_manager: LicenseManager,
+    keywords_manager: KeywordsManager,
     provided: ProvidedManager,
     system: Vec<String>,
     world: Vec<String>,
@@ -49,6 +53,8 @@ impl ResolvedConfig {
         accepted_keywords: BTreeSet<String>,
         use_manager: UseManager,
         mask_manager: MaskManager,
+        license_manager: LicenseManager,
+        keywords_manager: KeywordsManager,
         provided: ProvidedManager,
         system: Vec<String>,
         world: Vec<String>,
@@ -59,10 +65,34 @@ impl ResolvedConfig {
             accepted_keywords,
             use_manager,
             mask_manager,
+            license_manager,
+            keywords_manager,
             provided,
             system,
             world,
         }
+    }
+
+    /// The package's effective `KEYWORDS` after applying profile
+    /// `package.keywords`, given the ebuild's raw `KEYWORDS`.
+    pub fn stacked_keywords(
+        &self,
+        pkg: &PackageRef<'_>,
+        ebuild_keywords: &[String],
+    ) -> Vec<String> {
+        self.keywords_manager.stacked_keywords(pkg, ebuild_keywords)
+    }
+
+    /// The per-package accepted keywords matching `pkg` from
+    /// `package.accept_keywords` (and the deprecated `package.keywords`).
+    pub fn package_keywords(&self, pkg: &PackageRef<'_>) -> Vec<String> {
+        self.keywords_manager.pkeywords(pkg)
+    }
+
+    /// The licenses of `reduced` (a USE-reduced `LICENSE`) that are not accepted
+    /// for `pkg`. An empty result means the license is acceptable.
+    pub fn missing_licenses(&self, reduced: &LicenseReq, pkg: &PackageRef<'_>) -> BTreeSet<String> {
+        self.license_manager.missing_licenses(reduced, pkg)
     }
 
     /// The effective USE for a package, given its raw `IUSE` tokens (with `+`/`-`
@@ -205,6 +235,8 @@ mod tests {
             BTreeSet::new(),
             UseManager::default(),
             MaskManager::new(),
+            LicenseManager::default(),
+            KeywordsManager::new(),
             ProvidedManager::new(),
             Vec::new(),
             Vec::new(),
@@ -219,6 +251,8 @@ mod tests {
             ["amd64".to_owned()].into_iter().collect(),
             UseManager::default(),
             MaskManager::new(),
+            LicenseManager::default(),
+            KeywordsManager::new(),
             ProvidedManager::new(),
             Vec::new(),
             Vec::new(),

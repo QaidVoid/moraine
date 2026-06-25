@@ -217,6 +217,9 @@ pub struct LoadedEntry {
     /// dependency atom expression, so it is kept verbatim and parsed by the
     /// resolver's dedicated parser.
     pub required_use: String,
+    /// Raw `LICENSE` text. It is a USE-conditional dep-string whose leaves are
+    /// license tokens, kept verbatim for the resolver's license reduction.
+    pub license: String,
     /// Interned `KEYWORDS`.
     pub keywords: Vec<Symbol>,
     /// Interned `IUSE`.
@@ -367,6 +370,7 @@ fn parse_entry(e: &StoredEntry, interner: &Interner) -> Result<LoadedEntry> {
         pdepend: parse_dep(&e.pdepend)?,
         idepend: parse_dep(&e.idepend)?,
         required_use: e.required_use.clone(),
+        license: e.license.clone(),
         keywords: intern_all(&e.keywords),
         iuse: intern_all(&e.iuse),
         properties: intern_all(&e.properties),
