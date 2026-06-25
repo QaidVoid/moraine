@@ -127,6 +127,13 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     // genuine ones to the real installed version(s).
     let installed = installed_versions(&vdb);
     let order = clean_order(&raw_order, &installed);
+    // Drop no-op reinstalls: a package already installed at the resolved version
+    // and slot that is not being rebuilt is not part of the merge delta, matching
+    // Portage's default of not reinstalling unchanged packages.
+    let order: Vec<Task> = order
+        .into_iter()
+        .filter(|task| !is_noop_merge(task, &solution))
+        .collect();
     if order.is_empty() {
         println!("Nothing to do; the targets are already satisfied.");
         return Ok(());
@@ -491,6 +498,20 @@ fn binary_choice(cp: &str, version: &str, prefs: &BinaryPrefs, pkgdir: &Path) ->
 
 /// Clean the serialized order: drop blocker uninstalls for packages that are not
 /// installed, and expand genuine ones to the real installed `(version, slot)`.
+/// Whether a merge task is a no-op: the package is already installed at the
+/// resolved version and slot and is not being rebuilt, so it is not part of the
+/// merge delta.
+fn is_noop_merge(task: &Task, solution: &moraine_resolve::solution::ResolvedSolution) -> bool {
+    task.kind == ResolveTaskKind::Merge
+        && solution.packages.iter().any(|p| {
+            p.cp == task.cp
+                && p.slot == task.slot
+                && p.version.as_str() == task.version
+                && p.already_installed
+                && !p.subslot_rebuild
+        })
+}
+
 fn clean_order(order: &[Task], installed: &HashMap<String, Vec<(String, String)>>) -> Vec<Task> {
     let mut out = Vec::with_capacity(order.len());
     for task in order {
