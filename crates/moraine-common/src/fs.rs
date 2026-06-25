@@ -17,6 +17,16 @@ pub fn atomic_write(path: impl AsRef<Path>, bytes: &[u8]) -> Result<(), CommonEr
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir).with_path(dir)?;
     tmp.write_all(bytes).with_path(path)?;
+    // `tempfile` creates the file mode 0600; relax it to 0644 so caches and
+    // stores written as root stay readable by other users, matching Portage's
+    // world-readable vdb and metadata caches.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))
+            .with_path(path)?;
+    }
     tmp.as_file().sync_all().with_path(path)?;
     tmp.persist(path).map_err(|err| CommonError::Io {
         path: path.to_path_buf(),

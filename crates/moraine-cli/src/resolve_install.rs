@@ -835,14 +835,15 @@ fn load_existing_index(
     let mut repos = Vec::new();
     for cfg in set.ordered() {
         let path = store_dir.join(format!("{}.mrepo", cfg.name));
-        if !path.exists() {
-            continue;
+        // Skip a missing or unreadable store rather than abandoning the whole
+        // read-only load (which would force an unnecessary rebuild).
+        match LoadedStore::load_with(&path, Arc::clone(interner)) {
+            Ok(store) => repos.push(RepoStore {
+                name: cfg.name.clone(),
+                store,
+            }),
+            Err(_) => continue,
         }
-        let store = LoadedStore::load_with(&path, Arc::clone(interner)).ok()?;
-        repos.push(RepoStore {
-            name: cfg.name.clone(),
-            store,
-        });
     }
     if repos.is_empty() {
         return None;
