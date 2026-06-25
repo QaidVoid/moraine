@@ -63,6 +63,8 @@ pub enum ConfigLoadError {
 pub struct ConfigContext {
     /// The active profile stack.
     pub profile: ProfileStack,
+    /// The merged `make.defaults` plus `make.conf` variables.
+    pub vars: VarMap,
     /// The system architecture keyword.
     pub arch: String,
     /// The `FEATURES` tokens from configuration.
@@ -129,6 +131,7 @@ impl ConfigContext {
 
         Ok(ConfigContext {
             profile,
+            vars: env,
             arch,
             features,
             config_protect,
@@ -223,6 +226,7 @@ mod tests {
     fn set_source_dispatches_standard_sets() {
         let ctx = ConfigContext {
             profile: ProfileStack::default(),
+            vars: VarMap::new(),
             arch: "amd64".to_owned(),
             features: Vec::new(),
             config_protect: Vec::new(),

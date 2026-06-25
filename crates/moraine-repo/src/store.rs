@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use moraine_atom::DepSpec;
 use moraine_common::{Interner, Symbol};
@@ -233,7 +234,7 @@ pub struct LoadedEntry {
 /// All query methods take `&self` and perform no interior mutation, so a loaded
 /// store is safe to share across threads without external locking.
 pub struct LoadedStore {
-    interner: Interner,
+    interner: Arc<Interner>,
     /// Entries in `(category, package, version)` order.
     entries: Vec<LoadedEntry>,
     /// Maps `(category, package)` to a contiguous `[start, end)` range in
@@ -259,36 +260,27 @@ impl LoadedStore {
     /// failure returns a typed error signalling a rebuild is required.
     #[tracing::instrument(skip_all, fields(path = %path.as_ref().display()))]
     pub fn load(path: impl AsRef<Path>) -> Result<LoadedStore> {
-        let map = moraine_common::fs::mmap_read(path)?;
-        let doc: OnDisk = rmp_serde::from_slice(&map).map_err(|e| RepoError::StoreCorruption {
-            reason: format!("cannot deserialize store: {e}"),
-        })?;
-        if doc.magic != MAGIC {
-            return Err(RepoError::StoreCorruption {
-                reason: "bad magic tag".to_owned(),
-            });
-        }
-        if doc.format_version != FORMAT_VERSION {
-            return Err(RepoError::FormatVersionMismatch {
-                found: doc.format_version,
-                expected: FORMAT_VERSION,
-            });
-        }
-        let payload = rmp_serde::to_vec(&doc.entries).map_err(|e| RepoError::StoreCorruption {
-            reason: format!("cannot re-encode entries for checksum: {e}"),
-        })?;
-        if moraine_common::hash::blake2b(&payload) != doc.checksum {
-            return Err(RepoError::StoreCorruption {
-                reason: "whole-store checksum mismatch".to_owned(),
-            });
-        }
-        Self::from_entries(doc.entries)
+        Self::from_entries(read_entries(path)?)
+    }
+
+    /// Load a store from `path`, parsing every entry against the shared
+    /// `interner` so its symbols compare equal to other stores and to
+    /// configuration atoms parsed against the same interner.
+    pub fn load_with(path: impl AsRef<Path>, interner: Arc<Interner>) -> Result<LoadedStore> {
+        Self::from_entries_with(read_entries(path)?, interner)
     }
 
     /// Build a loaded store directly from stored entries, parsing keys and ASTs.
     /// Used by [`LoadedStore::load`] and by the importer to build in memory.
     pub fn from_entries(entries: Vec<StoredEntry>) -> Result<LoadedStore> {
-        let interner = Interner::new();
+        Self::from_entries_with(entries, Arc::new(Interner::new()))
+    }
+
+    /// Build a loaded store from entries against the shared `interner`.
+    pub fn from_entries_with(
+        entries: Vec<StoredEntry>,
+        interner: Arc<Interner>,
+    ) -> Result<LoadedStore> {
         let mut loaded = Vec::with_capacity(entries.len());
         for e in &entries {
             loaded.push(parse_entry(e, &interner)?);
@@ -308,6 +300,12 @@ impl LoadedStore {
     /// symbols compare equal to the store's.
     pub fn interner(&self) -> &Interner {
         &self.interner
+    }
+
+    /// The store's shared interner handle, for parsing atoms that must compare
+    /// equal to this store's symbols.
+    pub fn interner_arc(&self) -> Arc<Interner> {
+        Arc::clone(&self.interner)
     }
 
     /// All loaded entries in key order.

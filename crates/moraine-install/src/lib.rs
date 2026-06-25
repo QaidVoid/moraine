@@ -35,8 +35,8 @@ pub use journal::Journal;
 pub use lock::TransactionLock;
 pub use quickpkg::{QuickpkgInput, package_image_dir};
 pub use realize::{
-    BinpkgRunner, BinpkgSource, BuildOptions, BuildPlanner, LocalPkgdir, SourceRunner,
-    realize_binpkg,
+    BinhostSource, BinpkgRunner, BinpkgSource, BuildOptions, BuildPlanner, LocalPkgdir,
+    SourceRunner, realize_binpkg,
 };
 pub use remove::{
     InstalledPackage, RemovalSet, depclean_orphans, prune_superseded, would_break_retained,

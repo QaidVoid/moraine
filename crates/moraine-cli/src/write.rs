@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use miette::{IntoDiagnostic, Result, miette};
 use moraine_install::{
     BinpkgRunner, EngineApplier, InstallTask, LocalPkgdir, PendingUpdate, Realized, Resolution,
-    SourceKind, StepRunner, Transaction, TransactionEngine, depclean_orphans, prune_superseded,
-    resolve_update, would_break_retained,
+    StepRunner, Transaction, TransactionEngine, depclean_orphans, prune_superseded, resolve_update,
+    would_break_retained,
 };
 use moraine_merge::{ConfigProtect, Features, MergeContext};
 use moraine_vdb::record::DependKind;
@@ -47,14 +47,14 @@ struct Installed {
 }
 
 /// The live-system roots the write actions operate against.
-struct WriteRoots {
-    eroot: PathBuf,
-    vdb_dir: PathBuf,
-    state_dir: PathBuf,
+pub(crate) struct WriteRoots {
+    pub(crate) eroot: PathBuf,
+    pub(crate) vdb_dir: PathBuf,
+    pub(crate) state_dir: PathBuf,
 }
 
 impl WriteRoots {
-    fn from(roots: &Roots) -> Self {
+    pub(crate) fn from(roots: &Roots) -> Self {
         let eroot = roots.root_dir();
         WriteRoots {
             vdb_dir: eroot.join("var/db/pkg"),
@@ -65,14 +65,14 @@ impl WriteRoots {
 }
 
 /// Ensure the installed-store and state directories exist before a transaction.
-fn ensure_dirs(wr: &WriteRoots) -> Result<()> {
+pub(crate) fn ensure_dirs(wr: &WriteRoots) -> Result<()> {
     std::fs::create_dir_all(&wr.vdb_dir).into_diagnostic()?;
     std::fs::create_dir_all(&wr.state_dir).into_diagnostic()?;
     Ok(())
 }
 
 /// Build the merge context from configuration and roots.
-fn merge_context(ctx: &ConfigContext, wr: &WriteRoots) -> MergeContext {
+pub(crate) fn merge_context(ctx: &ConfigContext, wr: &WriteRoots) -> MergeContext {
     MergeContext {
         eroot: wr.eroot.clone(),
         vdb_dir: wr.vdb_dir.clone(),
@@ -154,71 +154,6 @@ fn run_removal(cli: &Cli, ctx: &ConfigContext, wr: &WriteRoots, cpvs: &[String])
     Ok(())
 }
 
-/// Install explicit binary-package targets through the orchestrator.
-///
-/// Dependency-resolving install over arbitrary atoms runs through the solver
-/// pipeline, which is exercised by the corpus-gated harness. This entry point
-/// installs exact versioned targets (`=cat/pkg-ver`) from binary packages, which
-/// is the fully wired write path.
-pub fn install(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
-    let wr = WriteRoots::from(roots);
-
-    if cli.buildpkg || cli.buildpkgonly {
-        return Err(miette!(
-            "--buildpkg/--buildpkgonly require the source-build pipeline; the \
-             engine supports it (moraine-install SourceRunner) but the CLI does \
-             not yet construct build requests from the repository"
-        ));
-    }
-    if cli.getbinpkg {
-        return Err(miette!(
-            "--getbinpkg (binhost fetch) is not yet wired into the CLI; only \
-             local binary packages under PKGDIR are installed"
-        ));
-    }
-
-    let mut tasks = Vec::new();
-    for target in &cli.targets {
-        let cpv = exact_cpv(target).ok_or_else(|| {
-            miette!(
-                "install currently requires exact versioned targets such as \
-                 `=cat/pkg-1.2` because dependency resolution is not yet wired \
-                 into the CLI; got `{target}`"
-            )
-        })?;
-        let cp = cp_of_cpv(&cpv);
-        let mut task = InstallTask::merge(cpv, cp, String::new());
-        task.source = SourceKind::Binary;
-        task.in_world = !cli.oneshot;
-        tasks.push(task);
-    }
-
-    println!("The following packages would be installed:");
-    for task in &tasks {
-        println!("  {}", task.cpv);
-    }
-    if cli.pretend {
-        return Ok(());
-    }
-    if !confirm(cli.ask) {
-        println!("Operation cancelled.");
-        return Ok(());
-    }
-
-    ensure_dirs(&wr)?;
-    let pkgdir = wr.eroot.join("var/cache/binpkgs");
-    let stage = wr.state_dir.join("install-stage");
-    let runner = BinpkgRunner::new(LocalPkgdir { pkgdir }, stage);
-    let mctx = merge_context(ctx, &wr);
-    let applier = EngineApplier::new(mctx);
-    let engine = TransactionEngine::new(&runner, &applier, &wr.state_dir);
-    engine
-        .run(&Transaction::new(tasks))
-        .map_err(|e| miette!("install failed: {e}"))?;
-    println!("Installation complete.");
-    Ok(())
-}
-
 /// Resume the unfinished portion of the most recent transaction.
 pub fn resume(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let wr = WriteRoots::from(roots);
@@ -240,24 +175,6 @@ pub fn resume(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     engine.resume().map_err(|e| miette!("resume failed: {e}"))?;
     println!("Resume complete.");
     Ok(())
-}
-
-/// Parse an exact versioned target `=cat/pkg-ver[:slot]` into its `cat/pkg-ver`.
-fn exact_cpv(target: &str) -> Option<String> {
-    let body = target.strip_prefix('=')?;
-    let body = body.split(':').next().unwrap_or(body);
-    let (_, rest) = body.split_once('/')?;
-    // A version must be present: a `-` followed by a digit.
-    let bytes = rest.as_bytes();
-    let mut idx = 0;
-    while let Some(pos) = rest[idx..].find('-') {
-        let at = idx + pos;
-        if at + 1 < bytes.len() && bytes[at + 1].is_ascii_digit() {
-            return Some(body.to_owned());
-        }
-        idx = at + 1;
-    }
-    None
 }
 
 /// Unmerge explicitly named packages.
@@ -422,7 +339,7 @@ fn collect_variants(dir: &Path, out: &mut Vec<PendingUpdate>) {
 
 /// Prompt for a yes/no confirmation, defaulting to yes on an empty line. When
 /// `ask` is false the action proceeds without prompting.
-fn confirm(ask: bool) -> bool {
+pub(crate) fn confirm(ask: bool) -> bool {
     if !ask {
         return true;
     }
@@ -452,7 +369,7 @@ fn prompt_resolution() -> Resolution {
 
 /// The `category/package` head of an atom string, stripping operators, slot, and
 /// any version.
-fn cp_of_atom(atom: &str) -> String {
+pub(crate) fn cp_of_atom(atom: &str) -> String {
     let trimmed = atom.trim_start_matches(['>', '<', '=', '~', '!']);
     let no_slot = trimmed.split(':').next().unwrap_or(trimmed);
     match no_slot.split_once('/') {
@@ -515,20 +432,6 @@ mod tests {
         assert_eq!(strip_version("openssl-3.0.1"), "openssl");
         assert_eq!(strip_version("foo-bar-1.2"), "foo-bar");
         assert_eq!(strip_version("no-version"), "no-version");
-    }
-
-    #[test]
-    fn exact_cpv_requires_version() {
-        assert_eq!(
-            exact_cpv("=dev-libs/openssl-3.0.1"),
-            Some("dev-libs/openssl-3.0.1".to_owned())
-        );
-        assert_eq!(
-            exact_cpv("=app-misc/hello-2.10:0"),
-            Some("app-misc/hello-2.10".to_owned())
-        );
-        assert!(exact_cpv("dev-libs/openssl").is_none());
-        assert!(exact_cpv("=dev-libs/openssl").is_none());
     }
 
     #[test]

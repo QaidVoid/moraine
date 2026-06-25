@@ -1,15 +1,15 @@
 //! Realizing tasks into merge operations.
 //!
 //! [`BinpkgRunner`] is a [`StepRunner`] that installs from binary packages: for
-//! each task it locates the container (locally, or fetched from a binhost),
-//! unpacks its image into a staging directory, and builds the [`Operation`] the
-//! merge engine applies. The binary path is fully self-contained because the
-//! container carries both the image and the recorded metadata.
+//! each task it locates the container (locally via [`LocalPkgdir`] or from a
+//! binhost via [`BinhostSource`]), unpacks its image into a staging directory,
+//! and builds the [`Operation`] the merge engine applies. The binary path is
+//! self-contained because the container carries both the image and the metadata.
 //!
-//! Installing from source is not realized here. The build engine's
-//! [`PackageSpec`](moraine_build::PackageSpec) needs `SRC_URI`, which the
-//! greenfield repository store does not persist; a from-source runner therefore
-//! depends on a future metadata-capture change and is intentionally absent.
+//! [`SourceRunner`] is the from-source [`StepRunner`]: it asks a [`BuildPlanner`]
+//! for a [`BuildRequest`], drives the build engine to produce an image, and
+//! optionally emits a binary package. The planner is supplied by the caller,
+//! which owns the repository metadata (including `SRC_URI`) and configuration.
 
 use std::path::{Path, PathBuf};
 
@@ -51,6 +51,51 @@ impl BinpkgSource for LocalPkgdir {
     }
 }
 
+impl BinpkgSource for Box<dyn BinpkgSource> {
+    fn fetch(&self, task: &InstallTask) -> Result<Option<Vec<u8>>> {
+        (**self).fetch(task)
+    }
+}
+
+/// A [`BinpkgSource`] that fetches containers from a binhost base URI, laid out
+/// as `<base>/<category>/<pf>.gpkg`, into a staging directory.
+pub struct BinhostSource {
+    /// The binhost base URI (`PORTAGE_BINHOST`).
+    pub base_uri: String,
+    /// The fetch command used to download containers.
+    pub fetch: moraine_binpkg::fetch::FetchCommand,
+    /// The directory downloaded containers are written to.
+    pub stage_dir: PathBuf,
+}
+
+impl BinpkgSource for BinhostSource {
+    fn fetch(&self, task: &InstallTask) -> Result<Option<Vec<u8>>> {
+        if self.base_uri.is_empty() {
+            return Ok(None);
+        }
+        let (category, _) = task.cp.split_once('/').unwrap_or((task.cp.as_str(), ""));
+        let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
+        let uri = format!(
+            "{}/{}/{}.gpkg",
+            self.base_uri.trim_end_matches('/'),
+            category,
+            pf
+        );
+        std::fs::create_dir_all(&self.stage_dir)
+            .map_err(|e| InstallError::io(&self.stage_dir, e))?;
+        let dest = self.stage_dir.join(format!("{pf}.gpkg"));
+        // A fetch failure means the container is unavailable from the binhost,
+        // not a hard error: the caller falls back or reports it per task.
+        if self.fetch.run(&uri, &dest).is_err() {
+            return Ok(None);
+        }
+        match std::fs::read(&dest) {
+            Ok(bytes) if !bytes.is_empty() => Ok(Some(bytes)),
+            _ => Ok(None),
+        }
+    }
+}
+
 /// A [`StepRunner`] that installs binary packages, staging each image under
 /// `stage_dir`.
 pub struct BinpkgRunner<S: BinpkgSource> {
@@ -73,8 +118,8 @@ impl<S: BinpkgSource> StepRunner for BinpkgRunner<S> {
         if task.source != SourceKind::Binary {
             return Err(InstallError::Realize {
                 cpv: task.cpv.clone(),
-                reason: "source builds are not yet supported; \
-                         the repository store does not persist SRC_URI"
+                reason: "this is a binary-package runner; route source tasks to \
+                         the source runner"
                     .to_owned(),
             });
         }
@@ -406,6 +451,31 @@ mod tests {
         let task = InstallTask::merge("app/foo-1", "app/foo", "0");
         let err = runner.realize(&task).unwrap_err();
         assert!(matches!(err, InstallError::Realize { .. }));
+    }
+
+    #[test]
+    fn binhost_absent_container_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        // An empty base URI yields nothing.
+        let empty = BinhostSource {
+            base_uri: String::new(),
+            fetch: moraine_binpkg::fetch::FetchCommand::default(),
+            stage_dir: dir.path().join("stage"),
+        };
+        let mut task = InstallTask::merge("app/foo-1", "app/foo", "0");
+        task.source = SourceKind::Binary;
+        assert!(empty.fetch(&task).unwrap().is_none());
+
+        // A failing fetch command reports the container as unavailable.
+        let failing = BinhostSource {
+            base_uri: "http://example.invalid".to_owned(),
+            fetch: moraine_binpkg::fetch::FetchCommand {
+                command: "false".to_owned(),
+                args: vec![],
+            },
+            stage_dir: dir.path().join("stage"),
+        };
+        assert!(failing.fetch(&task).unwrap().is_none());
     }
 
     #[test]

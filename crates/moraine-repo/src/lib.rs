@@ -64,6 +64,21 @@ pub fn previous_index(entries: &[StoredEntry]) -> HashMap<(String, String, Strin
 /// only changed entries are re-parsed.
 #[instrument(skip_all)]
 pub fn build_index(repos_conf: impl AsRef<Path>, store_dir: impl AsRef<Path>) -> Result<RepoIndex> {
+    build_index_with(repos_conf, store_dir, None)
+}
+
+/// Build the index parsing every repository store against a shared interner.
+///
+/// When `interner` is `Some`, every repository store parses its entries against
+/// that one interner, so atoms parsed elsewhere against the same interner (for
+/// example a `ResolvedConfig`) compare equal to the stores' symbols. With `None`
+/// each store gets its own interner, matching [`build_index`].
+#[instrument(skip_all)]
+pub fn build_index_with(
+    repos_conf: impl AsRef<Path>,
+    store_dir: impl AsRef<Path>,
+    interner: Option<std::sync::Arc<moraine_common::Interner>>,
+) -> Result<RepoIndex> {
     let repo_set = discover(repos_conf)?;
     let store_dir = store_dir.as_ref();
     std::fs::create_dir_all(store_dir).map_err(|source| {
@@ -85,7 +100,10 @@ pub fn build_index(repos_conf: impl AsRef<Path>, store_dir: impl AsRef<Path>) ->
 
         let report = import_repo(&repo_set, &cfg.name, &previous)?;
         store::write_store(&store_path, report.entries)?;
-        let store = LoadedStore::load(&store_path)?;
+        let store = match &interner {
+            Some(shared) => LoadedStore::load_with(&store_path, std::sync::Arc::clone(shared))?,
+            None => LoadedStore::load(&store_path)?,
+        };
         repos.push(RepoStore {
             name: cfg.name.clone(),
             store,

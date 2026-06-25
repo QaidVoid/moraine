@@ -15,6 +15,7 @@ pub mod diagnostics;
 pub mod news;
 pub mod plan;
 pub mod render;
+pub mod resolve_install;
 pub mod run;
 pub mod sets;
 pub mod write;
@@ -110,12 +111,18 @@ pub fn dispatch(cli: &Cli) -> miette::Result<()> {
         Action::Install => {
             if cli.targets.is_empty() {
                 println!("No targets given. Pass atoms or package sets such as @world.");
-                Ok(())
-            } else if cli.pretend {
-                render_plan(cli)
-            } else {
-                crate::write::install(cli, &ctx, &roots)
+                return Ok(());
             }
+            if cli.pretend {
+                return render_plan(cli);
+            }
+            let request = crate::sets::expand(
+                &ctx,
+                &cli.targets,
+                &cli.exclude,
+                crate::run::modifiers_from(cli),
+            )?;
+            crate::resolve_install::run(cli, &ctx, &roots, &request.atoms)
         }
     }
 }
