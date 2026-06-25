@@ -417,9 +417,9 @@ impl CliPlanner<'_> {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
-        // `FETCHCOMMAND`/`RESUMECOMMAND` default in Portage's `make.globals`,
-        // which is not read here, so fall back to the build engine's built-in
-        // `wget` default when `make.conf` does not set them.
+        // `FETCHCOMMAND`/`RESUMECOMMAND` normally come from `make.globals` or
+        // `make.conf`; the build engine's `wget` default is the last resort when
+        // neither configures them.
         let defaults = FetchConfig::new(&distdir);
         let fetchcommand = match tokenize(self.ctx.vars.get("FETCHCOMMAND").unwrap_or_default()) {
             tokens if tokens.is_empty() => defaults.fetchcommand,

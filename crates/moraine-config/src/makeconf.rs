@@ -37,6 +37,17 @@ impl VarMap {
         self.vars.insert(key.into(), value.into());
     }
 
+    /// Merge a single assignment, stacking incremental variables onto the current
+    /// value and replacing non-incremental ones, as parsing a line would.
+    pub fn merge_var(&mut self, key: &str, value: &str) {
+        if self.is_incremental(key) {
+            let merged = stack_incremental(self.vars.get(key), value);
+            self.vars.insert(key.to_owned(), merged);
+        } else {
+            self.vars.insert(key.to_owned(), value.to_owned());
+        }
+    }
+
     /// Parse the contents of one assignment file, merging into this map so that
     /// later assignments override and expansion sees earlier values.
     pub fn merge_str(&mut self, content: &str, path: &Path) -> Result<(), ConfigError> {

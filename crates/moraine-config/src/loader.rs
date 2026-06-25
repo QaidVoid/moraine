@@ -47,7 +47,10 @@ pub fn resolve_config(
     for node in &profile.nodes {
         use_mask.apply(&read_flag_file(&node.path.join("use.mask")));
         use_force.apply(&read_flag_file(&node.path.join("use.force")));
-        use_stable_mask.apply(&read_flag_file(&node.path.join("use.stable.mask")));
+        // `use.stable.mask` is only honored from EAPI 5+ profile nodes.
+        if node_level(node) >= 5 {
+            use_stable_mask.apply(&read_flag_file(&node.path.join("use.stable.mask")));
+        }
     }
 
     let mut use_manager = UseManager::new(global.enabled, global.hidden)
@@ -119,6 +122,10 @@ pub fn resolve_config(
     // Externally provided packages.
     let mut provided = ProvidedManager::new();
     for node in &profile.nodes {
+        // `package.provided` is banned in EAPI 7+ profile nodes.
+        if node_level(node) >= 7 {
+            continue;
+        }
         for line in read_lines(&node.path.join("package.provided")) {
             // `package.provided` lines are bare `category/package-version`
             // CPVs, which are implicitly exact-version atoms.
@@ -154,6 +161,11 @@ pub fn resolve_config(
         system,
         world,
     )
+}
+
+/// The numeric EAPI level of a profile node, defaulting to 0 when unparseable.
+fn node_level(node: &crate::profile::ProfileNode) -> u8 {
+    moraine_eapi::level(&node.eapi).unwrap_or(0)
 }
 
 /// A set folded across stacked files, where a leading `-` removes a prior entry.
@@ -272,10 +284,14 @@ mod tests {
     use moraine_version::Version;
 
     fn profile_with(dir: &Path) -> ProfileStack {
+        profile_with_eapi(dir, "8")
+    }
+
+    fn profile_with_eapi(dir: &Path, eapi: &str) -> ProfileStack {
         ProfileStack {
             nodes: vec![crate::profile::ProfileNode {
                 path: dir.to_path_buf(),
-                eapi: "8".to_owned(),
+                eapi: eapi.to_owned(),
                 is_user: false,
             }],
         }
@@ -364,8 +380,9 @@ mod tests {
         )
         .unwrap();
         let interner = Interner::new();
+        // `package.provided` is honored in pre-7 EAPI profiles.
         let cfg = resolve_config(
-            &profile_with(dir.path()),
+            &profile_with_eapi(dir.path(), "6"),
             &VarMap::new(),
             dir.path(),
             vec![],
@@ -374,6 +391,67 @@ mod tests {
         );
         let version = Version::parse("6.6").unwrap();
         assert!(cfg.is_provided(&pref(&interner, "sys-kernel", "gentoo-sources", &version)));
+    }
+
+    #[test]
+    fn package_provided_rejected_in_eapi_7() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.provided"),
+            "sys-kernel/gentoo-sources-6.6\n",
+        )
+        .unwrap();
+        let interner = Interner::new();
+        let cfg = resolve_config(
+            &profile_with_eapi(dir.path(), "7"),
+            &VarMap::new(),
+            dir.path(),
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("6.6").unwrap();
+        assert!(!cfg.is_provided(&pref(&interner, "sys-kernel", "gentoo-sources", &version)));
+    }
+
+    #[test]
+    fn use_stable_mask_gated_by_eapi() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("use.stable.mask"), "exp\n").unwrap();
+        let interner = Interner::new();
+        let version = Version::parse("1.0").unwrap();
+
+        // EAPI 4 node: use.stable.mask is ignored, so a stable build keeps `exp`.
+        let cfg4 = resolve_config(
+            &profile_with_eapi(dir.path(), "4"),
+            &VarMap::new(),
+            dir.path(),
+            vec![],
+            vec![],
+            &interner,
+        );
+        let eff = cfg4.effective_use(
+            &pref(&interner, "a", "b", &version),
+            &["+exp".to_owned()],
+            true,
+        );
+        assert!(eff.enabled.contains("exp"));
+
+        // EAPI 8 node: use.stable.mask applies, masking `exp` for stable builds.
+        let cfg8 = resolve_config(
+            &profile_with_eapi(dir.path(), "8"),
+            &VarMap::new(),
+            dir.path(),
+            vec![],
+            vec![],
+            &interner,
+        );
+        let eff = cfg8.effective_use(
+            &pref(&interner, "a", "b", &version),
+            &["+exp".to_owned()],
+            true,
+        );
+        assert!(!eff.enabled.contains("exp"));
     }
 
     #[test]

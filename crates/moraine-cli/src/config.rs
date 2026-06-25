@@ -93,9 +93,16 @@ impl ConfigContext {
         let profile = load_profile(&config_dir, roots.profile.as_deref());
 
         let mut env = VarMap::new();
+        // make.globals is the lowest configuration layer, below profile
+        // make.defaults and make.conf. Its absence is tolerated.
+        let make_globals = config_dir.join("usr/share/portage/config/make.globals");
+        if make_globals.exists() {
+            env.merge_path(&make_globals)
+                .map_err(ConfigLoadError::MakeConf)?;
+        }
         if let Ok(defaults) = profile.make_defaults() {
             for (key, value) in defaults.iter() {
-                env.set(key.clone(), value.clone());
+                env.merge_var(key, value);
             }
         }
         let make_conf = config_dir.join("etc/portage/make.conf");
@@ -239,6 +246,25 @@ mod tests {
         assert_eq!(ctx.members("selected").unwrap(), ctx.selected);
         assert_eq!(ctx.members("world").unwrap(), ctx.world);
         assert!(ctx.members("nope").is_none());
+    }
+
+    #[test]
+    fn make_globals_is_lowest_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = dir.path().join("usr/share/portage/config/make.globals");
+        std::fs::create_dir_all(globals.parent().unwrap()).unwrap();
+        std::fs::write(&globals, "USE=\"a b\"\n").unwrap();
+        let make_conf = dir.path().join("etc/portage/make.conf");
+        std::fs::create_dir_all(make_conf.parent().unwrap()).unwrap();
+        std::fs::write(&make_conf, "USE=\"c\"\n").unwrap();
+        let roots = Roots {
+            root: Some(dir.path().to_path_buf()),
+            config_root: Some(dir.path().to_path_buf()),
+            profile: None,
+        };
+        let ctx = ConfigContext::load(&roots).unwrap();
+        // make.globals supplies the base USE, make.conf stacks onto it.
+        assert_eq!(ctx.vars.get("USE"), Some("a b c"));
     }
 
     #[test]
