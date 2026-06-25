@@ -274,7 +274,7 @@ fn required_use_violation_is_reported() {
 }
 
 #[test]
-fn weak_blocker_prevents_coexistence() {
+fn weak_blocker_of_required_package_conflicts() {
     let mut f = Fixture::new();
     f.add(PkgSpec {
         cp: "cat/main",
@@ -290,9 +290,59 @@ fn weak_blocker_prevents_coexistence() {
     });
     f.add(pkg("cat/foo", "1"));
 
-    // main blocks cat/foo, but cat/dep requires it: unsatisfiable.
+    // main blocks cat/foo, but cat/dep requires it: they cannot coexist at the
+    // end state, so the request is unsatisfiable.
     let r = resolve(&f, &["cat/main"]);
     assert!(matches!(r, Err(ResolveError::Unsatisfiable { .. })));
+}
+
+#[test]
+fn weak_blocker_resolved_by_unmerge() {
+    // A weak blocker against an installed package that nothing else needs lets
+    // the parent install while the installed package is scheduled for unmerge,
+    // rather than failing as a hard conflict.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/main",
+        version: "1",
+        rdepend: "!cat/foo",
+        ..Default::default()
+    });
+    f.add(pkg("cat/foo", "1"));
+    f.add_installed(installed("cat/foo", "1", "0", None, &[]));
+
+    let sol = resolve(&f, &["cat/main"]).expect("resolves");
+    assert!(sol.package("cat/main").is_some());
+    assert!(
+        sol.package("cat/foo").is_none(),
+        "blocked foo is not installed"
+    );
+    let victims: Vec<_> = sol.blockers.iter().flat_map(|b| &b.victims).collect();
+    assert!(
+        victims
+            .iter()
+            .any(|v| v.cp == "cat/foo" && v.version.as_str() == "1"),
+        "the installed foo is scheduled for unmerge: {victims:?}"
+    );
+}
+
+#[test]
+fn self_block_does_not_block_same_slot_replacement() {
+    // A package whose own dep string blocks an older version of itself in the
+    // same slot must still install: the same-slot install is a replacement, not
+    // a coexistence, so the self-block does not apply to the parent's own slot.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/foo",
+        version: "2",
+        slot: "0",
+        rdepend: "!!=cat/foo-1",
+        ..Default::default()
+    });
+    f.add_installed(installed("cat/foo", "1", "0", None, &[]));
+
+    let sol = resolve(&f, &["cat/foo"]).expect("resolves: same-slot replacement");
+    assert_eq!(sol.package("cat/foo").unwrap().version.as_str(), "2");
 }
 
 #[test]

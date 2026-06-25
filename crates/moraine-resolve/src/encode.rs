@@ -107,13 +107,12 @@ pub(crate) type Group<'a> = Vec<Vec<&'a NormAtom>>;
 /// constrains its candidate versions.
 pub(crate) type Alt = (String, Term<Version>);
 
-/// The package currently being encoded, whose own `(cp, slot, version)` is
-/// excluded from its blocker target sets.
+/// The package currently being encoded, whose own `(cp, slot)` is excluded from
+/// its blocker target sets (the same-slot-replacement exception).
 #[derive(Clone, Copy)]
 pub(crate) struct Parent<'a> {
     pub cp: &'a str,
     pub slot: &'a str,
-    pub version: &'a Version,
 }
 
 /// Recursively reduce a dependency node against the parent's USE, collecting the
@@ -247,13 +246,11 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             (&meta.idepend, DepClass::Idepend),
         ];
 
-        // The parent's own (cp, slot, version) is excluded from its blocker
-        // target sets so a self/other-slot block constrains only the other
-        // instance.
+        // The parent's own (cp, slot) is excluded from its blocker target sets so
+        // a self/other-slot block constrains only the other slots.
         let parent = Parent {
             cp: meta.cp.as_str(),
             slot: meta.slot.as_str(),
-            version: &meta.version,
         };
 
         for (node, _class) in class_nodes {
@@ -492,9 +489,12 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         parent_use: &BTreeSet<String>,
         features: EapiFeatures,
     ) -> Vec<Alt> {
-        let excluded = |slot: &str, version: &Version| -> bool {
-            matches!(parent, Some(p) if p.cp == atom.cp && p.slot == slot && p.version == version)
-        };
+        // A blocker never constrains the parent's own slot: in that slot the
+        // parent's install replaces the matched package rather than coexisting
+        // with it (the same-slot-replacement exception), so a self/other-slot
+        // block constrains only the other slots.
+        let excluded =
+            |slot: &str| -> bool { matches!(parent, Some(p) if p.cp == atom.cp && p.slot == slot) };
         let mut by_slot: std::collections::BTreeMap<String, Vec<Version>> =
             std::collections::BTreeMap::new();
         for m in self.source.versions_of(&atom.cp) {
@@ -507,7 +507,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                     parent_use,
                     features,
                 )
-                && !excluded(&m.slot, &m.version)
+                && !excluded(&m.slot)
             {
                 by_slot.entry(m.slot.clone()).or_default().push(m.version);
             }
@@ -520,7 +520,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             if slot_ok
                 && version_satisfies(atom, &m.version)
                 && use_deps_satisfied(atom, &m.use_enabled, &m.use_enabled, parent_use, features)
-                && !excluded(&m.slot, &m.version)
+                && !excluded(&m.slot)
             {
                 by_slot.entry(m.slot.clone()).or_default().push(m.version);
             }
