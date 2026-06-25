@@ -259,7 +259,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
     ) -> Result<(), String> {
         // Blockers become conflicts.
         if atom.blocker != BlockerKind::None {
-            if let Some(term) = self.blocked_term(atom) {
+            if let Some(term) = self.blocked_term(atom, parent_use, features) {
                 conflicts.push((atom.cp.clone(), term));
             }
             return Ok(());
@@ -395,9 +395,15 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
 
     /// The negative term for a blocker: the set of versions that must NOT be
     /// selected.
-    fn blocked_term(&self, atom: &NormAtom) -> Option<Term<Version>> {
-        // Find the versions of the blocked cp that match the blocker atom.
-        let blocked = self.matching_versions_simple(atom);
+    fn blocked_term(
+        &self,
+        atom: &NormAtom,
+        parent_use: &BTreeSet<String>,
+        features: EapiFeatures,
+    ) -> Option<Term<Version>> {
+        // The versions of the blocked cp that match the blocker, including its
+        // USE condition: `!pkg[-flag]` blocks only instances with the flag off.
+        let blocked = self.matching_versions_simple(atom, parent_use, features);
         if blocked.is_empty() {
             return None;
         }
@@ -507,15 +513,33 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
 
     /// The versions of an atom's cp that match version and slot, ignoring
     /// visibility and USE (used for blocker target sets).
-    fn matching_versions_simple(&self, atom: &NormAtom) -> Vec<Version> {
+    fn matching_versions_simple(
+        &self,
+        atom: &NormAtom,
+        parent_use: &BTreeSet<String>,
+        features: EapiFeatures,
+    ) -> Vec<Version> {
         let mut out = Vec::new();
         for m in self.source.versions_of(&atom.cp) {
-            if version_satisfies(atom, &m.version) && slot_matches(atom, &m) {
+            if version_satisfies(atom, &m.version)
+                && slot_matches(atom, &m)
+                && use_deps_satisfied(
+                    atom,
+                    &self.source.resolved_use(&m),
+                    &m.iuse,
+                    parent_use,
+                    features,
+                )
+            {
                 out.push(m.version.clone());
             }
         }
         for m in self.source.installed(&atom.cp) {
-            if version_satisfies(atom, &m.version) {
+            // An installed package's USE is fixed; its enabled set serves as both
+            // its USE and its known IUSE for the blocker's USE condition.
+            if version_satisfies(atom, &m.version)
+                && use_deps_satisfied(atom, &m.use_enabled, &m.use_enabled, parent_use, features)
+            {
                 out.push(m.version.clone());
             }
         }
