@@ -96,15 +96,27 @@ pub struct IndexedBinhost {
 }
 
 impl IndexedBinhost {
-    /// Fetch and parse the `Packages` index from the first reachable host in
-    /// `uris`, returning `None` when none are reachable.
-    pub fn load(uris: &[String], fetch: FetchCommand, stage: &Path) -> Option<IndexedBinhost> {
-        std::fs::create_dir_all(stage).ok()?;
+    /// Load the `Packages` index for the first reachable host in `uris`.
+    ///
+    /// The index is cached under `cache_dir` and reused as-is on later runs; it
+    /// is fetched only when missing, or when `refresh` is set (the `--sync`
+    /// path). This mirrors how repository metadata refreshes on sync rather than
+    /// on every invocation. Returns `None` when no host yields an index.
+    pub fn load(
+        uris: &[String],
+        fetch: FetchCommand,
+        cache_dir: &Path,
+        refresh: bool,
+    ) -> Option<IndexedBinhost> {
         for base in uris {
-            let dest = stage.join("Packages");
-            let url = format!("{}/Packages", base.trim_end_matches('/'));
-            if fetch.run(&url, &dest).is_err() {
-                continue;
+            let host_dir = cache_dir.join(host_key(base));
+            let dest = host_dir.join("Packages");
+            if refresh || !dest.exists() {
+                let _ = std::fs::create_dir_all(&host_dir);
+                let url = format!("{}/Packages", base.trim_end_matches('/'));
+                if fetch.run(&url, &dest).is_err() && !dest.exists() {
+                    continue;
+                }
             }
             let Ok(text) = std::fs::read_to_string(&dest) else {
                 continue;
@@ -114,7 +126,7 @@ impl IndexedBinhost {
                     base_uri: base.trim_end_matches('/').to_owned(),
                     index,
                     fetch,
-                    stage: stage.to_path_buf(),
+                    stage: host_dir,
                 });
             }
         }
@@ -164,6 +176,13 @@ impl BinpkgSource for IndexedBinhost {
             _ => Ok(None),
         }
     }
+}
+
+/// A filesystem-safe cache key for a binhost URI.
+fn host_key(uri: &str) -> String {
+    uri.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 /// A binary-package source that tries each member in order, returning the first

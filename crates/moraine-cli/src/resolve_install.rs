@@ -31,7 +31,7 @@ use moraine_install::{
     TransactionEngine,
 };
 use moraine_repo::store::{StoredEntry, read_entries};
-use moraine_repo::{RepoIndex, RepoSet, build_index_with, discover};
+use moraine_repo::{LoadedStore, RepoIndex, RepoSet, RepoStore, build_index_with, discover};
 use moraine_resolve::{RealSource, Task, TaskKind as ResolveTaskKind, resolve, serialize};
 use moraine_vdb::store::{Store, StorePaths};
 use moraine_version::Version;
@@ -73,9 +73,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     // Build the resolver inputs against one shared interner so masking and USE
     // from the configuration compare equal to the repository's symbols.
     let repos_conf = config_dir.join("etc/portage/repos.conf");
-    let store_dir = wr.eroot.join("var/cache/moraine/repos");
-    let repo_index = build_index_with(&repos_conf, &store_dir, Some(Arc::clone(&interner)))
-        .map_err(|e| index_error(e, &store_dir))?;
+    let (repo_index, store_dir) = obtain_index(&repos_conf, &wr.eroot, &interner)?;
     if repo_index
         .repos()
         .iter()
@@ -134,10 +132,16 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     // for fetching. Done once; reused for display and execution.
     let binhost = if prefs.getbinpkg {
         let uris = crate::binhost::binhost_uris(&config_dir, &ctx.vars);
+        let binhost_cache = store_dir
+            .parent()
+            .map(|p| p.join("binhost"))
+            .unwrap_or_else(|| store_dir.join("binhost"));
+        // Reuse the cached index; `--sync` refreshes it.
         crate::binhost::IndexedBinhost::load(
             &uris,
             moraine_binpkg::fetch::FetchCommand::default(),
-            &stage,
+            &binhost_cache,
+            cli.sync,
         )
     } else {
         None
@@ -785,6 +789,89 @@ fn package_ident(
 /// Split a shell-style command template into tokens.
 fn tokenize(s: &str) -> Vec<String> {
     s.split_whitespace().map(str::to_owned).collect()
+}
+
+/// Obtain the repository index and the store directory backing it.
+///
+/// An existing greenfield store is loaded read-only without rebuilding: first the
+/// system store (so a root-built cache is reused by any user), then the per-user
+/// store. Only when none exists is the index built, into the system cache when
+/// writable (root) or the per-user cache otherwise. The store refreshes on
+/// `moraine --sync`, not on every invocation.
+fn obtain_index(
+    repos_conf: &Path,
+    eroot: &Path,
+    interner: &Arc<Interner>,
+) -> Result<(RepoIndex, PathBuf)> {
+    let system = eroot.join("var/cache/moraine/repos");
+    let user = user_cache_base().map(|b| b.join("moraine/repos"));
+
+    if let Some(index) = load_existing_index(repos_conf, &system, interner) {
+        return Ok((index, system));
+    }
+    if let Some(user_dir) = &user
+        && let Some(index) = load_existing_index(repos_conf, user_dir, interner)
+    {
+        return Ok((index, user_dir.clone()));
+    }
+
+    let build_dir = if is_writable(&system) {
+        system
+    } else {
+        user.unwrap_or(system)
+    };
+    let index = build_index_with(repos_conf, &build_dir, Some(Arc::clone(interner)))
+        .map_err(|e| index_error(e, &build_dir))?;
+    Ok((index, build_dir))
+}
+
+/// Load a repository index from existing `.mrepo` store files without rebuilding.
+/// Returns `None` when no repository has a store file yet.
+fn load_existing_index(
+    repos_conf: &Path,
+    store_dir: &Path,
+    interner: &Arc<Interner>,
+) -> Option<RepoIndex> {
+    let set = discover(repos_conf).ok()?;
+    let mut repos = Vec::new();
+    for cfg in set.ordered() {
+        let path = store_dir.join(format!("{}.mrepo", cfg.name));
+        if !path.exists() {
+            continue;
+        }
+        let store = LoadedStore::load_with(&path, Arc::clone(interner)).ok()?;
+        repos.push(RepoStore {
+            name: cfg.name.clone(),
+            store,
+        });
+    }
+    if repos.is_empty() {
+        return None;
+    }
+    Some(RepoIndex::new(repos))
+}
+
+/// Whether a directory can be created and written to.
+fn is_writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".moraine-write-test");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The per-user cache base, from `XDG_CACHE_HOME` or `~/.cache`.
+fn user_cache_base() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
 }
 
 /// Turn a repository-index build failure into an actionable diagnostic. A

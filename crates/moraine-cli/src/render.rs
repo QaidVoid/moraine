@@ -162,20 +162,26 @@ pub fn render_entry(entry: &MergeEntry, verbose: bool) -> String {
         let _ = write!(slot_suffix, ":{slot}");
     }
 
-    let kind = if entry.binary { "binary" } else { "ebuild" };
-    let bracket = format!("[{kind} {}]", indicator_block(entry));
+    // Color each element distinctly: a cyan `binary` / green `ebuild` label, the
+    // operation indicator in its own color, a green atom, a blue repository, and
+    // a yellow size, so the parts stay visually separable.
+    let label = if entry.binary {
+        paint("binary", "36")
+    } else {
+        paint("ebuild", "32")
+    };
+    let indicator = paint(&indicator_block(entry), operation_color(entry.operation));
     let mut line = format!(
-        "{} {}{slot_suffix}-{}",
-        paint(&bracket, operation_color(entry.operation)),
+        "[{label} {indicator}] {}{slot_suffix}-{}",
         paint(&entry.cp, "32"),
         entry.version
     );
     if let Some(old) = &entry.old_version {
-        let _ = write!(line, " [{old}]");
+        let _ = write!(line, " {}", paint(&format!("[{old}]"), "33"));
     }
 
     if verbose && let Some(repo) = &entry.repository {
-        let _ = write!(line, "::{repo}");
+        let _ = write!(line, "{}", paint(&format!("::{repo}"), "34"));
     }
 
     let use_str = render_use_string(&entry.use_flags);
