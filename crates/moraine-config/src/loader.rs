@@ -69,6 +69,30 @@ pub fn resolve_config(
         }
     }
 
+    // Per-package USE masking and forcing across the profile stack then
+    // /etc/portage. Each file shares the `atom flag -flag` syntax of package.use.
+    type AddFn = fn(&mut UseManager, PkgUseEntry);
+    let pkg_use_files: [(&str, AddFn); 4] = [
+        ("package.use.mask", UseManager::add_pkg_mask),
+        ("package.use.force", UseManager::add_pkg_force),
+        ("package.use.stable.mask", UseManager::add_pkg_stable_mask),
+        ("package.use.stable.force", UseManager::add_pkg_stable_force),
+    ];
+    for (name, add) in pkg_use_files {
+        for node in &profile.nodes {
+            for line in read_lines(&node.path.join(name)) {
+                if let Some(entry) = parse_pkg_use(&line, interner) {
+                    add(&mut use_manager, entry);
+                }
+            }
+        }
+        for line in read_lines(&config_root.join("etc/portage").join(name)) {
+            if let Some(entry) = parse_pkg_use(&line, interner) {
+                add(&mut use_manager, entry);
+            }
+        }
+    }
+
     // Package masking: profile package.mask/unmask then /etc/portage.
     let mut mask_manager = MaskManager::new();
     for node in &profile.nodes {
