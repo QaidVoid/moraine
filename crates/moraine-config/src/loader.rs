@@ -664,6 +664,35 @@ mod tests {
     }
 
     #[test]
+    fn config_dir_skips_dotfiles() {
+        // A `._mrg`/`._cfg` CONFIG_PROTECT artifact in a config directory must be
+        // ignored, so a stale pending update does not leak into the config.
+        let dir = tempfile::tempdir().unwrap();
+        let pkguse = dir.path().join("etc/portage/package.use");
+        std::fs::create_dir_all(&pkguse).unwrap();
+        std::fs::write(pkguse.join("active"), "dev-libs/openssl ssl\n").unwrap();
+        std::fs::write(pkguse.join("._mrg0000_active"), "dev-libs/openssl -ssl\n").unwrap();
+        let interner = Interner::new();
+        let cfg = resolve_config(
+            &ProfileStack::default(),
+            &VarMap::new(),
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("3.0").unwrap();
+        let eff = cfg.effective_use(
+            &pref(&interner, "dev-libs", "openssl", &version),
+            &[],
+            false,
+        );
+        // The active file enables ssl; the dotfile's `-ssl` is ignored.
+        assert!(eff.enabled.contains("ssl"));
+    }
+
+    #[test]
     fn package_use_enables_flag() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.use"), "dev-libs/openssl ssl\n").unwrap();

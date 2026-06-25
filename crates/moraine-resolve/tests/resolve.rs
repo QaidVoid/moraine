@@ -626,6 +626,42 @@ fn two_slots_of_one_cp_coinstall() {
 }
 
 #[test]
+fn installed_package_skips_build_deps() {
+    // An already-installed package is not rebuilt, so an unavailable build-time
+    // dependency must not make it unresolvable; only its runtime deps matter.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/tool",
+        version: "1",
+        eapi: "8",
+        bdepend: "cat/missing-builddep",
+        rdepend: "cat/runtimelib",
+        ..Default::default()
+    });
+    f.add(pkg("cat/runtimelib", "1"));
+    // cat/missing-builddep has no candidate at all.
+    f.add_installed(installed("cat/tool", "1", "0", None, &[]));
+
+    let sol = resolve(&f, &["cat/tool"]).expect("installed package resolves despite missing bdep");
+    assert!(sol.package("cat/tool").is_some());
+    assert!(
+        sol.package("cat/runtimelib").is_some(),
+        "runtime dep pulled"
+    );
+
+    // A NOT-installed package with the same missing build dep does fail.
+    let mut f2 = Fixture::new();
+    f2.add(PkgSpec {
+        cp: "cat/tool",
+        version: "1",
+        eapi: "8",
+        bdepend: "cat/missing-builddep",
+        ..Default::default()
+    });
+    assert!(resolve(&f2, &["cat/tool"]).is_err());
+}
+
+#[test]
 fn ranged_blocker_only_removes_matching_versions() {
     // `!<cat/foo-2` removes the installed cat/foo-1 but leaves cat/foo-3.
     let mut f = Fixture::new();
