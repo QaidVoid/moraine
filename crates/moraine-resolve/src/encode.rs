@@ -348,25 +348,26 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             return Ok(());
         }
 
-        // virtual/* atoms expand to a disjunction over their providers. When the
-        // virtual's reduced RDEPEND lists no providers (for example
-        // virtual/libiconv on glibc, where the provider branch is USE-gated off),
-        // fall through to require the virtual package itself: selecting it
-        // processes its own RDEPEND, which is then trivially satisfied.
-        if atom.cp.starts_with("virtual/")
-            && let Some(alts) = self.expand_virtual(atom, features)
-        {
-            push_disjunction(clauses, alts);
-            return Ok(());
-        }
-
         // package.provided satisfies the atom with no install.
         if self.atom_is_provided(atom) {
             return Ok(());
         }
 
+        // A `virtual/*` atom is required like any package: selecting the virtual
+        // node retains it in the install/world set, and its own RDEPEND (a
+        // provider disjunction) is processed when the node is encoded, pulling in
+        // a provider. A virtual whose providers are all USE-gated off installs as
+        // a node with no provider, which is then trivially satisfied.
         let alts = self.required_alternatives(atom, parent_use, features);
         if alts.is_empty() {
+            // No visible virtual node: fall back to flattening providers so a
+            // provider can still be pulled in directly.
+            if atom.cp.starts_with("virtual/")
+                && let Some(provider_alts) = self.expand_virtual(atom, features)
+            {
+                push_disjunction(clauses, provider_alts);
+                return Ok(());
+            }
             return Err(format!("no provider for {}", atom.cp));
         }
         push_disjunction(clauses, alts);

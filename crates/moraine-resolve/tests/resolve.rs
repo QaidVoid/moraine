@@ -460,6 +460,12 @@ fn virtual_expands_to_provider() {
         sol.package("cat/provider-a").is_some() || sol.package("cat/provider-b").is_some(),
         "a virtual provider should be installed"
     );
+    // The virtual package node itself is retained in the solution (GLEP 37), not
+    // flattened away.
+    assert!(
+        sol.package("virtual/foo").is_some(),
+        "the virtual node is retained in the install set"
+    );
 }
 
 #[test]
