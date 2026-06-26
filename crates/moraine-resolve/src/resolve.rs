@@ -275,9 +275,11 @@ fn assemble_solution<S: ResolveSource>(
                         &selected,
                         &mut edges,
                         &mut blockers,
-                        &mut slot_bindings,
                     );
                 }
+                // Record `:=` bindings only for the satisfied `||` branch.
+                let root = root_for(class, features);
+                record_slot_bindings(node, &resolved_use, &selected, root, &mut slot_bindings);
             }
 
             packages.push(ResolvedPackage {
@@ -634,7 +636,6 @@ fn emit_edge_for_atom<S: ResolveSource>(
     selected: &BTreeMap<String, Vec<(Version, PackageMeta)>>,
     edges: &mut Vec<DepEdge>,
     blockers: &mut Vec<RecordedBlocker>,
-    slot_bindings: &mut Vec<SlotBinding>,
 ) {
     let root = root_for(class, features);
 
@@ -665,7 +666,7 @@ fn emit_edge_for_atom<S: ResolveSource>(
     }
 
     // Find the selected provider satisfying this atom.
-    if let Some((_, dep_meta)) = find_provider(selected, atom) {
+    if find_provider(selected, atom).is_some() {
         let slot_op = atom.slot_op.is_some();
         edges.push(DepEdge {
             from: from.to_owned(),
@@ -676,16 +677,72 @@ fn emit_edge_for_atom<S: ResolveSource>(
             slot_op,
             optional,
         });
-        // Record `:=`/`:slot=` bindings.
-        if matches!(atom.slot_op, Some(SlotOpKind::Equal)) {
-            slot_bindings.push(SlotBinding {
-                dependency: atom.cp.clone(),
-                slot: dep_meta.slot.clone(),
-                subslot: dep_meta.subslot.clone(),
-                root,
-            });
+    }
+}
+
+/// Record the `:=`/`:slot=` slot bindings of a dependency node against the
+/// selected providers, descending into only the `||` branch the solution
+/// satisfied so a binding is never recorded for an unlinked branch
+/// (`_slot_operator.py:88-95`).
+fn record_slot_bindings(
+    node: &DepNode,
+    parent_use: &BTreeSet<String>,
+    selected: &BTreeMap<String, Vec<(Version, PackageMeta)>>,
+    root: crate::solution::Root,
+    out: &mut Vec<SlotBinding>,
+) {
+    match node {
+        DepNode::Leaf(atom) => {
+            if matches!(atom.slot_op, Some(SlotOpKind::Equal))
+                && let Some((_, dep_meta)) = find_provider(selected, atom)
+            {
+                out.push(SlotBinding {
+                    dependency: atom.cp.clone(),
+                    slot: dep_meta.slot.clone(),
+                    subslot: dep_meta.subslot.clone(),
+                    root,
+                });
+            }
+        }
+        DepNode::AllOf(children) => {
+            for c in children {
+                record_slot_bindings(c, parent_use, selected, root, out);
+            }
+        }
+        DepNode::Conditional { flag, sense, body } => {
+            if parent_use.contains(flag) == *sense {
+                for c in body {
+                    record_slot_bindings(c, parent_use, selected, root, out);
+                }
+            }
+        }
+        DepNode::AnyOf(branches)
+        | DepNode::ExactlyOneOf(branches)
+        | DepNode::AtMostOneOf(branches) => {
+            // Only the first branch the solution satisfied is actually linked
+            // against, so only its `:=` atoms are bound.
+            if let Some(branch) = branches
+                .iter()
+                .find(|b| branch_satisfied(b, parent_use, selected))
+            {
+                record_slot_bindings(branch, parent_use, selected, root, out);
+            }
         }
     }
+}
+
+/// Whether every required (non-blocker) atom of a `||` branch has a selected
+/// provider, marking it the branch the solution linked against.
+fn branch_satisfied(
+    node: &DepNode,
+    parent_use: &BTreeSet<String>,
+    selected: &BTreeMap<String, Vec<(Version, PackageMeta)>>,
+) -> bool {
+    let mut atoms: Vec<(&NormAtom, bool)> = Vec::new();
+    collect_atoms(node, parent_use, false, &mut atoms);
+    atoms.iter().all(|(atom, _)| {
+        atom.blocker != BlockerKind::None || find_provider(selected, atom).is_some()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

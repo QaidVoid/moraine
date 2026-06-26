@@ -987,3 +987,37 @@ fn slot_operator_pulls_in_installed_consumer_for_rebuild() {
         "the pulled-in consumer must be flagged for a slot-operator rebuild"
     );
 }
+
+#[test]
+fn slot_operator_binding_only_for_satisfied_branch() {
+    // main has `|| ( cat/a:= cat/b:= )`. Only cat/b is installable, so the
+    // solution links cat/b and records a binding for cat/b, never for the
+    // unsatisfied cat/a branch.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/main",
+        version: "1",
+        eapi: "8",
+        rdepend: "|| ( cat/a:= cat/b:= )",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "cat/b",
+        version: "1",
+        slot: "2",
+        subslot: Some("2.1"),
+        ..Default::default()
+    });
+
+    let sol = resolve(&f, &["cat/main"]).expect("resolves via the cat/b branch");
+    let main = sol.package("cat/main").unwrap();
+    assert!(
+        main.slot_bindings.iter().any(|b| b.dependency == "cat/b"),
+        "a binding is recorded for the linked branch cat/b: {:?}",
+        main.slot_bindings
+    );
+    assert!(
+        !main.slot_bindings.iter().any(|b| b.dependency == "cat/a"),
+        "no binding for the unlinked branch cat/a"
+    );
+}
