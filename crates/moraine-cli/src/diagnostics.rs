@@ -109,6 +109,15 @@ impl From<ResolveError> for ResolutionDiagnostic {
             } => ResolutionDiagnostic::Unsatisfiable {
                 explanation: format!("blocker {blocker} blocks {victim}, but {reason}"),
             },
+            ResolveError::BrokenReverseDependency {
+                dependent,
+                dependency,
+                atom,
+            } => ResolutionDiagnostic::Unsatisfiable {
+                explanation: format!(
+                    "{dependent} depends on `{atom}`, which the change to {dependency} no longer satisfies"
+                ),
+            },
         }
     }
 }

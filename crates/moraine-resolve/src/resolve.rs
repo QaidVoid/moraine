@@ -218,6 +218,13 @@ fn assemble_solution<S: ResolveSource>(
     // cat/x when Y is not itself being removed or replaced.
     enforce_installed_blockers(source, &packages)?;
 
+    // `--deep`: validate that no changed package leaves an installed
+    // reverse-dependency's atom unsatisfied (Portage's `_complete_graph`,
+    // gated on a version actually changing).
+    if modifiers.deep {
+        enforce_reverse_dep_consistency(source, &packages)?;
+    }
+
     edges.sort_by(|a, b| {
         a.from
             .cmp(&b.from)
@@ -326,6 +333,117 @@ fn enforce_installed_blockers<S: ResolveSource>(
         }
     }
     Ok(())
+}
+
+/// The `--deep` reverse-dependency consistency pass.
+///
+/// For each installed package not itself being changed, its runtime
+/// (RDEPEND/PDEPEND) atoms on a changed package are re-checked against the
+/// post-resolution providers. If a changed package no longer satisfies an
+/// installed consumer's atom and nothing else provides it, the change would
+/// break the consumer, surfaced as a structured
+/// [`ResolveError::BrokenReverseDependency`] rather than a silent breakage.
+fn enforce_reverse_dep_consistency<S: ResolveSource>(
+    source: &S,
+    packages: &[ResolvedPackage],
+) -> Result<(), ResolveError> {
+    // Packages that actually changed (a new install or a version change), the
+    // only ones whose reverse-dependencies need re-validation.
+    let changed: BTreeSet<&str> = packages
+        .iter()
+        .filter(|p| !p.already_installed)
+        .map(|p| p.cp.as_str())
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+
+    for inst in source.installed_all() {
+        // A consumer being changed itself is rebuilt against the new providers,
+        // so its old atoms do not constrain the result.
+        if packages
+            .iter()
+            .any(|p| p.cp == inst.cp && p.slot == inst.slot && !p.already_installed)
+        {
+            continue;
+        }
+        let Some(imeta) = source
+            .versions_of(&inst.cp)
+            .into_iter()
+            .find(|m| m.version == inst.version && m.slot == inst.slot)
+        else {
+            continue;
+        };
+        let features = features_for(&imeta.eapi);
+        let mut atoms: Vec<(&NormAtom, bool)> = Vec::new();
+        collect_atoms(&imeta.rdepend, &inst.use_enabled, false, &mut atoms);
+        collect_atoms(&imeta.pdepend, &inst.use_enabled, false, &mut atoms);
+        for (atom, _) in atoms {
+            if atom.blocker != BlockerKind::None || !changed.contains(atom.cp.as_str()) {
+                continue;
+            }
+            if !atom_satisfied_post_solve(source, atom, packages, features) {
+                return Err(ResolveError::BrokenReverseDependency {
+                    dependent: inst.cp.clone(),
+                    dependency: atom.cp.clone(),
+                    atom: render_atom(atom),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `atom` is satisfied by the post-resolution world: any selected
+/// package, or any installed package of the atom's cp whose slot the solution
+/// did not change.
+fn atom_satisfied_post_solve<S: ResolveSource>(
+    source: &S,
+    atom: &NormAtom,
+    packages: &[ResolvedPackage],
+    features: moraine_eapi::EapiFeatures,
+) -> bool {
+    let selected_slots: BTreeSet<&str> = packages
+        .iter()
+        .filter(|p| p.cp == atom.cp)
+        .map(|p| p.slot.as_str())
+        .collect();
+    // Selected providers.
+    for p in packages.iter().filter(|p| p.cp == atom.cp) {
+        let slot_ok = atom.slot.as_ref().is_none_or(|s| &p.slot == s);
+        if slot_ok
+            && version_satisfies(atom, &p.version)
+            && use_deps_satisfied(
+                atom,
+                &p.use_enabled,
+                &p.use_enabled,
+                &p.use_enabled,
+                features,
+            )
+        {
+            return true;
+        }
+    }
+    // Installed providers in a slot the solution did not touch.
+    for inst in source.installed(&atom.cp) {
+        if selected_slots.contains(inst.slot.as_str()) {
+            continue;
+        }
+        let slot_ok = atom.slot.as_ref().is_none_or(|s| &inst.slot == s);
+        if slot_ok
+            && version_satisfies(atom, &inst.version)
+            && use_deps_satisfied(
+                atom,
+                &inst.use_enabled,
+                &inst.iuse,
+                &inst.use_enabled,
+                features,
+            )
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Collect the live atoms of a dependency node against the parent's USE,

@@ -48,6 +48,20 @@ pub enum ResolveError {
         /// Why the uninstall is refused.
         reason: String,
     },
+
+    /// A `--deep` consistency check found that a change to one package would
+    /// leave an installed reverse-dependency's atom unsatisfied.
+    #[error(
+        "{dependent} depends on `{atom}`, which the planned change to {dependency} no longer satisfies"
+    )]
+    BrokenReverseDependency {
+        /// The installed package whose dependency would be broken.
+        dependent: String,
+        /// The `category/package` being changed.
+        dependency: String,
+        /// The unsatisfied atom, rendered.
+        atom: String,
+    },
 }
 
 /// An error raised while serializing the merge order.

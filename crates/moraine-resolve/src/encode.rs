@@ -312,7 +312,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             }
             if atom.cp.starts_with("virtual/") {
                 match self.expand_virtual(atom, features) {
-                    Some(alts) => push_disjunction(&mut clauses, alts),
+                    Some(alts) => self.push_disjunction(&mut clauses, alts),
                     None => clauses.push(Clause::single(
                         atom.cp.clone(),
                         Term::positive(Range::full()),
@@ -330,7 +330,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                     Term::positive(Range::full()),
                 ));
             } else {
-                push_disjunction(&mut clauses, alts);
+                self.push_disjunction(&mut clauses, alts);
             }
         }
         Requirements { clauses, conflicts }
@@ -373,12 +373,12 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             if atom.cp.starts_with("virtual/")
                 && let Some(provider_alts) = self.expand_virtual(atom, features)
             {
-                push_disjunction(clauses, provider_alts);
+                self.push_disjunction(clauses, provider_alts);
                 return Ok(());
             }
             return Err(format!("no provider for {}", atom.cp));
         }
-        push_disjunction(clauses, alts);
+        self.push_disjunction(clauses, alts);
         Ok(())
     }
 
@@ -485,7 +485,7 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
         // conjunction (every atom required) and assert its blockers.
         let (_, chosen_atoms, chosen_blockers) = &branches[0];
         for alts in chosen_atoms {
-            push_disjunction(clauses, alts.clone());
+            self.push_disjunction(clauses, alts.clone());
         }
         for blocker in chosen_blockers {
             for alt in self.blocked_alternatives(blocker, Some(parent), parent_use, features) {
@@ -729,29 +729,35 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             version_satisfies(atom, &m.version) && self.source.is_provided(&atom.cp, &m.version)
         })
     }
-}
 
-/// Push a disjunction over alternatives, honoring Portage's greedy
-/// preference-order selection.
-///
-/// The generic solver only decides packages that are positively required, so a
-/// bare disjunction (whose alternatives appear only as negative terms) would
-/// never drive a selection on its own. Following `dep_zapdeps`, which picks the
-/// first satisfiable branch greedily, the encoder emits the most-preferred
-/// alternative as a positive requirement so it is selected, and also emits the
-/// full disjunction so the solver can fall back to another alternative when the
-/// preferred one is contradicted by a learned conflict.
-///
-/// Known limitation: multi-branch backtracking across `||` branches that each
-/// pull disjoint sub-trees collapses to the first branch; this matches Portage's
-/// greedy behavior for the common case and is revisited if the corpus demands
-/// deeper exploration.
-fn push_disjunction(clauses: &mut Vec<Clause<String, Version>>, alternatives: Vec<Alt>) {
-    if let Some((cp, term)) = alternatives.first() {
-        clauses.push(Clause::single(cp.clone(), term.clone()));
-    }
-    if alternatives.len() > 1 {
-        clauses.push(Clause::any_of(alternatives));
+    /// Push a disjunction over alternatives, forcing the most-preferred as a
+    /// positive requirement so the solver selects it, with the full disjunction
+    /// kept as a fallback for conflict-driven branch switching.
+    ///
+    /// The generic solver only decides packages that are positively required, so
+    /// a bare disjunction (whose alternatives appear only as negative terms)
+    /// would never drive a selection. Following `dep_zapdeps`, the encoder forces
+    /// one alternative using its preference bins: an alternative whose
+    /// `(cp, slot)` is already installed (preferred-installed) is chosen first;
+    /// otherwise the leading alternative, which `to_alternatives` has already
+    /// ordered highest-version-first (upgrade promotion). The graph-aware
+    /// "preferred-in-graph" bin has no analogue here, since the encoder runs
+    /// without access to the solver's partial solution.
+    fn push_disjunction(&self, clauses: &mut Vec<Clause<String, Version>>, alternatives: Vec<Alt>) {
+        let preferred = alternatives
+            .iter()
+            .find(|(key, _)| {
+                crate::provider::split_key(key)
+                    .map(|(cp, slot)| self.source.installed(cp).iter().any(|i| i.slot == slot))
+                    .unwrap_or(false)
+            })
+            .or_else(|| alternatives.first());
+        if let Some((cp, term)) = preferred {
+            clauses.push(Clause::single(cp.clone(), term.clone()));
+        }
+        if alternatives.len() > 1 {
+            clauses.push(Clause::any_of(alternatives));
+        }
     }
 }
 

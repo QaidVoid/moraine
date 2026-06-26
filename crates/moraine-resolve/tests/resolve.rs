@@ -892,3 +892,55 @@ fn installed_package_blocker_blocks_new_install() {
         other => panic!("expected an installed-package blocker, got {other:?}"),
     }
 }
+
+#[test]
+fn deep_catches_broken_reverse_dependency() {
+    // cat/consumer (installed) needs <cat/lib-2. Upgrading cat/lib to 2 under
+    // --update --deep would break the consumer, which the consistency pass
+    // catches.
+    let mut f = Fixture::new();
+    f.add(pkg("cat/lib", "1"));
+    f.add(pkg("cat/lib", "2"));
+    f.add(PkgSpec {
+        cp: "cat/consumer",
+        version: "1",
+        rdepend: "<cat/lib-2",
+        ..Default::default()
+    });
+    f.add_installed(installed("cat/lib", "1", "0", None, &[]));
+    f.add_installed(installed("cat/consumer", "1", "0", None, &[]));
+
+    // Without --deep the upgrade is allowed (no reverse-dep validation).
+    let sol = resolve_with(
+        &f,
+        &["cat/lib"],
+        Modifiers {
+            update: true,
+            ..Default::default()
+        },
+    )
+    .expect("resolves without deep");
+    assert_eq!(sol.package("cat/lib").unwrap().version.as_str(), "2");
+
+    // With --deep the broken consumer is caught.
+    let r = resolve_with(
+        &f,
+        &["cat/lib"],
+        Modifiers {
+            update: true,
+            deep: true,
+            ..Default::default()
+        },
+    );
+    match r {
+        Err(ResolveError::BrokenReverseDependency {
+            dependent,
+            dependency,
+            ..
+        }) => {
+            assert_eq!(dependent, "cat/consumer");
+            assert_eq!(dependency, "cat/lib");
+        }
+        other => panic!("expected a broken reverse dependency, got {other:?}"),
+    }
+}
