@@ -57,6 +57,35 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_parity_with_reference_portage() {
+        let i = Interner::new();
+        // A `.` is not permitted in a package name (PMS 2.1.2).
+        assert!(Atom::parse("dev-libs/foo.bar", eapi8(), &i).is_err());
+        // A bare package name must not end in a hyphen followed by digits.
+        assert!(Atom::parse("dev-libs/foo-1", eapi8(), &i).is_err());
+        // The bare `!flag` USE-dependency form is invalid; `-flag` is the spelling.
+        assert!(Atom::parse("dev-libs/foo[!bar]", eapi8(), &i).is_err());
+
+        // These remain valid and parse as before.
+        assert!(Atom::parse("dev-libs/foo[-bar]", eapi8(), &i).is_ok());
+        assert!(Atom::parse("dev-libs/foo[!bar?]", eapi8(), &i).is_ok());
+        assert!(Atom::parse("dev-libs/foo[!bar=]", eapi8(), &i).is_ok());
+        assert!(Atom::parse(">=dev-libs/openssl-3.0", eapi8(), &i).is_ok());
+        assert!(Atom::parse("=dev-libs/foo-1.2*", eapi8(), &i).is_ok());
+    }
+
+    #[test]
+    fn interior_hyphen_locks_the_cp_version_boundary() {
+        let i = Interner::new();
+        // The maximal package name `foo-bar` pairs with the trailing version
+        // `1.0`, not the interior `bar-1.0`.
+        let a = Atom::parse(">=dev-libs/foo-bar-1.0", eapi8(), &i).unwrap();
+        assert_eq!(a.package(), i.intern("foo-bar"));
+        let (_, ver) = a.version().unwrap();
+        assert_eq!(ver, &Version::parse("1.0").unwrap());
+    }
+
+    #[test]
     fn tilde_matches_any_revision() {
         let i = Interner::new();
         let a = Atom::parse("~dev-libs/openssl-3.0", eapi8(), &i).unwrap();

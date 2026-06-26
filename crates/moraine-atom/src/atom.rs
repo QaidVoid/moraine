@@ -484,14 +484,30 @@ fn parse_operator(s: &str) -> (Option<Operator>, &str) {
     }
 }
 
+/// Split a `cat/pkg-version` body into its `cat/pkg` and `version` halves,
+/// pairing the maximal package name with the trailing version as the anchored
+/// PMS `_cpv` grammar does. Boundaries are scanned from the right, taking the
+/// first `-` whose remainder parses as a version and whose preceding package
+/// name is itself valid (in particular not ending in a hyphen-digit segment).
 fn split_cp_version(cpv: &str) -> Option<(&str, &str)> {
     let bytes = cpv.as_bytes();
-    for (i, b) in bytes.iter().enumerate() {
-        if *b == b'-' && i > 0 && i + 1 < bytes.len() && Version::parse(&cpv[i + 1..]).is_ok() {
-            return Some((&cpv[..i], &cpv[i + 1..]));
+    for i in (1..bytes.len().saturating_sub(1)).rev() {
+        if bytes[i] != b'-' {
+            continue;
+        }
+        let (left, right) = (&cpv[..i], &cpv[i + 1..]);
+        if Version::parse(right).is_ok() && cp_package_is_valid(left) {
+            return Some((left, right));
         }
     }
     None
+}
+
+/// Whether the package half of a `cat/pkg` (the component after the last `/`)
+/// satisfies the package-name rules, used to anchor the cp/version boundary.
+fn cp_package_is_valid(cp: &str) -> bool {
+    let package = cp.rsplit('/').next().unwrap_or(cp);
+    is_valid_package(package) && !ends_in_version_like(package)
 }
 
 fn parse_cp(
@@ -500,16 +516,24 @@ fn parse_cp(
     err: &impl Fn(&'static str) -> AtomError,
 ) -> Result<(Symbol, Symbol), AtomError> {
     let (category, package) = cp.split_once('/').ok_or_else(|| err("missing category"))?;
-    if !is_valid_name(category) {
+    if !is_valid_category(category) {
         return Err(err("invalid category name"));
     }
-    if package.is_empty() || package.contains('/') || !is_valid_name(package) {
+    if package.is_empty() || package.contains('/') || !is_valid_package(package) {
         return Err(err("invalid package name"));
+    }
+    // PMS 2.1.2 terminal rule: a bare package name must not end in a hyphen
+    // followed by digits, so `dev-libs/foo-1` is an error rather than the
+    // package `foo-1`.
+    if ends_in_version_like(package) {
+        return Err(err("package name ends in a version-like segment"));
     }
     Ok((interner.intern(category), interner.intern(package)))
 }
 
-fn is_valid_name(s: &str) -> bool {
+/// PMS 2.1.1 category names: `[A-Za-z0-9_][A-Za-z0-9+_.-]*` (a `.` is allowed).
+/// Slot and sub-slot names share this character set.
+fn is_valid_category(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
@@ -519,6 +543,32 @@ fn is_valid_name(s: &str) -> bool {
     }
     s.bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'_' | b'-' | b'.'))
+}
+
+/// PMS 2.1.2 package names: `[A-Za-z0-9_][A-Za-z0-9+_-]*` (no `.`, unlike a
+/// category name).
+fn is_valid_package(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let first = s.as_bytes()[0];
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
+        return false;
+    }
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'_' | b'-'))
+}
+
+/// PMS 2.1.2: a package name must not end in a hyphen followed by one or more
+/// digits, which would be ambiguous with a version suffix.
+fn ends_in_version_like(pkg: &str) -> bool {
+    match pkg.rfind('-') {
+        Some(idx) => {
+            let tail = &pkg[idx + 1..];
+            !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -555,12 +605,12 @@ fn parse_slot(
         Some((a, b)) => (a, Some(b)),
         None => (body, None),
     };
-    if !is_valid_name(slot_name) {
+    if !is_valid_category(slot_name) {
         return Err(err("invalid slot name"));
     }
     *slot = Some(interner.intern(slot_name));
     if let Some(sub) = sub {
-        if !is_valid_name(sub) {
+        if !is_valid_category(sub) {
             return Err(err("invalid sub-slot name"));
         }
         *subslot = Some(interner.intern(sub));
@@ -644,10 +694,12 @@ fn parse_use_dep(
         return Err(err("invalid USE flag"));
     }
 
+    // PMS 8.2.6.4 USE-dependency forms: `flag`, `-flag`, `flag?`, `!flag?`,
+    // `flag=`, `!flag=`. The bare `!flag` (a `!` prefix with no `?`/`=` suffix)
+    // is not a valid form; the disable spelling is `-flag`.
     let kind = match (excl, minus, suffix) {
         (false, false, None) => UseDepKind::Enabled,
         (false, true, None) => UseDepKind::Disabled,
-        (true, false, None) => UseDepKind::Disabled,
         (false, false, Some('?')) => UseDepKind::EnabledIfParent,
         (true, false, Some('?')) => UseDepKind::DisabledIfParent,
         (false, false, Some('=')) => UseDepKind::EqualToParent,
