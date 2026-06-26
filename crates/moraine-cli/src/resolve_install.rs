@@ -32,7 +32,9 @@ use moraine_install::{
 };
 use moraine_repo::store::{StoredEntry, read_entries};
 use moraine_repo::{LoadedStore, RepoIndex, RepoSet, RepoStore, build_index_with, discover};
-use moraine_resolve::{RealSource, Task, TaskKind as ResolveTaskKind, resolve, serialize};
+use moraine_resolve::{
+    Modifiers, RealSource, Task, TaskKind as ResolveTaskKind, resolve_with, serialize,
+};
 use moraine_vdb::store::Store;
 use moraine_version::Version;
 
@@ -137,7 +139,13 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let source = RealSource::new(&repo_index, &vdb, &config).with_binaries(binary_cpvs);
     let atom_refs: Vec<&str> = request.atoms.iter().map(String::as_str).collect();
     let started = std::time::Instant::now();
-    let solution = resolve(&source, &atom_refs).map_err(|e| miette!("resolution failed:\n{e}"))?;
+    let modifiers = Modifiers {
+        update: request.update,
+        deep: request.deep,
+        newuse: request.newuse,
+    };
+    let solution = resolve_with(&source, &atom_refs, modifiers)
+        .map_err(|e| miette!("resolution failed:\n{e}"))?;
     let elapsed = started.elapsed();
     println!(
         "Dependency resolution took {:.2} s (backtracks: {})",

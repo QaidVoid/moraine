@@ -30,7 +30,7 @@ pub use error::{MergeOrderError, ResidualCycle, ResolveError};
 pub use graph::{EdgeFlags, MergeGraph, MergeNode, NodeKind};
 pub use provider::GentooProvider;
 pub use realsource::RealSource;
-pub use resolve::resolve;
+pub use resolve::{Modifiers, resolve, resolve_with};
 pub use serialize::{Task, TaskKind, serialize};
 pub use solution::{
     AutounmaskChange, DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, Root,

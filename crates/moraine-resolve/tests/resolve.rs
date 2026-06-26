@@ -4,7 +4,7 @@ mod fixture;
 
 use fixture::{Fixture, PkgSpec, installed};
 use moraine_resolve::solution::{DepClass, Root};
-use moraine_resolve::{ResolveError, resolve};
+use moraine_resolve::{Modifiers, ResolveError, resolve, resolve_with};
 
 fn pkg(cp: &'static str, version: &'static str) -> PkgSpec {
     PkgSpec {
@@ -812,4 +812,58 @@ fn subslot_rebuild_detected() {
         main.subslot_rebuild,
         "main should be flagged for subslot rebuild"
     );
+}
+
+#[test]
+fn update_prefers_highest_over_installed() {
+    let mut f = Fixture::new();
+    f.add(pkg("cat/a", "1"));
+    f.add(pkg("cat/a", "2"));
+    f.add_installed(installed("cat/a", "1", "0", None, &[]));
+
+    // Default: the installed version is kept rather than upgraded.
+    let sol = resolve(&f, &["cat/a"]).expect("resolves");
+    assert_eq!(sol.package("cat/a").unwrap().version.as_str(), "1");
+
+    // --update: the highest visible version is selected.
+    let sol = resolve_with(
+        &f,
+        &["cat/a"],
+        Modifiers {
+            update: true,
+            ..Default::default()
+        },
+    )
+    .expect("resolves");
+    assert_eq!(sol.package("cat/a").unwrap().version.as_str(), "2");
+}
+
+#[test]
+fn newuse_reinstalls_on_use_change() {
+    let mut f = Fixture::new();
+    // The repository build enables `foo`; the installed build has it disabled.
+    f.add(PkgSpec {
+        cp: "cat/a",
+        version: "1",
+        iuse: &["foo"],
+        use_enabled: &["foo"],
+        ..Default::default()
+    });
+    f.add_installed(installed("cat/a", "1", "0", None, &[]));
+
+    // Default: same version, so it is a no-op reinstall (already installed).
+    let sol = resolve(&f, &["cat/a"]).expect("resolves");
+    assert!(sol.package("cat/a").unwrap().already_installed);
+
+    // --newuse: the USE set changed, so the package is a reinstall, not a no-op.
+    let sol = resolve_with(
+        &f,
+        &["cat/a"],
+        Modifiers {
+            newuse: true,
+            ..Default::default()
+        },
+    )
+    .expect("resolves");
+    assert!(!sol.package("cat/a").unwrap().already_installed);
 }

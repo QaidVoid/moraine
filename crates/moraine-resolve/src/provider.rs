@@ -52,6 +52,7 @@ pub(crate) fn split_key(key: &str) -> Option<(&str, &str)> {
 pub struct GentooProvider<'s, S: ResolveSource> {
     source: &'s S,
     request: Vec<crate::depnode::NormAtom>,
+    modifiers: crate::resolve::Modifiers,
 }
 
 impl<'s, S: ResolveSource> GentooProvider<'s, S> {
@@ -61,13 +62,22 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
         GentooProvider {
             source,
             request: Vec::new(),
+            modifiers: crate::resolve::Modifiers::default(),
         }
     }
 
     /// Create a provider whose synthetic root depends on the given request
     /// atoms.
-    pub(crate) fn with_request(source: &'s S, request: Vec<crate::depnode::NormAtom>) -> Self {
-        GentooProvider { source, request }
+    pub(crate) fn with_request(
+        source: &'s S,
+        request: Vec<crate::depnode::NormAtom>,
+        modifiers: crate::resolve::Modifiers,
+    ) -> Self {
+        GentooProvider {
+            source,
+            request,
+            modifiers,
+        }
     }
 
     /// Borrow the underlying source.
@@ -137,18 +147,25 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
 
         // Prefer the version installed in this slot (Portage's default keeps an
         // installed package rather than needlessly upgrading or downgrading it),
-        // then the highest version.
+        // then the highest version. Under `--update` the installed-version
+        // preference is dropped so the highest visible version wins.
         let installed_versions: BTreeSet<Version> = installed
             .iter()
             .filter(|i| i.slot == slot)
             .map(|i| i.version.clone())
             .collect();
+        let update = self.modifiers.update;
         strict.sort_by(|a, b| {
-            let ai = installed_versions.contains(&a.version);
-            let bi = installed_versions.contains(&b.version);
+            let by_installed = if update {
+                std::cmp::Ordering::Equal
+            } else {
+                let ai = installed_versions.contains(&a.version);
+                let bi = installed_versions.contains(&b.version);
+                bi.cmp(&ai)
+            };
             let ab = self.source.has_binary(cp, &a.version);
             let bb = self.source.has_binary(cp, &b.version);
-            bi.cmp(&ai)
+            by_installed
                 .then_with(|| bb.cmp(&ab))
                 .then_with(|| b.version.cmp(&a.version))
         });
@@ -220,8 +237,16 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
         // An already-installed package at this exact version and slot is not
         // rebuilt, so its build-time dependencies are not pulled into the graph
         // (matching Portage's default and a binary install). A new install or
-        // upgrade still pulls its build deps.
-        let skip_build = self.source.installed_matches(cp, &meta.version, slot);
+        // upgrade still pulls its build deps. Under `--newuse` a USE change makes
+        // the package a reinstall, so its build deps are pulled again.
+        let newuse_rebuild = self.modifiers.newuse
+            && self
+                .source
+                .installed(cp)
+                .into_iter()
+                .find(|i| i.slot == slot)
+                .is_some_and(|inst| inst.use_enabled != resolved_use);
+        let skip_build = self.source.installed_matches(cp, &meta.version, slot) && !newuse_rebuild;
 
         match encoder.requirements(&meta, &resolved_use, features, skip_build) {
             Ok(reqs) => Dependencies::Known(reqs),

@@ -24,12 +24,38 @@ use crate::source::{Acceptability, PackageMeta, ResolveSource};
 /// uninstall.
 const PACKAGE_MANAGER: &str = "sys-apps/portage";
 
+/// Resolution behavior modifiers, mirroring `emerge`'s `--deep`/`--update`/
+/// `--newuse`. The default (all `false`) keeps the conservative behavior: an
+/// installed version is preferred and only an actually-changed package is
+/// rebuilt.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Modifiers {
+    /// Rank the highest visible version ahead of the installed one (`--update`).
+    pub update: bool,
+    /// Run the consistency pass across the installed dependency graph, not just
+    /// the request (`--deep`).
+    pub deep: bool,
+    /// Treat a USE-flag change against the installed package as a reinstall
+    /// trigger (`--newuse`).
+    pub newuse: bool,
+}
+
 /// Resolve a set of request atom strings against the given source, producing a
 /// resolved solution or a structured failure.
-#[instrument(skip(source), fields(requests = requests.len()))]
 pub fn resolve<S: ResolveSource>(
     source: &S,
     requests: &[&str],
+) -> Result<ResolvedSolution, ResolveError> {
+    resolve_with(source, requests, Modifiers::default())
+}
+
+/// Resolve with explicit [`Modifiers`]. [`resolve`] is this with the default
+/// (conservative) modifiers.
+#[instrument(skip(source, modifiers), fields(requests = requests.len()))]
+pub fn resolve_with<S: ResolveSource>(
+    source: &S,
+    requests: &[&str],
+    modifiers: Modifiers,
 ) -> Result<ResolvedSolution, ResolveError> {
     let interner = Interner::new();
     let mut request_atoms: Vec<NormAtom> = Vec::with_capacity(requests.len());
@@ -42,7 +68,7 @@ pub fn resolve<S: ResolveSource>(
         request_atoms.push(normalize_atom(&atom, &interner));
     }
 
-    let provider = GentooProvider::with_request(source, request_atoms.clone());
+    let provider = GentooProvider::with_request(source, request_atoms.clone(), modifiers);
     let root_version = Version::parse("0").expect("synthetic version parses");
 
     let (solution, stats) = solve_with_stats(&provider, REQUEST_CP.to_owned(), root_version);
@@ -55,7 +81,7 @@ pub fn resolve<S: ResolveSource>(
         }
     };
 
-    let mut resolved = assemble_solution(source, &decisions)?;
+    let mut resolved = assemble_solution(source, &decisions, modifiers)?;
     resolved.backtracks = stats.backtracks;
     Ok(resolved)
 }
@@ -64,6 +90,7 @@ pub fn resolve<S: ResolveSource>(
 fn assemble_solution<S: ResolveSource>(
     source: &S,
     decisions: &BTreeMap<String, Version>,
+    modifiers: Modifiers,
 ) -> Result<ResolvedSolution, ResolveError> {
     // The selected packages, grouped by cp so two slots of one cp both appear.
     let mut selected: BTreeMap<String, Vec<(Version, PackageMeta)>> = BTreeMap::new();
@@ -92,7 +119,11 @@ fn assemble_solution<S: ResolveSource>(
         for (version, meta) in slots {
             let resolved_use = source.resolved_use(meta);
             let features = features_for(&meta.eapi);
-            let already_installed = source.installed_matches(cp, version, &meta.slot);
+            // `--newuse` turns a USE change against the installed package into a
+            // reinstall, so an unchanged-version install with a different USE set
+            // is no longer treated as already installed.
+            let already_installed = source.installed_matches(cp, version, &meta.slot)
+                && !(modifiers.newuse && use_changed(source, cp, &meta.slot, &resolved_use));
 
             // Autounmask: a newly-merged package the solver could only reach via a
             // soft mask records the keyword/license change the user must accept.
@@ -205,6 +236,21 @@ fn assemble_solution<S: ResolveSource>(
         backtracks: 0,
         autounmask,
     })
+}
+
+/// Whether the resolved USE for a `(cp, slot)` differs from the installed
+/// package's recorded enabled USE, the `--newuse` reinstall trigger.
+fn use_changed<S: ResolveSource>(
+    source: &S,
+    cp: &str,
+    slot: &str,
+    resolved_use: &BTreeSet<String>,
+) -> bool {
+    source
+        .installed(cp)
+        .into_iter()
+        .find(|i| i.slot == slot)
+        .is_some_and(|inst| &inst.use_enabled != resolved_use)
 }
 
 /// Collect the live atoms of a dependency node against the parent's USE,
