@@ -1,5 +1,6 @@
 //! Package sets: `@system`, `@selected`, `@world`, and file-backed user sets.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::error::ConfigError;
@@ -67,6 +68,32 @@ pub fn world_set(selected: &[String], system: &[String]) -> Vec<String> {
     out
 }
 
+/// Build the `@preserved-rebuild` set: installed packages that link a soname now
+/// satisfied only by a preserved library, minus the preserved libraries' own
+/// owners.
+///
+/// `consumers` is each installed `(cp, required_sonames)`; `preserved_sonames`
+/// are the sonames whose only remaining provider is a preserved library;
+/// `preserved_owners` are the `cp`s that own a preserved library. A consumer
+/// requiring any preserved-only soname is selected for rebuild, excluding the
+/// owners themselves, mirroring `PreservedLibraryConsumerSet.load`.
+pub fn preserved_rebuild_set(
+    consumers: &[(String, Vec<String>)],
+    preserved_sonames: &BTreeSet<String>,
+    preserved_owners: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = consumers
+        .iter()
+        .filter(|(cp, sonames)| {
+            !preserved_owners.contains(cp) && sonames.iter().any(|s| preserved_sonames.contains(s))
+        })
+        .map(|(cp, _)| cp.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Resolve a file-backed user set by name from the set config search path.
 /// Returns the set's atom lines, or [`ConfigError::UnknownSet`] if no matching
 /// file exists.
@@ -120,6 +147,25 @@ mod tests {
         let layer = "*sys-apps/portage\napp-misc/profileonly\n";
         assert_eq!(profile_set(&[layer]), vec!["app-misc/profileonly"]);
         assert_eq!(system_set(&[layer]), vec!["sys-apps/portage"]);
+    }
+
+    #[test]
+    fn preserved_rebuild_selects_consumers_minus_owners() {
+        let consumers = vec![
+            ("app/uses-old".to_owned(), vec!["libold.so.1".to_owned()]),
+            (
+                "app/unaffected".to_owned(),
+                vec!["libcurrent.so.2".to_owned()],
+            ),
+            ("lib/owner".to_owned(), vec!["libold.so.1".to_owned()]),
+        ];
+        let preserved: BTreeSet<String> = ["libold.so.1".to_owned()].into_iter().collect();
+        let owners: BTreeSet<String> = ["lib/owner".to_owned()].into_iter().collect();
+
+        let set = preserved_rebuild_set(&consumers, &preserved, &owners);
+        // The consumer of the preserved soname is selected; the unaffected
+        // package and the preserved-lib owner are excluded.
+        assert_eq!(set, vec!["app/uses-old".to_owned()]);
     }
 
     #[test]

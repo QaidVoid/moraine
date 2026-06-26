@@ -182,5 +182,6 @@ pub fn installed(
             .iter()
             .map(|(c, s, ss)| ((*c).to_owned(), (*s).to_owned(), ss.map(|x| x.to_owned())))
             .collect(),
+        recorded_deps: std::collections::BTreeMap::new(),
     }
 }

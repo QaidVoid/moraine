@@ -41,6 +41,16 @@ pub struct Cli {
     #[arg(short = 'N', long)]
     pub newuse: bool,
 
+    /// Reinstall installed packages whose dependencies changed in the ebuild,
+    /// ignoring slot-operator bindings (`--changed-deps`).
+    #[arg(long = "changed-deps")]
+    pub changed_deps: bool,
+
+    /// Reinstall installed packages whose ebuild slot or sub-slot changed
+    /// (`--changed-slot`).
+    #[arg(long = "changed-slot")]
+    pub changed_slot: bool,
+
     /// Prompt before proceeding with any mutation.
     #[arg(short = 'a', long)]
     pub ask: bool,

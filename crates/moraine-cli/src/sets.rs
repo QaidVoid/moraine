@@ -31,7 +31,9 @@ pub enum ExpandError {
     #[error("unknown package set `@{name}`")]
     #[diagnostic(
         code(moraine::sets::unknown),
-        help("known sets are @world, @system, and @selected, plus any user sets")
+        help(
+            "known sets are @world, @system, @selected, @profile, and @preserved-rebuild, plus any user sets"
+        )
     )]
     UnknownSet {
         /// The unknown set name, without the leading `@`.

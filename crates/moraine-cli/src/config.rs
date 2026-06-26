@@ -82,6 +82,9 @@ pub struct ConfigContext {
     pub profile_set: Vec<String>,
     /// The `@world` set members.
     pub world: Vec<String>,
+    /// The `@preserved-rebuild` set members, computed from the preserved-libs
+    /// registry and installed soname data when that set is requested.
+    pub preserved_rebuild: Vec<String>,
 }
 
 impl ConfigContext {
@@ -182,6 +185,7 @@ impl ConfigContext {
             selected,
             profile_set: profile_set_members,
             world,
+            preserved_rebuild: Vec::new(),
         })
     }
 }
@@ -370,6 +374,7 @@ impl SetSource for ConfigContext {
             "system" => Some(self.system.clone()),
             "selected" => Some(self.selected.clone()),
             "profile" => Some(self.profile_set.clone()),
+            "preserved-rebuild" => Some(self.preserved_rebuild.clone()),
             _ => None,
         }
     }
@@ -443,6 +448,7 @@ mod tests {
             selected: vec!["app/editor".to_owned()],
             profile_set: Vec::new(),
             world: vec!["app/editor".to_owned(), "sys-apps/baselayout".to_owned()],
+            preserved_rebuild: Vec::new(),
         };
         assert_eq!(ctx.members("system").unwrap(), ctx.system);
         assert_eq!(ctx.members("selected").unwrap(), ctx.selected);

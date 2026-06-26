@@ -107,6 +107,15 @@ impl<'a> RealSource<'a> {
                 Some((format!("{c}/{p}"), bslot.unwrap_or_default(), bsub))
             })
             .collect();
+        let recorded_deps = moraine_vdb::record::DependKind::ALL
+            .iter()
+            .filter_map(|kind| {
+                record
+                    .depends
+                    .get(*kind)
+                    .map(|dep| (kind.name().to_owned(), dep.raw.clone()))
+            })
+            .collect();
         InstalledMeta {
             cp,
             version: record.version.clone(),
@@ -115,6 +124,7 @@ impl<'a> RealSource<'a> {
             use_enabled,
             iuse,
             slot_bindings,
+            recorded_deps,
         }
     }
 }

@@ -38,6 +38,12 @@ pub struct Modifiers {
     /// Treat a USE-flag change against the installed package as a reinstall
     /// trigger (`--newuse`).
     pub newuse: bool,
+    /// Reinstall an installed package whose ebuild dependencies changed,
+    /// comparing slot-stripped `*DEPEND` (`--changed-deps`).
+    pub changed_deps: bool,
+    /// Reinstall an installed package whose ebuild slot or sub-slot changed
+    /// (`--changed-slot`).
+    pub changed_slot: bool,
 }
 
 /// Resolve a set of request atom strings against the given source, producing a
@@ -124,32 +130,40 @@ fn rebuild_consumers<S: ResolveSource>(
     resolved: &ResolvedSolution,
     requested: &BTreeSet<String>,
 ) -> Vec<NormAtom> {
+    // Index the selected providers by cp once, so the installed scan is a single
+    // pass rather than a re-scan of the whole installed store per provider.
+    let mut providers: std::collections::HashMap<&str, Vec<&ResolvedPackage>> =
+        std::collections::HashMap::new();
+    let mut selected_cps: BTreeSet<&str> = BTreeSet::new();
+    for p in &resolved.packages {
+        providers.entry(p.cp.as_str()).or_default().push(p);
+        selected_cps.insert(p.cp.as_str());
+    }
+
     let mut out: Vec<NormAtom> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for provider in &resolved.packages {
-        for inst in source.installed_consumers_of(&provider.cp) {
-            if requested.contains(&inst.cp)
-                || seen.contains(&inst.cp)
-                || resolved.packages.iter().any(|p| p.cp == inst.cp)
-            {
-                continue;
+    for inst in source.installed_all() {
+        if requested.contains(&inst.cp)
+            || seen.contains(&inst.cp)
+            || selected_cps.contains(inst.cp.as_str())
+        {
+            continue;
+        }
+        let needs_rebuild = inst.slot_bindings.iter().any(|(dep_cp, bslot, bsub)| {
+            if bslot.is_empty() {
+                return false;
             }
-            let needs_rebuild = inst.slot_bindings.iter().any(|(dep_cp, bslot, bsub)| {
-                if dep_cp != &provider.cp || bslot.is_empty() || &provider.slot != bslot {
-                    return false;
-                }
-                // PMS 7.2: a missing sub-slot equals the slot.
-                let bound_sub = bsub.as_deref().unwrap_or(bslot.as_str());
-                let current_sub = provider
-                    .subslot
-                    .as_deref()
-                    .unwrap_or(provider.slot.as_str());
-                current_sub != bound_sub
-            });
-            if needs_rebuild {
-                seen.insert(inst.cp.clone());
-                out.push(bare_atom(&inst.cp));
-            }
+            // PMS 7.2: a missing sub-slot equals the slot.
+            let bound_sub = bsub.as_deref().unwrap_or(bslot.as_str());
+            providers.get(dep_cp.as_str()).is_some_and(|ps| {
+                ps.iter().any(|p| {
+                    &p.slot == bslot && p.subslot.as_deref().unwrap_or(p.slot.as_str()) != bound_sub
+                })
+            })
+        });
+        if needs_rebuild {
+            seen.insert(inst.cp.clone());
+            out.push(bare_atom(&inst.cp));
         }
     }
     out
@@ -248,6 +262,29 @@ fn assemble_solution<S: ResolveSource>(
                         subslot_rebuild = true;
                     }
                 }
+            }
+
+            // `--changed-slot`: the current ebuild declares a slot or sub-slot
+            // different from the installed package's recorded one (same version).
+            if modifiers.changed_slot
+                && source.installed(cp).iter().any(|inst| {
+                    &inst.version == version
+                        && (inst.slot != meta.slot || inst.subslot != meta.subslot)
+                })
+            {
+                subslot_rebuild = true;
+            }
+
+            // `--changed-deps`: the current ebuild's slot-stripped dependencies
+            // differ from those recorded for the installed package.
+            if modifiers.changed_deps
+                && source.installed(cp).iter().any(|inst| {
+                    &inst.version == version
+                        && !inst.recorded_deps.is_empty()
+                        && deps_changed(meta, inst)
+                })
+            {
+                subslot_rebuild = true;
             }
 
             let mut slot_bindings: Vec<SlotBinding> = Vec::new();
@@ -799,6 +836,84 @@ fn emit_virtual_edges<S: ResolveSource>(
         // Only the highest matching virtual contributes.
         break;
     }
+}
+
+/// Whether the current ebuild's slot-stripped dependencies differ from the
+/// installed package's recorded ones, the `--changed-deps` trigger.
+///
+/// Both sides are USE-reduced against the installed USE and rendered without
+/// slot/sub-slot, so only a structural dependency change (an atom added,
+/// removed, or its version constraint or USE-deps changed) is detected, not a
+/// slot-operator binding difference, mirroring Portage's `strip_slots`.
+fn deps_changed(meta: &PackageMeta, inst: &crate::source::InstalledMeta) -> bool {
+    let interner = Interner::new();
+    current_dep_set(meta, &inst.use_enabled) != recorded_dep_set(&inst.recorded_deps, &interner)
+}
+
+/// The slot-stripped atom set of the current ebuild's dependencies, USE-reduced
+/// against `parent_use`.
+fn current_dep_set(meta: &PackageMeta, parent_use: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for node in [
+        &meta.bdepend,
+        &meta.depend,
+        &meta.rdepend,
+        &meta.pdepend,
+        &meta.idepend,
+    ] {
+        let mut atoms: Vec<(&NormAtom, bool)> = Vec::new();
+        collect_atoms(node, parent_use, false, &mut atoms);
+        for (atom, _) in atoms {
+            out.insert(canonical_atom(atom));
+        }
+    }
+    out
+}
+
+/// The slot-stripped atom set parsed from recorded `*DEPEND` strings (already
+/// USE-reduced when recorded).
+fn recorded_dep_set(recorded: &BTreeMap<String, String>, interner: &Interner) -> BTreeSet<String> {
+    let empty = BTreeSet::new();
+    let mut out = BTreeSet::new();
+    for raw in recorded.values() {
+        let Ok(spec) = moraine_atom::DepSpec::parse(raw, PERMISSIVE, interner) else {
+            continue;
+        };
+        let node = crate::normalize::normalize_depspec(&spec, interner);
+        let mut atoms: Vec<(&NormAtom, bool)> = Vec::new();
+        collect_atoms(&node, &empty, false, &mut atoms);
+        for (atom, _) in atoms {
+            out.insert(canonical_atom(atom));
+        }
+    }
+    out
+}
+
+/// Render an atom without its slot, sub-slot, or slot operator, for a
+/// structural dependency comparison. USE-deps are reduced to a sorted flag list.
+fn canonical_atom(atom: &NormAtom) -> String {
+    let mut s = String::new();
+    match atom.blocker {
+        BlockerKind::None => {}
+        BlockerKind::Weak => s.push('!'),
+        BlockerKind::Strong => s.push_str("!!"),
+    }
+    if let Some((op, v)) = &atom.version {
+        s.push_str(op_str(*op));
+        s.push_str(&atom.cp);
+        s.push('-');
+        s.push_str(v.as_str());
+    } else {
+        s.push_str(&atom.cp);
+    }
+    if !atom.use_deps.is_empty() {
+        let mut flags: Vec<&str> = atom.use_deps.iter().map(|u| u.flag.as_str()).collect();
+        flags.sort_unstable();
+        s.push('[');
+        s.push_str(&flags.join(","));
+        s.push(']');
+    }
+    s
 }
 
 /// Render a normalized atom for diagnostics.

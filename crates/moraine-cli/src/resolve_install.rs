@@ -99,6 +99,18 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         &interner,
     );
 
+    // Compute `@preserved-rebuild` from the preserved-libs registry and the
+    // installed soname data, but only when that set is actually requested.
+    let ctx_owned;
+    let ctx: &ConfigContext = if cli.targets.iter().any(|t| t == "@preserved-rebuild") {
+        let mut owned = ctx.clone();
+        owned.preserved_rebuild = compute_preserved_rebuild(&vdb, &wr.state_dir);
+        ctx_owned = owned;
+        &ctx_owned
+    } else {
+        ctx
+    };
+
     // Resolve each bare package name to a category, then expand sets and atoms.
     let qualified = qualify_targets(&cli.targets, &repo_index)?;
     let request = crate::sets::expand(
@@ -143,6 +155,8 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         update: request.update,
         deep: request.deep,
         newuse: request.newuse,
+        changed_deps: cli.changed_deps,
+        changed_slot: cli.changed_slot,
     };
     let solution = resolve_with(&source, &atom_refs, modifiers)
         .map_err(|e| miette!("resolution failed:\n{e}"))?;
@@ -888,6 +902,46 @@ fn explicit_heads(cli: &Cli) -> BTreeSet<String> {
         .collect()
 }
 
+/// Compute the `@preserved-rebuild` set: installed packages requiring a soname
+/// kept alive only by a preserved library, minus the preserved libraries' own
+/// owners. Returns empty when the registry has no preserved libraries.
+fn compute_preserved_rebuild(vdb: &Store, state_dir: &Path) -> Vec<String> {
+    let registry = moraine_merge::PreservedLibs::load(&state_dir.join("preserved-libs"))
+        .unwrap_or_else(|_| moraine_merge::PreservedLibs::new());
+    if registry.is_empty() {
+        return Vec::new();
+    }
+    let preserved_sonames: BTreeSet<String> = registry
+        .entries()
+        .iter()
+        .map(|e| e.soname.clone())
+        .collect();
+    let preserved_owners: BTreeSet<String> = registry
+        .entries()
+        .iter()
+        .map(|e| {
+            let (category, pf) = split_cpv(&e.cpv);
+            let (pn, _) = split_pf(&pf);
+            format!("{category}/{pn}")
+        })
+        .collect();
+    let interner = vdb.interner();
+    let consumers: Vec<(String, Vec<String>)> = vdb
+        .records()
+        .iter()
+        .filter_map(|record| {
+            let category = interner.resolve(record.category)?;
+            let package = interner.resolve(record.package)?;
+            let sonames = vdb
+                .required_sonames(record)
+                .filter_map(|s| interner.resolve(s).map(|x| x.to_string()))
+                .collect();
+            Some((format!("{category}/{package}"), sonames))
+        })
+        .collect();
+    moraine_config::sets::preserved_rebuild_set(&consumers, &preserved_sonames, &preserved_owners)
+}
+
 /// Split a `category/package-version` into `(category, pf)`.
 fn split_cpv(cpv: &str) -> (String, String) {
     match cpv.split_once('/') {
@@ -1164,6 +1218,7 @@ mod tests {
             selected: Vec::new(),
             profile_set: Vec::new(),
             world: Vec::new(),
+            preserved_rebuild: Vec::new(),
         };
         let planner = CliPlanner {
             repo_set: &repo_set,

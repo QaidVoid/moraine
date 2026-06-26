@@ -64,6 +64,10 @@ pub struct InstalledMeta {
     pub iuse: BTreeSet<String>,
     /// Recorded `:=`/`:slot=` bindings: `(dependency_cp, slot, subslot)`.
     pub slot_bindings: Vec<(String, String, Option<String>)>,
+    /// The recorded `*DEPEND` strings keyed by family (`DEPEND`, `RDEPEND`, ...),
+    /// used by `--changed-deps` to compare against the current ebuild. Empty for
+    /// sources that do not track recorded dependencies.
+    pub recorded_deps: std::collections::BTreeMap<String, String>,
 }
 
 /// The configuration change needed to make a soft-masked package installable,
@@ -146,25 +150,10 @@ pub trait ResolveSource {
     fn installed(&self, cp: &str) -> Vec<InstalledMeta>;
 
     /// Every installed package across all `cp`s. Used by the installed-package
-    /// blocker scan to read installed packages' blocker atoms. The default is
-    /// empty for sources that do not expose a full installed store.
+    /// blocker scan and the slot-operator reverse-dependency pull-in. The default
+    /// is empty for sources that do not expose a full installed store.
     fn installed_all(&self) -> Vec<InstalledMeta> {
         Vec::new()
-    }
-
-    /// The installed packages that recorded a `:=` slot-operator binding naming
-    /// `provider_cp`. Used to pull a changed provider's reverse-dependencies into
-    /// resolution for a slot-operator rebuild. The default filters
-    /// [`installed_all`](Self::installed_all).
-    fn installed_consumers_of(&self, provider_cp: &str) -> Vec<InstalledMeta> {
-        self.installed_all()
-            .into_iter()
-            .filter(|inst| {
-                inst.slot_bindings
-                    .iter()
-                    .any(|(dep_cp, _, _)| dep_cp == provider_cp)
-            })
-            .collect()
     }
 
     /// Whether any installed package satisfies `cp` at `version` (used to mark

@@ -1021,3 +1021,70 @@ fn slot_operator_binding_only_for_satisfied_branch() {
         "no binding for the unlinked branch cat/a"
     );
 }
+
+#[test]
+fn changed_slot_forces_reinstall() {
+    // The installed cat/a-1 recorded sub-slot 1; the current ebuild now declares
+    // sub-slot 2. --changed-slot reinstalls it.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/a",
+        version: "1",
+        slot: "0",
+        subslot: Some("2"),
+        ..Default::default()
+    });
+    f.add_installed(installed("cat/a", "1", "0", Some("1"), &[]));
+
+    let sol = resolve(&f, &["cat/a"]).expect("resolves");
+    assert!(!sol.package("cat/a").unwrap().subslot_rebuild);
+
+    let sol = resolve_with(
+        &f,
+        &["cat/a"],
+        Modifiers {
+            changed_slot: true,
+            ..Default::default()
+        },
+    )
+    .expect("resolves");
+    assert!(
+        sol.package("cat/a").unwrap().subslot_rebuild,
+        "a sub-slot change must force a reinstall under --changed-slot"
+    );
+}
+
+#[test]
+fn changed_deps_forces_reinstall() {
+    // The installed cat/a-1 recorded RDEPEND cat/old; the current ebuild now
+    // RDEPENDs cat/new. --changed-deps reinstalls it.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/a",
+        version: "1",
+        rdepend: "cat/new",
+        ..Default::default()
+    });
+    f.add(pkg("cat/new", "1"));
+    let mut inst = installed("cat/a", "1", "0", None, &[]);
+    inst.recorded_deps
+        .insert("RDEPEND".to_owned(), "cat/old".to_owned());
+    f.add_installed(inst);
+
+    let sol = resolve(&f, &["cat/a"]).expect("resolves");
+    assert!(!sol.package("cat/a").unwrap().subslot_rebuild);
+
+    let sol = resolve_with(
+        &f,
+        &["cat/a"],
+        Modifiers {
+            changed_deps: true,
+            ..Default::default()
+        },
+    )
+    .expect("resolves");
+    assert!(
+        sol.package("cat/a").unwrap().subslot_rebuild,
+        "a dependency change must force a reinstall under --changed-deps"
+    );
+}
