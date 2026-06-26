@@ -150,6 +150,11 @@ pub struct BuildOptions {
     pub buildpkg: bool,
     /// Emit a binary package and skip merging (`--buildpkgonly`).
     pub buildpkgonly: bool,
+    /// `FEATURES=buildsyspkg`: emit a binary package for `@system` members even
+    /// when global `buildpkg` is off.
+    pub buildsyspkg: bool,
+    /// The `category/package` heads of the `@system` set, used by `buildsyspkg`.
+    pub system_cps: std::collections::BTreeSet<String>,
     /// The package directory to write binary packages into.
     pub pkgdir: PathBuf,
     /// The container write options.
@@ -163,6 +168,8 @@ impl Default for BuildOptions {
         BuildOptions {
             buildpkg: false,
             buildpkgonly: false,
+            buildsyspkg: false,
+            system_cps: std::collections::BTreeSet::new(),
             pkgdir: PathBuf::from("/var/cache/binpkgs"),
             write_options: WriteOptions::default(),
             binpkg_format: moraine_binpkg::BinpkgFormat::default(),
@@ -202,7 +209,10 @@ impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
         let scan = moraine_build::scan_image_sonames(&outcome.image_dir);
         let build_time = read_line_u64(&outcome.build_info_dir.join("BUILD_TIME"));
 
-        if self.options.buildpkg || self.options.buildpkgonly {
+        // `buildsyspkg` emits a binary package for an `@system` member even when
+        // global `buildpkg` is off.
+        let syspkg = self.options.buildsyspkg && self.options.system_cps.contains(&task.cp);
+        if self.options.buildpkg || self.options.buildpkgonly || syspkg {
             let (category, _) = task.cp.split_once('/').unwrap_or((task.cp.as_str(), ""));
             let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
             let dir = self.options.pkgdir.join(category);

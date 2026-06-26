@@ -21,6 +21,156 @@ use tracing::instrument;
 
 use crate::sets::SetSource;
 
+/// The recognized `FEATURES` tokens, copied from Portage's `SUPPORTED_FEATURES`
+/// (`lib/portage/const.py`). A token outside this set is "unknown" and is warned
+/// about or filtered per `unknown-features-warn`/`unknown-features-filter`.
+pub const SUPPORTED_FEATURES: &[&str] = &[
+    "assume-digests",
+    "binpkg-docompress",
+    "binpkg-dostrip",
+    "binpkg-ignore-signature",
+    "binpkg-logs",
+    "binpkg-multi-instance",
+    "binpkg-request-signature",
+    "binpkg-signing",
+    "buildpkg",
+    "buildpkg-live",
+    "buildpkg-proactive",
+    "buildsyspkg",
+    "candy",
+    "case-insensitive-fs",
+    "ccache",
+    "chflags",
+    "clean-logs",
+    "collision-protect",
+    "compress-build-logs",
+    "compress-index",
+    "compressdebug",
+    "config-protect-if-modified",
+    "dedupdebug",
+    "digest",
+    "distcc",
+    "distlocks",
+    "downgrade-backup",
+    "ebuild-locks",
+    "fail-clean",
+    "fakeroot",
+    "fixlafiles",
+    "force-mirror",
+    "getbinpkg",
+    "gpg-keepalive",
+    "home-dir-template-copy",
+    "icecream",
+    "installsources",
+    "ipc-sandbox",
+    "jobserver-token",
+    "keeptemp",
+    "keepwork",
+    "lmirror",
+    "merge-sync",
+    "merge-wait",
+    "metadata-transfer",
+    "mirror",
+    "mount-sandbox",
+    "multilib-strict",
+    "network-sandbox",
+    "network-sandbox-proxy",
+    "news",
+    "noauto",
+    "noclean",
+    "nodoc",
+    "noinfo",
+    "noman",
+    "nostrip",
+    "notitles",
+    "packdebug",
+    "parallel-fetch",
+    "parallel-install",
+    "pid-sandbox",
+    "pkgdir-index-trusted",
+    "prelink-checksums",
+    "preserve-libs",
+    "protect-owned",
+    "python-trace",
+    "qa-unresolved-soname-deps",
+    "sandbox",
+    "selinux",
+    "sesandbox",
+    "sfperms",
+    "sign",
+    "skiprocheck",
+    "split-elog",
+    "split-log",
+    "splitdebug",
+    "strict",
+    "strict-keepdir",
+    "stricter",
+    "suidctl",
+    "test",
+    "test-fail-continue",
+    "unknown-features-filter",
+    "unknown-features-warn",
+    "unmerge-backup",
+    "unmerge-logs",
+    "unmerge-orphans",
+    "unprivileged",
+    "userfetch",
+    "userpriv",
+    "usersandbox",
+    "usersync",
+    "warn-on-large-env",
+    "webrsync-gpg",
+    "xattr",
+];
+
+/// Resolve whether an incremental `FEATURES` token is enabled, honoring a later
+/// `-token` negation; the final occurrence wins.
+fn feature_enabled(raw: &[String], name: &str, default: bool) -> bool {
+    let neg = format!("-{name}");
+    let mut on = default;
+    for token in raw {
+        if token == name {
+            on = true;
+        } else if *token == neg {
+            on = false;
+        }
+    }
+    on
+}
+
+/// Validate `FEATURES` tokens against [`SUPPORTED_FEATURES`]. Unknown tokens are
+/// warned about when `unknown-features-warn` is set (default on) and dropped from
+/// the effective set when `unknown-features-filter` is set, matching Portage.
+fn validate_features(raw: Vec<String>) -> Vec<String> {
+    let warn = feature_enabled(&raw, "unknown-features-warn", true);
+    let filter = feature_enabled(&raw, "unknown-features-filter", false);
+
+    let is_known = |token: &str| {
+        let name = token.strip_prefix('-').unwrap_or(token);
+        name.is_empty() || SUPPORTED_FEATURES.contains(&name)
+    };
+
+    if warn {
+        let unknown: Vec<&str> = raw
+            .iter()
+            .map(String::as_str)
+            .filter(|t| !is_known(t))
+            .collect();
+        if !unknown.is_empty() {
+            tracing::warn!(
+                "FEATURES variable contains unknown value(s): {}",
+                unknown.join(", ")
+            );
+        }
+    }
+
+    if filter {
+        raw.into_iter().filter(|t| is_known(t)).collect()
+    } else {
+        raw
+    }
+}
+
 /// Global root and profile selection from the command line.
 #[derive(Debug, Clone, Default)]
 pub struct Roots {
@@ -147,7 +297,7 @@ impl ConfigContext {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         };
-        let features = tokens("FEATURES");
+        let features = validate_features(tokens("FEATURES"));
         // When configuration leaves CONFIG_PROTECT unset, fall back to the
         // make.globals defaults so a minimal config root still protects `/etc`
         // and masks `/etc/env.d`.
@@ -442,6 +592,46 @@ mod tests {
         let roots = Roots::default();
         assert_eq!(roots.root_dir(), PathBuf::from("/"));
         assert_eq!(roots.config_dir(), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn features_validation_warns_and_filters_unknown() {
+        // Without the filter token, unknown values are retained (only warned).
+        let kept = validate_features(vec![
+            "ccache".into(),
+            "bogus-feature".into(),
+            "candy".into(),
+        ]);
+        assert!(kept.contains(&"bogus-feature".to_owned()));
+
+        // With the filter token, unknown values are dropped; known ones stay.
+        let filtered = validate_features(vec![
+            "unknown-features-filter".into(),
+            "ccache".into(),
+            "bogus-feature".into(),
+            "notitles".into(),
+        ]);
+        assert!(!filtered.contains(&"bogus-feature".to_owned()));
+        assert!(filtered.contains(&"ccache".to_owned()));
+        assert!(filtered.contains(&"notitles".to_owned()));
+    }
+
+    #[test]
+    fn feature_negation_respects_last_occurrence() {
+        assert!(!feature_enabled(
+            &[
+                "unknown-features-warn".into(),
+                "-unknown-features-warn".into()
+            ],
+            "unknown-features-warn",
+            true,
+        ));
+        assert!(feature_enabled(&[], "unknown-features-warn", true));
+        assert!(feature_enabled(
+            &["unknown-features-filter".into()],
+            "unknown-features-filter",
+            false,
+        ));
     }
 
     #[test]

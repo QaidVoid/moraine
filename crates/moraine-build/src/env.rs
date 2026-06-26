@@ -179,6 +179,9 @@ impl EnvBuilder {
         // Root and prefix variables, EAPI-gated.
         Self::insert_root_vars(&mut base, &ident, &config, features)?;
 
+        // ccache/distcc compiler masquerade, gated on FEATURES.
+        Self::insert_masquerade_vars(&mut base, &config);
+
         Ok(EnvBuilder {
             ident,
             config,
@@ -232,6 +235,41 @@ impl EnvBuilder {
 
         let _ = ident;
         Ok(())
+    }
+
+    /// Wire the `ccache`/`distcc` compiler masquerade into the environment when
+    /// the corresponding `FEATURES` token is set: prepend the masquerade bin
+    /// directory to `PATH` and default `CCACHE_DIR`/`DISTCC_DIR` when unset.
+    /// `CCACHE_SIZE` is exported via the configured vars when the user sets it.
+    /// The masquerade tools create their cache directories on first use, so this
+    /// stays a pure environment computation with no filesystem side effects.
+    fn insert_masquerade_vars(base: &mut BTreeMap<String, String>, config: &ConfigEnv) {
+        let eprefix = config.eprefix.as_str();
+        let mut masquerade: Vec<String> = Vec::new();
+        if config.has_feature("ccache") {
+            masquerade.push(format!("{eprefix}/usr/lib/ccache/bin"));
+            base.entry("CCACHE_DIR".to_string())
+                .or_insert_with(|| format!("{eprefix}/var/tmp/ccache"));
+        }
+        if config.has_feature("distcc") {
+            masquerade.push(format!("{eprefix}/usr/lib/distcc/bin"));
+            base.entry("DISTCC_DIR".to_string())
+                .or_insert_with(|| format!("{eprefix}/var/tmp/portage/.distcc"));
+        }
+        if masquerade.is_empty() {
+            return;
+        }
+        let existing = base
+            .get("PATH")
+            .cloned()
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_default();
+        let path = if existing.is_empty() {
+            masquerade.join(":")
+        } else {
+            format!("{}:{existing}", masquerade.join(":"))
+        };
+        base.insert("PATH".to_string(), path);
     }
 
     /// The EAPI feature table for the package.
@@ -450,6 +488,28 @@ mod tests {
         assert_eq!(env.get("MAKEOPTS"), Some("-j4"));
         assert_eq!(env.get("FEATURES"), Some("sandbox"));
         assert_eq!(env.get("EAPI"), Some("8"));
+    }
+
+    #[test]
+    fn ccache_distcc_masquerade_wires_path_and_dirs() {
+        let (_t, layout) = layout();
+        let cfg = ConfigEnv::rooted(["ccache".to_string(), "distcc".to_string()]);
+        let b = EnvBuilder::new(ident("8"), cfg, &layout).unwrap();
+        let env = b.for_phase("compile", "src_compile");
+        let path = env.get("PATH").unwrap();
+        assert!(path.contains("/usr/lib/ccache/bin"));
+        assert!(path.contains("/usr/lib/distcc/bin"));
+        assert_eq!(env.get("CCACHE_DIR"), Some("/var/tmp/ccache"));
+        assert!(env.get("DISTCC_DIR").unwrap().contains(".distcc"));
+    }
+
+    #[test]
+    fn masquerade_absent_without_features() {
+        let (_t, layout) = layout();
+        let cfg = ConfigEnv::rooted([]);
+        let b = EnvBuilder::new(ident("8"), cfg, &layout).unwrap();
+        let env = b.for_phase("compile", "src_compile");
+        assert!(env.get("CCACHE_DIR").is_none());
     }
 
     #[test]

@@ -51,6 +51,7 @@ struct BinaryPrefs {
     usepkg: bool,
     buildpkg: bool,
     buildpkgonly: bool,
+    buildsyspkg: bool,
 }
 
 impl BinaryPrefs {
@@ -62,6 +63,8 @@ impl BinaryPrefs {
             usepkg: cli.usepkg || cli.getbinpkg || has("getbinpkg"),
             buildpkg: cli.buildpkg || has("buildpkg"),
             buildpkgonly: cli.buildpkgonly,
+            // `buildsyspkg` emits binaries only for `@system` members.
+            buildsyspkg: has("buildsyspkg"),
         }
     }
 }
@@ -271,6 +274,8 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let options = BuildOptions {
         buildpkg: prefs.buildpkg,
         buildpkgonly: prefs.buildpkgonly,
+        buildsyspkg: prefs.buildsyspkg,
+        system_cps: ctx.system.iter().map(|atom| cp_of_atom(atom)).collect(),
         pkgdir: pkgdir.clone(),
         binpkg_format: moraine_binpkg::BinpkgFormat::parse(
             ctx.vars.get("BINPKG_FORMAT").unwrap_or("gpkg"),
@@ -1205,6 +1210,7 @@ mod tests {
             usepkg,
             buildpkg: false,
             buildpkgonly: false,
+            buildsyspkg: false,
         }
     }
 
