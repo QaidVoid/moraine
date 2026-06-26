@@ -396,6 +396,11 @@ pub fn sync(cli: &Cli, roots: &Roots) -> Result<()> {
     if let Err(e) = apply_package_moves(&repo_set, &wr, roots) {
         eprintln!("warning: package-move replay failed: {e}");
     }
+
+    // Scan the freshly-synced trees for relevant unread news and report counts.
+    if let Ok(ctx) = ConfigContext::load(roots) {
+        crate::news_state::display_after_action(&ctx, &wr.vdb_dir, &wr.eroot, &repo_set);
+    }
     Ok(())
 }
 

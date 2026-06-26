@@ -15,6 +15,7 @@ pub mod corpus;
 pub mod diagnostics;
 pub mod elog;
 pub mod news;
+pub mod news_state;
 pub mod plan;
 pub mod render;
 pub mod resolve_install;
@@ -123,10 +124,6 @@ pub fn dispatch(cli: &Cli) -> miette::Result<()> {
 /// Render the read-only resolution plan: the resolved targets, any unread news,
 /// and the timing breakdown. This is the `--pretend` view of the install action.
 pub fn render_plan(cli: &Cli) -> miette::Result<()> {
-    use crate::config::installed_set_heads;
-    use crate::news::{NewsEnv, render_news, unread_relevant};
-    use std::collections::BTreeSet;
-
     if cli.targets.is_empty() {
         println!("No targets given. Pass atoms or package sets such as @world.");
         return Ok(());
@@ -158,29 +155,9 @@ pub fn render_plan(cli: &Cli) -> miette::Result<()> {
         println!("Modifiers: {}", modifiers.join(", "));
     }
 
-    let roots = run::roots_from(cli);
-    let installed = installed_set_heads(&ctx);
-    let env = NewsEnv {
-        installed,
-        profile: ctx
-            .profile
-            .nodes
-            .last()
-            .map(|n| n.path.display().to_string())
-            .unwrap_or_default(),
-        arch: ctx.arch.clone(),
-    };
-    let news_dir = roots.root_dir().join("var/db/repos/gentoo/metadata/news");
-    let unread: BTreeSet<String> = BTreeSet::new();
-    match unread_relevant(&news_dir, &env, &unread) {
-        Ok(items) => {
-            let rendered = render_news(&items);
-            if !rendered.is_empty() {
-                print!("{rendered}");
-            }
-        }
-        Err(error) => tracing::warn!(%error, "could not read news"),
-    }
+    // News for freshly-resolved targets is surfaced after the real install and
+    // after sync, not in this read-only pretend view.
+    let _ = &ctx;
 
     if cli.timing || cli.is_verbose() {
         print!("{}", timing.report());

@@ -1,16 +1,21 @@
 //! GLEP 42 news item reading, relevance, and display.
 //!
 //! News items live under each repository's `metadata/news` directory, one
-//! directory per item holding a `*.en.txt` body. The header carries
-//! `Display-If-Installed`, `Display-If-Profile`, and `Display-If-Keyword`
-//! restrictions. This module parses items, evaluates relevance against the
-//! environment, and reads the per-repository unread state. It never writes: it
-//! does not mark items read or modify any skip state.
+//! directory per item holding a `<name>.<lang>.txt` body. The header carries
+//! `News-Item-Format`, `Display-If-Installed`, `Display-If-Profile`, and
+//! `Display-If-Keyword`. This module parses items, validates them by format,
+//! evaluates relevance against the environment with full atom and repo-relative
+//! profile semantics, and reads bodies with a language fallback. State writing
+//! lives in [`crate::news_state`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use miette::Diagnostic;
+use moraine_atom::{Atom, PackageRef};
+use moraine_common::Interner;
+use moraine_eapi::{EapiFeatures, features_for};
+use moraine_version::Version;
 use thiserror::Error;
 use tracing::instrument;
 
@@ -40,6 +45,21 @@ pub enum Restriction {
     IfKeyword(String),
 }
 
+/// An installed package, for full-atom `Display-If-Installed` matching.
+#[derive(Debug, Clone)]
+pub struct InstalledPkg {
+    /// The package category.
+    pub category: String,
+    /// The package name.
+    pub package: String,
+    /// The installed version.
+    pub version: Version,
+    /// The installed slot.
+    pub slot: String,
+    /// The installed sub-slot, if any.
+    pub subslot: Option<String>,
+}
+
 /// A parsed news item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewsItem {
@@ -47,6 +67,8 @@ pub struct NewsItem {
     pub name: String,
     /// The `Title:` header.
     pub title: String,
+    /// The `News-Item-Format:` header value (for example `1.0` or `2.0`).
+    pub format: String,
     /// The display restrictions declared by the item.
     pub restrictions: Vec<Restriction>,
 }
@@ -54,21 +76,31 @@ pub struct NewsItem {
 /// The environment a news item's relevance is evaluated against.
 #[derive(Debug, Clone, Default)]
 pub struct NewsEnv {
-    /// The installed `category/package` set.
-    pub installed: BTreeSet<String>,
-    /// The active profile path, as a repository-relative string.
+    /// The installed packages, for full-atom matching.
+    pub installed: Vec<InstalledPkg>,
+    /// The active profile path, repository-relative.
     pub profile: String,
     /// The system arch keyword, for example `amd64`.
     pub arch: String,
 }
 
+/// The EAPI a news item's `Display-If-Installed` atoms are validated under,
+/// gated by the item format: `0` for `1.*`, `5` for `2.*`, `None` otherwise.
+fn format_eapi(format: &str) -> Option<&'static str> {
+    if format.starts_with("1.") {
+        Some("0")
+    } else if format.starts_with("2.") {
+        Some("5")
+    } else {
+        None
+    }
+}
+
 impl NewsItem {
     /// Parse a news item from its header text and directory name.
-    ///
-    /// Only the header keys this phase evaluates are retained. Unknown headers
-    /// and the body are ignored.
     pub fn parse(name: &str, header: &str) -> NewsItem {
         let mut title = String::new();
+        let mut format = String::new();
         let mut restrictions = Vec::new();
         for line in header.lines() {
             let Some((key, value)) = line.split_once(':') else {
@@ -77,6 +109,7 @@ impl NewsItem {
             let value = value.trim();
             match key.trim() {
                 "Title" => title = value.to_owned(),
+                "News-Item-Format" => format = value.to_owned(),
                 "Display-If-Installed" => {
                     restrictions.push(Restriction::IfInstalled(value.to_owned()))
                 }
@@ -88,8 +121,25 @@ impl NewsItem {
         NewsItem {
             name: name.to_owned(),
             title,
+            format,
             restrictions,
         }
+    }
+
+    /// Whether the item is structurally valid: its format matches `[12].*` and
+    /// every restriction is well-formed under that format's EAPI. An invalid item
+    /// is skipped entirely, mirroring `news.py`'s validation.
+    pub fn is_valid(&self) -> bool {
+        let Some(eapi) = format_eapi(&self.format) else {
+            return false;
+        };
+        let features = features_for(eapi);
+        let interner = Interner::new();
+        self.restrictions.iter().all(|r| match r {
+            Restriction::IfInstalled(atom) => Atom::parse(atom, features, &interner).is_ok(),
+            Restriction::IfProfile(path) => !path.is_empty(),
+            Restriction::IfKeyword(_) => true,
+        })
     }
 
     /// Whether the item is relevant in the given environment.
@@ -98,37 +148,26 @@ impl NewsItem {
     /// kinds are joint requirements. An item with no restrictions is always
     /// relevant.
     pub fn is_relevant(&self, env: &NewsEnv) -> bool {
-        let installed: Vec<&String> = self
-            .restrictions
-            .iter()
-            .filter_map(|r| match r {
-                Restriction::IfInstalled(a) => Some(a),
-                _ => None,
-            })
-            .collect();
-        let profiles: Vec<&String> = self
-            .restrictions
-            .iter()
-            .filter_map(|r| match r {
-                Restriction::IfProfile(p) => Some(p),
-                _ => None,
-            })
-            .collect();
-        let keywords: Vec<&String> = self
-            .restrictions
-            .iter()
-            .filter_map(|r| match r {
-                Restriction::IfKeyword(k) => Some(k),
-                _ => None,
-            })
-            .collect();
+        let features = features_for(format_eapi(&self.format).unwrap_or("0"));
+        let mut installed = Vec::new();
+        let mut profiles = Vec::new();
+        let mut keywords = Vec::new();
+        for r in &self.restrictions {
+            match r {
+                Restriction::IfInstalled(a) => installed.push(a),
+                Restriction::IfProfile(p) => profiles.push(p),
+                Restriction::IfKeyword(k) => keywords.push(k),
+            }
+        }
 
         let installed_ok = installed.is_empty()
             || installed
                 .iter()
-                .any(|atom| installed_matches(&env.installed, atom));
-        let profile_ok =
-            profiles.is_empty() || profiles.iter().any(|p| env.profile.contains(p.as_str()));
+                .any(|atom| installed_matches(&env.installed, atom, features));
+        let profile_ok = profiles.is_empty()
+            || profiles
+                .iter()
+                .any(|p| profile_matches(&env.profile, p, &self.format));
         let keyword_ok =
             keywords.is_empty() || keywords.iter().any(|k| keyword_matches(&env.arch, k));
 
@@ -136,25 +175,36 @@ impl NewsItem {
     }
 }
 
-/// Whether any installed `category/package` satisfies the restriction atom.
-///
-/// The restriction names a `category/package` (optionally with a version
-/// constraint). Matching here is on the `category/package` head, which is what
-/// the installed set carries.
-fn installed_matches(installed: &BTreeSet<String>, atom: &str) -> bool {
-    let head = atom_head(atom);
-    installed.contains(head)
+/// Whether any installed package satisfies the `Display-If-Installed` atom, with
+/// full version-operator and slot semantics. An unparseable atom matches nothing.
+fn installed_matches(installed: &[InstalledPkg], atom: &str, features: EapiFeatures) -> bool {
+    let interner = Interner::new();
+    let Ok(parsed) = Atom::parse(atom, features, &interner) else {
+        return false;
+    };
+    installed.iter().any(|pkg| {
+        let pref = PackageRef {
+            category: interner.intern(&pkg.category),
+            package: interner.intern(&pkg.package),
+            version: &pkg.version,
+            slot: Some(interner.intern(&pkg.slot)),
+            subslot: pkg.subslot.as_deref().map(|s| interner.intern(s)),
+            repo: None,
+        };
+        parsed.matches(&pref)
+    })
 }
 
-/// The `category/package` head of a restriction atom.
-fn atom_head(atom: &str) -> &str {
-    let trimmed = atom.trim_start_matches(['>', '<', '=', '~', '!']);
-    // Strip a trailing version if present by cutting at the last `-` that begins
-    // a version token. A simple heuristic suffices for relevance matching.
-    if let Some(slot) = trimmed.find(':') {
-        return &trimmed[..slot];
+/// Match a `Display-If-Profile` restriction against the repo-relative profile:
+/// format `2.*` allows a trailing `/*` prefix match, every other format requires
+/// exact equality, mirroring `DisplayProfileRestriction.checkRestriction`.
+fn profile_matches(profile: &str, restriction: &str, format: &str) -> bool {
+    if format.starts_with("2.")
+        && let Some(prefix) = restriction.strip_suffix("/*")
+    {
+        return profile == prefix || profile.starts_with(&format!("{prefix}/"));
     }
-    trimmed
+    profile == restriction
 }
 
 /// Whether the arch satisfies a `Display-If-Keyword` restriction.
@@ -166,13 +216,15 @@ fn keyword_matches(arch: &str, keyword: &str) -> bool {
 /// Read and evaluate unread, relevant news for one repository.
 ///
 /// `news_dir` is the repository's `metadata/news` directory; `unread` is the set
-/// of item names the per-repository state reports as unread. Returns only items
-/// that are both unread and relevant. The unread state is read, never written.
+/// of item names the per-repository state reports as unread; `lang` selects the
+/// body language with an `en` fallback. Returns only items that are valid,
+/// unread, and relevant. The unread state is read, never written.
 #[instrument(skip(news_dir, env, unread))]
 pub fn unread_relevant(
     news_dir: &Path,
     env: &NewsEnv,
     unread: &BTreeSet<String>,
+    lang: &str,
 ) -> Result<Vec<NewsItem>, NewsError> {
     if !news_dir.exists() {
         return Ok(Vec::new());
@@ -194,11 +246,11 @@ pub fn unread_relevant(
         if !unread.contains(&name) {
             continue;
         }
-        let Some(header) = read_header(&entry.path(), &name)? else {
+        let Some(header) = read_header(&entry.path(), &name, lang)? else {
             continue;
         };
         let item = NewsItem::parse(&name, &header);
-        if item.is_relevant(env) {
+        if item.is_valid() && item.is_relevant(env) {
             items.push(item);
         }
     }
@@ -206,9 +258,13 @@ pub fn unread_relevant(
     Ok(items)
 }
 
-/// Read the header (text up to the first blank line) of a news item body.
-fn read_header(item_dir: &Path, name: &str) -> Result<Option<String>, NewsError> {
-    let body = item_dir.join(format!("{name}.en.txt"));
+/// Read the header (text up to the first blank line) of a news item body,
+/// preferring the `<name>.<lang>.txt` body and falling back to `<name>.en.txt`.
+fn read_header(item_dir: &Path, name: &str, lang: &str) -> Result<Option<String>, NewsError> {
+    let mut body = item_dir.join(format!("{name}.{lang}.txt"));
+    if !body.exists() {
+        body = item_dir.join(format!("{name}.en.txt"));
+    }
     if !body.exists() {
         return Ok(None);
     }
@@ -246,9 +302,31 @@ pub fn render_news(items: &[NewsItem]) -> String {
 mod tests {
     use super::*;
 
-    fn env(installed: &[&str], profile: &str, arch: &str) -> NewsEnv {
+    fn installed(specs: &[&str]) -> Vec<InstalledPkg> {
+        specs
+            .iter()
+            .map(|s| {
+                // `category/package-version[:slot]`.
+                let (head, slot) = match s.split_once(':') {
+                    Some((h, sl)) => (h, sl.to_owned()),
+                    None => (*s, "0".to_owned()),
+                };
+                let (cp, version) = head.rsplit_once('-').unwrap();
+                let (category, package) = cp.split_once('/').unwrap();
+                InstalledPkg {
+                    category: category.to_owned(),
+                    package: package.to_owned(),
+                    version: Version::parse(version).unwrap(),
+                    slot,
+                    subslot: None,
+                }
+            })
+            .collect()
+    }
+
+    fn env(specs: &[&str], profile: &str, arch: &str) -> NewsEnv {
         NewsEnv {
-            installed: installed.iter().map(|s| s.to_string()).collect(),
+            installed: installed(specs),
             profile: profile.to_owned(),
             arch: arch.to_owned(),
         }
@@ -256,36 +334,47 @@ mod tests {
 
     #[test]
     fn item_without_restrictions_is_relevant() {
-        let item = NewsItem::parse("2024-01-01-test", "Title: Hello\nAuthor: a\n");
-        assert_eq!(item.title, "Hello");
+        let item = NewsItem::parse("x", "Title: Hello\nNews-Item-Format: 1.0\n");
+        assert!(item.is_valid());
         assert!(item.is_relevant(&env(&[], "", "amd64")));
     }
 
     #[test]
-    fn installed_restriction_gates_relevance() {
-        let item = NewsItem::parse("x", "Title: T\nDisplay-If-Installed: sys-apps/portage\n");
-        assert!(item.is_relevant(&env(&["sys-apps/portage"], "", "amd64")));
-        assert!(!item.is_relevant(&env(&["dev-libs/openssl"], "", "amd64")));
+    fn invalid_format_is_rejected() {
+        let item = NewsItem::parse("x", "Title: T\nNews-Item-Format: 3.0\n");
+        assert!(!item.is_valid());
+        let no_format = NewsItem::parse("x", "Title: T\n");
+        assert!(!no_format.is_valid());
     }
 
     #[test]
-    fn differing_kinds_are_joint() {
+    fn installed_restriction_uses_version_operator() {
         let item = NewsItem::parse(
             "x",
-            "Title: T\nDisplay-If-Installed: sys-apps/portage\nDisplay-If-Keyword: amd64\n",
+            "Title: T\nNews-Item-Format: 1.0\nDisplay-If-Installed: >=sys-libs/glibc-2.0\n",
         );
-        assert!(item.is_relevant(&env(&["sys-apps/portage"], "", "amd64")));
-        // Installed matches but keyword does not.
-        assert!(!item.is_relevant(&env(&["sys-apps/portage"], "", "x86")));
+        assert!(item.is_relevant(&env(&["sys-libs/glibc-2.5"], "", "amd64")));
+        // An older installed version does not satisfy the >= restriction.
+        assert!(!item.is_relevant(&env(&["sys-libs/glibc-1.9"], "", "amd64")));
     }
 
     #[test]
-    fn like_kinds_are_alternatives() {
-        let item = NewsItem::parse(
+    fn profile_exact_for_format_1_and_prefix_for_format_2() {
+        let one = NewsItem::parse(
             "x",
-            "Title: T\nDisplay-If-Installed: a/one\nDisplay-If-Installed: b/two\n",
+            "Title: T\nNews-Item-Format: 1.0\nDisplay-If-Profile: default/linux/amd64/17.1\n",
         );
-        assert!(item.is_relevant(&env(&["b/two"], "", "amd64")));
+        assert!(one.is_relevant(&env(&[], "default/linux/amd64/17.1", "amd64")));
+        // Format 1 is exact: a sub-profile does not match.
+        assert!(!one.is_relevant(&env(&[], "default/linux/amd64/17.1/desktop", "amd64")));
+
+        let two = NewsItem::parse(
+            "x",
+            "Title: T\nNews-Item-Format: 2.0\nDisplay-If-Profile: default/linux/amd64/17.1/*\n",
+        );
+        assert!(two.is_relevant(&env(&[], "default/linux/amd64/17.1/desktop", "amd64")));
+        assert!(two.is_relevant(&env(&[], "default/linux/amd64/17.1", "amd64")));
+        assert!(!two.is_relevant(&env(&[], "default/linux/x86/17.1", "amd64")));
     }
 
     #[test]
@@ -294,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_relevant_reads_from_dir() {
+    fn unread_relevant_reads_with_language_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let news = dir.path().join("metadata/news");
         let item_name = "2024-05-01-glibc";
@@ -302,31 +391,28 @@ mod tests {
         std::fs::create_dir_all(&item_dir).unwrap();
         std::fs::write(
             item_dir.join(format!("{item_name}.en.txt")),
-            "Title: glibc upgrade\nDisplay-If-Installed: sys-libs/glibc\n\nBody text here.\n",
+            "Title: glibc upgrade\nNews-Item-Format: 1.0\nDisplay-If-Installed: sys-libs/glibc\n\nBody.\n",
         )
         .unwrap();
 
         let unread: BTreeSet<String> = [item_name.to_string()].into_iter().collect();
-        let relevant =
-            unread_relevant(&news, &env(&["sys-libs/glibc"], "", "amd64"), &unread).unwrap();
-        assert_eq!(relevant.len(), 1);
-        assert_eq!(relevant[0].title, "glibc upgrade");
-
-        // An item not in the unread set is skipped.
-        let none = unread_relevant(
+        // A missing `de` body falls back to `en`.
+        let relevant = unread_relevant(
             &news,
-            &env(&["sys-libs/glibc"], "", "amd64"),
-            &BTreeSet::new(),
+            &env(&["sys-libs/glibc-2.5"], "", "amd64"),
+            &unread,
+            "de",
         )
         .unwrap();
-        assert!(none.is_empty());
+        assert_eq!(relevant.len(), 1);
+        assert_eq!(relevant[0].title, "glibc upgrade");
     }
 
     #[test]
     fn missing_news_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let news = dir.path().join("metadata/news");
-        let out = unread_relevant(&news, &env(&[], "", "amd64"), &BTreeSet::new()).unwrap();
+        let out = unread_relevant(&news, &env(&[], "", "amd64"), &BTreeSet::new(), "en").unwrap();
         assert!(out.is_empty());
     }
 }

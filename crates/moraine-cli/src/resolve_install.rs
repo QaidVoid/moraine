@@ -307,6 +307,8 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         &wr.eroot,
     );
     println!("Installation complete.");
+    // Surface relevant unread news for every repository after the install.
+    crate::news_state::display_after_action(ctx, &wr.vdb_dir, &wr.eroot, &repo_set);
     Ok(())
 }
 
