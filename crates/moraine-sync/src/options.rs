@@ -82,10 +82,20 @@ pub struct SyncOptions {
     pub depth: Option<u32>,
     /// Extra rsync options from `sync-rsync-extra-opts`.
     pub rsync_extra_opts: Vec<String>,
-    /// Whether signature verification is required.
-    pub verify: bool,
+    /// rsync `sync-rsync-verify-metamanifest`: verify the metamanifest tree.
+    pub verify_metamanifest: bool,
+    /// git `sync-git-verify-commit-signature`: verify the head commit signature.
+    pub git_verify_commit_signature: bool,
+    /// git `sync-git-verify-max-age-days`: reject a head older than this (0 = off).
+    pub git_verify_max_age_days: u32,
+    /// webrsync `sync-webrsync-verify-signature`: verify the snapshot signature.
+    pub webrsync_verify_signature: bool,
+    /// webrsync `sync-webrsync-keep-snapshots`: keep downloaded snapshots (`-k`).
+    pub webrsync_keep_snapshots: bool,
     /// The OpenPGP key path from `sync-openpgp-key-path`, when set.
     pub openpgp_key_path: Option<PathBuf>,
+    /// The OpenPGP keyserver from `sync-openpgp-keyserver`, when set.
+    pub openpgp_keyserver: Option<String>,
     /// The key-refresh policy.
     pub key_refresh: KeyRefresh,
     /// The refresh retry count.
@@ -136,7 +146,14 @@ impl SyncOptions {
             .map(|s| s.split_whitespace().map(str::to_owned).collect())
             .unwrap_or_default();
 
-        let verify = match get("sync-rsync-verify-metamanifest")
+        // Each backend's verify key is parsed independently so enabling one does
+        // not silently force another.
+        let bool_key = |key: &str, default: bool| match get(key).as_deref() {
+            Some("yes") | Some("true") | Some("1") => true,
+            Some("no") | Some("false") | Some("0") => false,
+            _ => default,
+        };
+        let verify_metamanifest = match get("sync-rsync-verify-metamanifest")
             .or_else(|| get("sync-verify"))
             .as_deref()
         {
@@ -144,10 +161,16 @@ impl SyncOptions {
             Some("no") | Some("false") | Some("0") => false,
             _ => defaults.verify,
         };
+        let git_verify_commit_signature = bool_key("sync-git-verify-commit-signature", false);
+        let git_verify_max_age_days =
+            parse_u32(get("sync-git-verify-max-age-days").as_deref()).unwrap_or(0);
+        let webrsync_verify_signature = bool_key("sync-webrsync-verify-signature", false);
+        let webrsync_keep_snapshots = bool_key("sync-webrsync-keep-snapshots", false);
 
         let openpgp_key_path = get("sync-openpgp-key-path")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let openpgp_keyserver = get("sync-openpgp-keyserver").filter(|s| !s.is_empty());
 
         let key_refresh = if cfg.sync.contains_key("sync-openpgp-key-refresh") {
             KeyRefresh::parse(get("sync-openpgp-key-refresh").as_deref())
@@ -169,8 +192,13 @@ impl SyncOptions {
             retries,
             depth,
             rsync_extra_opts,
-            verify,
+            verify_metamanifest,
+            git_verify_commit_signature,
+            git_verify_max_age_days,
+            webrsync_verify_signature,
+            webrsync_keep_snapshots,
             openpgp_key_path,
+            openpgp_keyserver,
             key_refresh,
             refresh_retries,
             post_sync,

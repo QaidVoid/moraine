@@ -1,5 +1,9 @@
 //! The available-packages metadata database for the Moraine package manager.
 //!
+//! Non-goal: old-style `profiles/virtuals` is not supported. Modern Gentoo
+//! expresses virtuals as `virtual/*` packages, so the legacy text-file virtuals
+//! mechanism is intentionally omitted rather than implemented.
+//!
 //! This crate is the `portdbapi` equivalent of the rewrite. It answers the
 //! question the solver asks millions of times: given an atom, which package
 //! versions exist, and what are their dependencies, slots, keywords, and USE

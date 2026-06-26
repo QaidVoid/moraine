@@ -101,7 +101,7 @@ impl<R: CommandRunner> Backend for GitBackend<R> {
             });
         }
         self.set_safe_directory(ctx)?;
-        if ctx.options.verify {
+        if ctx.options.git_verify_commit_signature {
             Verifier::new(&self.runner).verify_git_head(ctx.repo, ctx.location)?;
         }
         let head = self.head(ctx)?;
@@ -140,7 +140,7 @@ impl<R: CommandRunner> Backend for GitBackend<R> {
             });
         }
 
-        if ctx.options.verify {
+        if ctx.options.git_verify_commit_signature {
             Verifier::new(&self.runner).verify_git_head(ctx.repo, ctx.location)?;
         }
 

@@ -149,6 +149,8 @@ impl RepoSet {
 pub fn discover(repos_conf: impl AsRef<Path>) -> Result<RepoSet, DiscoveryError> {
     let mut sections = parse_repos_conf(repos_conf.as_ref())?;
     let mut repos: HashMap<String, RepoConfig> = HashMap::new();
+    // The unset-aware masters per repo, resolved after the main repo is known.
+    let mut masters_unset: HashMap<String, Option<Vec<String>>> = HashMap::new();
 
     // `[DEFAULT]` is the special defaults section, not a repository: its keys are
     // inherited by every repository section (for example `main-repo`). Pull it
@@ -184,7 +186,8 @@ pub fn discover(repos_conf: impl AsRef<Path>) -> Result<RepoSet, DiscoveryError>
         let layout = read_layout_conf(&location);
 
         // repos.conf overrides layout.conf for masters, aliases, eclass-overrides.
-        let masters = conf_masters.unwrap_or(layout.masters);
+        // Masters stay unset-aware so the main-repo fallback can apply below.
+        let masters_opt = conf_masters.or(layout.masters);
         let aliases = conf_aliases.unwrap_or(layout.aliases);
         let eclass_overrides = conf_overrides.unwrap_or(layout.eclass_overrides);
 
@@ -194,7 +197,8 @@ pub fn discover(repos_conf: impl AsRef<Path>) -> Result<RepoSet, DiscoveryError>
         let cfg = RepoConfig {
             name: canonical.clone(),
             location,
-            masters,
+            // Resolved in the second pass once the main repo is known.
+            masters: Vec::new(),
             priority,
             aliases,
             eclass_overrides,
@@ -205,11 +209,48 @@ pub fn discover(repos_conf: impl AsRef<Path>) -> Result<RepoSet, DiscoveryError>
             thin_manifests: layout.thin_manifests,
             sync,
         };
+        masters_unset.insert(canonical.clone(), masters_opt);
         repos.insert(canonical, cfg);
+    }
+
+    // Determine the main repo: `DEFAULT.main-repo`, else the highest-priority
+    // repository (name breaking ties), matching Portage's `RepoConfigLoader`.
+    let main_repo = main_repo_name(&defaults, &repos);
+    // Resolve masters: an unset `masters` defaults to the main repo (unless the
+    // repository is itself the main repo); an explicit value is kept as-is.
+    for (name, cfg) in repos.iter_mut() {
+        cfg.masters = match masters_unset.remove(name).flatten() {
+            Some(explicit) => explicit,
+            None => match &main_repo {
+                Some(main) if main != name => vec![main.clone()],
+                _ => Vec::new(),
+            },
+        };
     }
 
     let order = resolve_order(&repos)?;
     Ok(RepoSet { repos, order })
+}
+
+/// The main repository name: the `[DEFAULT] main-repo` value when set and known,
+/// otherwise the highest-priority repository (name breaking ties).
+fn main_repo_name(
+    defaults: &BTreeMap<String, String>,
+    repos: &HashMap<String, RepoConfig>,
+) -> Option<String> {
+    if let Some(main) = defaults.get("main-repo").map(|s| s.trim().to_string())
+        && repos.contains_key(&main)
+    {
+        return Some(main);
+    }
+    repos
+        .values()
+        .max_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then_with(|| b.name.cmp(&a.name))
+        })
+        .map(|c| c.name.clone())
 }
 
 /// Resolve the deterministic repository search order via a topological sort over
@@ -293,7 +334,9 @@ fn resolve_order(repos: &HashMap<String, RepoConfig>) -> Result<Vec<String>, Dis
 /// The subset of `layout.conf` keys discovery consumes.
 #[derive(Debug, Default)]
 struct Layout {
-    masters: Vec<String>,
+    /// `None` when `masters` is absent from layout.conf (so the main-repo
+    /// fallback applies); `Some(vec![])` only for an explicit empty `masters =`.
+    masters: Option<Vec<String>>,
     aliases: Vec<String>,
     eclass_overrides: Vec<String>,
     cache_formats: Vec<String>,
@@ -320,7 +363,7 @@ fn read_layout_conf(location: &Path) -> Layout {
         let key = key.trim();
         let value: Vec<String> = split_ws(value);
         match key {
-            "masters" => layout.masters = value,
+            "masters" => layout.masters = Some(value),
             "aliases" => layout.aliases = value,
             "eclass-overrides" => layout.eclass_overrides = value,
             "cache-formats" => layout.cache_formats = value,
@@ -723,6 +766,35 @@ mod tests {
     }
 
     #[test]
+    fn unset_masters_default_to_main_repo_but_explicit_empty_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let gentoo = make_repo(tmp.path(), "gentoo", "");
+        let overlay = make_repo(tmp.path(), "overlay", "");
+        let standalone = make_repo(tmp.path(), "standalone", "");
+        let conf = tmp.path().join("repos.conf");
+        // overlay omits `masters` (unset) and must inherit gentoo; standalone sets
+        // an explicit empty `masters =` and must stay independent.
+        fs::write(
+            &conf,
+            format!(
+                "[DEFAULT]\nmain-repo = gentoo\n[gentoo]\nlocation = {}\n[overlay]\nlocation = {}\n[standalone]\nlocation = {}\nmasters =\n",
+                gentoo.display(),
+                overlay.display(),
+                standalone.display(),
+            ),
+        )
+        .unwrap();
+        let set = discover(&conf).unwrap();
+        assert_eq!(
+            set.get("overlay").unwrap().masters,
+            vec!["gentoo".to_string()]
+        );
+        assert!(set.get("standalone").unwrap().masters.is_empty());
+        // The main repo itself gets no self-master.
+        assert!(set.get("gentoo").unwrap().masters.is_empty());
+    }
+
+    #[test]
     fn eclass_search_path_prefers_override_then_self_then_master() {
         let tmp = TempDir::new().unwrap();
         let master = make_repo(tmp.path(), "master", "");
@@ -732,7 +804,7 @@ mod tests {
         fs::write(
             &conf,
             format!(
-                "[master]\nlocation = {}\n[over]\nlocation = {}\n[child]\nlocation = {}\nmasters = master\neclass-overrides = over\n",
+                "[DEFAULT]\nmain-repo = master\n[master]\nlocation = {}\n[over]\nlocation = {}\nmasters =\n[child]\nlocation = {}\nmasters = master\neclass-overrides = over\n",
                 master.display(),
                 over.display(),
                 child.display()

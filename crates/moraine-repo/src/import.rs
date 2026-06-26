@@ -59,6 +59,19 @@ pub enum ImportIssue {
         /// The `<cat>/<P-V>` identifier of the ebuild.
         cpv: String,
     },
+    /// The repository has no committed metadata cache, so it yields no metadata.
+    NoMetadataCache {
+        /// The cache directory that was absent.
+        path: PathBuf,
+    },
+    /// An entry's `EAPI` is banned by the repository's `eapis-banned`, so it is
+    /// excluded.
+    BannedEapi {
+        /// The `<cat>/<P-V>` identifier.
+        cpv: String,
+        /// The banned EAPI.
+        eapi: String,
+    },
 }
 
 /// The result of an import: the kept entries plus the issues encountered.
@@ -94,9 +107,14 @@ pub fn import_repo(
 
     let cache_dir = cfg.md5_cache_dir();
     if !cache_dir.is_dir() {
-        return Err(RepoError::Import(ImportError::NotADirectory {
-            path: cache_dir,
-        }));
+        // A synced tree without a committed `metadata/md5-cache` yields no
+        // metadata gracefully rather than failing the whole repository, matching
+        // Portage's `_sync_callback` (a missing cache is not regenerated here).
+        let mut report = ImportReport::default();
+        report
+            .issues
+            .push(ImportIssue::NoMetadataCache { path: cache_dir });
+        return Ok(report);
     }
 
     // Resolve on-disk eclass md5s once, through the masters search path.
@@ -197,15 +215,17 @@ fn import_one(
         }
     };
 
-    // Incremental reuse: reuse the previous entry unchanged when both _mtime_
-    // and _md5_ match, so its dependencies are not re-parsed.
+    // Incremental reuse: the md5-dict format's validation digest is `_md5_`, so
+    // reuse a previous entry whose `_md5_` matches (real gentoo md5-cache entries
+    // carry `_md5_` but no `_mtime_`). An mtime-based cache additionally requires
+    // a matching non-empty `_mtime_`.
     let key = (category.to_owned(), package.clone(), version.clone());
-    if let Some(prev) = previous.get(&key)
-        && prev.mtime == mtime
-        && prev.md5 == md5
-        && !mtime.is_empty()
-    {
-        return EntryOutcome::Kept(Box::new(prev.clone()));
+    if let Some(prev) = previous.get(&key) {
+        let md5_ok = !md5.is_empty() && prev.md5 == md5;
+        let mtime_ok = mtime.is_empty() || (prev.mtime == mtime);
+        if md5_ok && mtime_ok {
+            return EntryOutcome::Kept(Box::new(prev.clone()));
+        }
     }
 
     // Validate eclass md5 pairs against on-disk eclasses.

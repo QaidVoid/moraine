@@ -28,9 +28,25 @@ impl<R: CommandRunner> WebrsyncBackend<R> {
     /// signed snapshot, verifies its signature, and unpacks it into place.
     #[instrument(skip(self, ctx), fields(repo = ctx.repo))]
     fn run_helper(&self, ctx: &SyncContext<'_>) -> Result<SyncOutcome, SyncError> {
-        let spec = CommandSpec::new("emerge-webrsync")
-            .arg("--repo")
-            .arg(ctx.repo.to_owned());
+        // `emerge-webrsync` syncs the configured tree and accepts only
+        // `-h/-k/-q/-v/-x/--no-pgp-verify`; it does not take a `--repo` name.
+        let opts = ctx.options;
+        let mut spec = CommandSpec::new("emerge-webrsync");
+        if opts.webrsync_verify_signature {
+            // Opt into signature verification via the GPG environment Portage uses.
+            spec = spec.env("PORTAGE_SYNC_WEBRSYNC_GPG", "1");
+            if let Some(key) = &opts.openpgp_key_path {
+                spec = spec.env("PORTAGE_GPG_KEY", key.to_string_lossy().into_owned());
+            }
+            if let Some(server) = &opts.openpgp_keyserver {
+                spec = spec.env("PORTAGE_GPG_KEY_SERVER", server.clone());
+            }
+        } else {
+            spec = spec.arg("--no-pgp-verify");
+        }
+        if opts.webrsync_keep_snapshots {
+            spec = spec.arg("-k");
+        }
         let out = self.runner.run(&spec)?;
         if !out.success() {
             // A signature rejection in the helper is reported as a verification

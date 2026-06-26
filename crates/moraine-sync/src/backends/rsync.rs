@@ -131,7 +131,7 @@ impl<R: CommandRunner> RsyncBackend<R> {
             });
         }
 
-        if ctx.options.verify {
+        if ctx.options.verify_metamanifest {
             let verifier = Verifier::new(&self.runner);
             verifier.verify_rsync_tree(ctx.repo, ctx.staging, None)?;
         }

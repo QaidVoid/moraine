@@ -23,6 +23,8 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     /// The working directory to run the command in, if any.
     pub cwd: Option<PathBuf>,
+    /// Extra environment variables to set for the command.
+    pub env: Vec<(String, String)>,
 }
 
 impl CommandSpec {
@@ -32,7 +34,14 @@ impl CommandSpec {
             program: program.into(),
             args: Vec::new(),
             cwd: None,
+            env: Vec::new(),
         }
+    }
+
+    /// Set an environment variable for the command.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
     }
 
     /// Append a single argument.
@@ -105,6 +114,9 @@ impl CommandRunner for SystemRunner {
         cmd.args(&spec.args);
         if let Some(dir) = &spec.cwd {
             cmd.current_dir(dir);
+        }
+        for (key, value) in &spec.env {
+            cmd.env(key, value);
         }
         let output = cmd.output().map_err(|source| SyncError::Command {
             program: spec.program.clone(),

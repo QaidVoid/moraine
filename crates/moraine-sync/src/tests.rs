@@ -368,8 +368,13 @@ fn rsync_server_out_of_date_preserves_tree() {
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
-        verify: false,
+        verify_metamanifest: false,
+        git_verify_commit_signature: false,
+        git_verify_max_age_days: 0,
+        webrsync_verify_signature: false,
+        webrsync_keep_snapshots: false,
         openpgp_key_path: None,
+        openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
@@ -408,8 +413,13 @@ fn rsync_transfer_includes_standard_excludes_and_extra_opts() {
         retries: 1,
         depth: None,
         rsync_extra_opts: vec!["--bwlimit=1000".into()],
-        verify: false,
+        verify_metamanifest: false,
+        git_verify_commit_signature: false,
+        git_verify_max_age_days: 0,
+        webrsync_verify_signature: false,
+        webrsync_keep_snapshots: false,
         openpgp_key_path: None,
+        openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
@@ -464,8 +474,13 @@ fn rsync_verification_failure_preserves_prior_tree() {
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
-        verify: true,
+        verify_metamanifest: true,
+        git_verify_commit_signature: true,
+        git_verify_max_age_days: 0,
+        webrsync_verify_signature: true,
+        webrsync_keep_snapshots: false,
         openpgp_key_path: None,
+        openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
@@ -583,8 +598,13 @@ fn git_opts(depth: Option<u32>) -> SyncOptions {
         retries: 1,
         depth,
         rsync_extra_opts: vec![],
-        verify: false,
+        verify_metamanifest: false,
+        git_verify_commit_signature: false,
+        git_verify_max_age_days: 0,
+        webrsync_verify_signature: false,
+        webrsync_keep_snapshots: false,
         openpgp_key_path: None,
+        openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
@@ -609,8 +629,13 @@ fn webrsync_signature_rejection_is_verification_error() {
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
-        verify: true,
+        verify_metamanifest: true,
+        git_verify_commit_signature: true,
+        git_verify_max_age_days: 0,
+        webrsync_verify_signature: true,
+        webrsync_keep_snapshots: false,
         openpgp_key_path: None,
+        openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
@@ -623,6 +648,80 @@ fn webrsync_signature_rejection_is_verification_error() {
     };
     let err = backend.fetch(&ctx).unwrap_err();
     assert!(matches!(err, SyncError::Verification { .. }));
+}
+
+#[test]
+fn webrsync_command_has_no_repo_and_default_no_pgp_verify() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    let staging = tmp.path().join("staging/g");
+
+    // Verify off (default): the command takes --no-pgp-verify and never --repo.
+    let runner = FakeRunner::new().rule(|s| (s.program == "emerge-webrsync").then(|| ok("")));
+    let mut opts = webrsync_opts();
+    {
+        let backend = WebrsyncBackend::new(&runner);
+        let ctx = SyncContext {
+            repo: "g",
+            location: &loc,
+            staging: &staging,
+            options: &opts,
+        };
+        backend.fetch(&ctx).unwrap();
+    }
+    let call = &runner.calls()[0];
+    assert!(call.args.iter().any(|a| a == "--no-pgp-verify"));
+    assert!(!call.args.iter().any(|a| a == "--repo"));
+
+    // Verify on: the GPG environment is exported and --no-pgp-verify is dropped.
+    opts.webrsync_verify_signature = true;
+    opts.openpgp_key_path = Some(std::path::PathBuf::from("/keys/release.gpg"));
+    opts.openpgp_keyserver = Some("hkps://keys.gentoo.org".into());
+    opts.webrsync_keep_snapshots = true;
+    let runner2 = FakeRunner::new().rule(|s| (s.program == "emerge-webrsync").then(|| ok("")));
+    {
+        let backend = WebrsyncBackend::new(&runner2);
+        let ctx = SyncContext {
+            repo: "g",
+            location: &loc,
+            staging: &staging,
+            options: &opts,
+        };
+        backend.fetch(&ctx).unwrap();
+    }
+    let call = &runner2.calls()[0];
+    assert!(!call.args.iter().any(|a| a == "--no-pgp-verify"));
+    assert!(call.args.iter().any(|a| a == "-k"));
+    assert!(
+        call.env
+            .iter()
+            .any(|(k, v)| k == "PORTAGE_SYNC_WEBRSYNC_GPG" && v == "1")
+    );
+    assert!(call.env.iter().any(|(k, _)| k == "PORTAGE_GPG_KEY"));
+    assert!(call.env.iter().any(|(k, _)| k == "PORTAGE_GPG_KEY_SERVER"));
+}
+
+/// Default webrsync options with verification off.
+fn webrsync_opts() -> SyncOptions {
+    SyncOptions {
+        sync_type: "webrsync".into(),
+        uri: "https://x".into(),
+        auto_sync: true,
+        timeout_secs: 30,
+        retries: 1,
+        depth: None,
+        rsync_extra_opts: vec![],
+        verify_metamanifest: false,
+        git_verify_commit_signature: false,
+        git_verify_max_age_days: 0,
+        webrsync_verify_signature: false,
+        webrsync_keep_snapshots: false,
+        openpgp_key_path: None,
+        openpgp_keyserver: None,
+        key_refresh: crate::options::KeyRefresh::Disabled,
+        refresh_retries: 0,
+        post_sync: None,
+    }
 }
 
 // --- verification key handling ----------------------------------------------
