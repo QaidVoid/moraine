@@ -57,12 +57,41 @@ pub fn selected_set(world_file: &str) -> Vec<String> {
         .collect()
 }
 
-/// Compose `@world` as `@selected` plus `@system`.
-pub fn world_set(selected: &[String], system: &[String]) -> Vec<String> {
-    let mut out = selected.to_vec();
-    for member in system {
-        if !out.iter().any(|x| x == member) {
-            out.push(member.clone());
+/// Read `@selected-sets` from the `world_sets` file: the `@name` set references
+/// the operator has selected, one per non-empty line. A line without the `@`
+/// prefix is normalized to `@name`, mirroring `WorldSelectedSetsSet`.
+pub fn selected_sets(world_sets_file: &str) -> Vec<String> {
+    world_sets_file
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            if l.starts_with('@') {
+                l.to_owned()
+            } else {
+                format!("@{l}")
+            }
+        })
+        .collect()
+}
+
+/// Compose `@world` as the union of `@profile`, `@selected`, `@system`, and the
+/// resolved members of the operator's `world_sets`, de-duplicating while
+/// preserving first-seen order. This mirrors the default `[world]` definition
+/// (`@profile @selected @system`) and `WorldSelectedSet`'s union of the world
+/// packages and world sets files.
+pub fn world_set(
+    profile: &[String],
+    selected: &[String],
+    system: &[String],
+    set_members: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for group in [profile, selected, system, set_members] {
+        for member in group {
+            if !out.iter().any(|x| x == member) {
+                out.push(member.clone());
+            }
         }
     }
     out
@@ -169,12 +198,26 @@ mod tests {
     }
 
     #[test]
-    fn world_includes_system() {
+    fn world_unions_profile_selected_system_and_sets() {
+        let profile = vec!["sys-libs/glibc".to_owned()];
         let selected = selected_set("dev-lang/rust\napp-editors/neovim\n");
         let system = vec!["sys-apps/portage".to_owned()];
-        let world = world_set(&selected, &system);
+        let set_members = vec!["dev-libs/from-set".to_owned(), "dev-lang/rust".to_owned()];
+        let world = world_set(&profile, &selected, &system, &set_members);
+        assert!(world.contains(&"sys-libs/glibc".to_owned()));
         assert!(world.contains(&"dev-lang/rust".to_owned()));
         assert!(world.contains(&"sys-apps/portage".to_owned()));
+        assert!(world.contains(&"dev-libs/from-set".to_owned()));
+        // The duplicate `dev-lang/rust` from the set members appears once.
+        assert_eq!(world.iter().filter(|w| *w == "dev-lang/rust").count(), 1);
+    }
+
+    #[test]
+    fn selected_sets_reads_at_name_references() {
+        assert_eq!(
+            selected_sets("@security\nmyset\n# comment\n\n"),
+            vec!["@security".to_owned(), "@myset".to_owned()]
+        );
     }
 
     #[test]

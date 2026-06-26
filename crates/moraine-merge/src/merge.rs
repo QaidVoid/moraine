@@ -448,26 +448,16 @@ fn write_variant(
 }
 
 /// Choose the `._cfgNNNN_<name>` variant: reuse the highest existing variant when
-/// its content already equals `bytes`, otherwise the lowest unused index.
+/// its content already equals `bytes`, otherwise allocate the next index past the
+/// highest, mirroring Portage's `new_protect_filename`.
 fn choose_variant(live: &Path, name: &str, bytes: &[u8]) -> String {
-    let siblings = protect::sibling_names(live);
-    let prefix = "._cfg";
-    let suffix = format!("_{name}");
-    // The highest existing variant index for this name.
-    let highest = siblings
-        .iter()
-        .filter_map(|s| {
-            let rest = s.strip_prefix(prefix)?.strip_suffix(&suffix)?;
-            rest.parse::<u32>().ok().map(|n| (n, s.clone()))
-        })
-        .max_by_key(|(n, _)| *n);
-    if let Some((_, ref highest_name)) = highest {
-        let highest_live = live.with_file_name(highest_name);
-        if std::fs::read(&highest_live).is_ok_and(|c| c == bytes) {
-            return highest_name.clone();
-        }
+    if let Some(highest) = protect::highest_variant_path(live, name)
+        && std::fs::read(&highest).is_ok_and(|c| c == bytes)
+        && let Some(highest_name) = highest.file_name()
+    {
+        return highest_name.to_string_lossy().into_owned();
     }
-    protect::variant_name(name, &siblings)
+    protect::variant_name(name, &protect::sibling_names(live))
 }
 
 /// The md5 the replaced version recorded for each obj path, used by

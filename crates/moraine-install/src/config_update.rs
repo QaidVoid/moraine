@@ -27,6 +27,11 @@ impl PendingUpdate {
     pub fn from_variant(variant: impl Into<PathBuf>) -> Option<Self> {
         let variant = variant.into();
         let name = variant.file_name()?.to_str()?;
+        // A backup artifact is never a pending update, even if it otherwise has
+        // the `._cfgNNNN_` shape.
+        if is_backup_name(name) {
+            return None;
+        }
         let target_name = strip_variant_prefix(name)?;
         let target = variant.with_file_name(target_name);
         Some(PendingUpdate { target, variant })
@@ -85,6 +90,12 @@ fn strip_variant_prefix(name: &str) -> Option<String> {
     }
 }
 
+/// Whether a file name is a backup artifact (`*~` or `*.bak`, case-insensitive)
+/// excluded from pending updates, matching `find_updated_config_files`.
+fn is_backup_name(name: &str) -> bool {
+    name.ends_with('~') || name.to_ascii_lowercase().ends_with(".bak")
+}
+
 /// Write `bytes` to the live target atomically, creating parents.
 fn write_target(target: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = target.parent() {
@@ -127,6 +138,13 @@ mod tests {
     #[test]
     fn from_variant_rejects_plain_name() {
         assert!(PendingUpdate::from_variant("/etc/bar.conf").is_none());
+    }
+
+    #[test]
+    fn from_variant_rejects_backup_suffixes() {
+        assert!(PendingUpdate::from_variant("/etc/._cfg0000_foo.conf~").is_none());
+        assert!(PendingUpdate::from_variant("/etc/._cfg0000_foo.conf.bak").is_none());
+        assert!(PendingUpdate::from_variant("/etc/._cfg0000_foo.conf.BAK").is_none());
     }
 
     #[test]

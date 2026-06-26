@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use miette::Diagnostic;
 use moraine_config::makeconf::VarMap;
 use moraine_config::profile::{ProfileContext, ProfileStack, RepoProfileInfo};
-use moraine_config::sets::{profile_set, selected_set, system_set, world_set};
+use moraine_config::sets::{
+    profile_set, resolve_user_set, selected_set, selected_sets, system_set, world_set,
+};
 use moraine_repo::{RepoConfig, RepoSet, discover};
 use thiserror::Error;
 use tracing::instrument;
@@ -85,6 +87,8 @@ pub struct ConfigContext {
     /// The `@preserved-rebuild` set members, computed from the preserved-libs
     /// registry and installed soname data when that set is requested.
     pub preserved_rebuild: Vec<String>,
+    /// The `/etc/portage/sets/` search directories for resolving named user sets.
+    pub set_search_dirs: Vec<PathBuf>,
 }
 
 impl ConfigContext {
@@ -144,8 +148,17 @@ impl ConfigContext {
                 .collect::<Vec<_>>()
         };
         let features = tokens("FEATURES");
-        let config_protect = tokens("CONFIG_PROTECT");
-        let config_protect_mask = tokens("CONFIG_PROTECT_MASK");
+        // When configuration leaves CONFIG_PROTECT unset, fall back to the
+        // make.globals defaults so a minimal config root still protects `/etc`
+        // and masks `/etc/env.d`.
+        let mut config_protect = tokens("CONFIG_PROTECT");
+        if config_protect.is_empty() {
+            config_protect.push("/etc".to_owned());
+        }
+        let mut config_protect_mask = tokens("CONFIG_PROTECT_MASK");
+        if config_protect_mask.is_empty() {
+            config_protect_mask.push("/etc/env.d".to_owned());
+        }
 
         let profile_layers: Vec<String> = profile
             .nodes
@@ -167,12 +180,25 @@ impl ConfigContext {
             Vec::new()
         };
 
-        let mut world = world_set(&selected, &system);
-        for member in &profile_set_members {
-            if !world.iter().any(|w| w == member) {
-                world.push(member.clone());
+        // The `world_sets` file selects `@name` set references; expand each from
+        // the `/etc/portage/sets/` search path and union the members into world.
+        let set_search_dirs = vec![config_dir.join("etc/portage/sets")];
+        let world_sets_path = roots.root_dir().join("var/lib/portage/world_sets");
+        let world_sets_contents = std::fs::read_to_string(&world_sets_path).unwrap_or_default();
+        let dir_refs: Vec<&Path> = set_search_dirs.iter().map(PathBuf::as_path).collect();
+        let mut world_set_members: Vec<String> = Vec::new();
+        for set_ref in selected_sets(&world_sets_contents) {
+            let name = set_ref.trim_start_matches('@');
+            if let Ok(members) = resolve_user_set(name, &dir_refs) {
+                for member in members {
+                    if !world_set_members.contains(&member) {
+                        world_set_members.push(member);
+                    }
+                }
             }
         }
+
+        let world = world_set(&profile_set_members, &selected, &system, &world_set_members);
 
         Ok(ConfigContext {
             profile,
@@ -186,6 +212,7 @@ impl ConfigContext {
             profile_set: profile_set_members,
             world,
             preserved_rebuild: Vec::new(),
+            set_search_dirs,
         })
     }
 }
@@ -375,7 +402,12 @@ impl SetSource for ConfigContext {
             "selected" => Some(self.selected.clone()),
             "profile" => Some(self.profile_set.clone()),
             "preserved-rebuild" => Some(self.preserved_rebuild.clone()),
-            _ => None,
+            // Any other name resolves as a file-backed user set from the
+            // `/etc/portage/sets/` search path; `None` only when no file exists.
+            other => {
+                let dirs: Vec<&Path> = self.set_search_dirs.iter().map(PathBuf::as_path).collect();
+                resolve_user_set(other, &dirs).ok()
+            }
         }
     }
 }
@@ -433,6 +465,37 @@ mod tests {
         let ctx = ConfigContext::load(&roots).unwrap();
         assert!(ctx.world.is_empty());
         assert!(ctx.system.is_empty());
+        // A minimal config root still defaults to protecting `/etc` and masking
+        // `/etc/env.d`.
+        assert_eq!(ctx.config_protect, vec!["/etc".to_owned()]);
+        assert_eq!(ctx.config_protect_mask, vec!["/etc/env.d".to_owned()]);
+    }
+
+    #[test]
+    fn set_source_resolves_named_user_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let sets_dir = dir.path().join("etc/portage/sets");
+        std::fs::create_dir_all(&sets_dir).unwrap();
+        std::fs::write(sets_dir.join("myset"), "dev-libs/a\ndev-libs/b\n").unwrap();
+        let ctx = ConfigContext {
+            profile: ProfileStack::default(),
+            vars: VarMap::new(),
+            arch: "amd64".to_owned(),
+            features: Vec::new(),
+            config_protect: Vec::new(),
+            config_protect_mask: Vec::new(),
+            system: Vec::new(),
+            selected: Vec::new(),
+            profile_set: Vec::new(),
+            world: Vec::new(),
+            preserved_rebuild: Vec::new(),
+            set_search_dirs: vec![sets_dir],
+        };
+        assert_eq!(
+            ctx.members("myset").unwrap(),
+            vec!["dev-libs/a".to_owned(), "dev-libs/b".to_owned()]
+        );
+        assert!(ctx.members("nonexistent").is_none());
     }
 
     #[test]
@@ -449,6 +512,7 @@ mod tests {
             profile_set: Vec::new(),
             world: vec!["app/editor".to_owned(), "sys-apps/baselayout".to_owned()],
             preserved_rebuild: Vec::new(),
+            set_search_dirs: Vec::new(),
         };
         assert_eq!(ctx.members("system").unwrap(), ctx.system);
         assert_eq!(ctx.members("selected").unwrap(), ctx.selected);

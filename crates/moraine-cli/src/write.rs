@@ -78,7 +78,8 @@ pub(crate) fn merge_context(ctx: &ConfigContext, wr: &WriteRoots) -> MergeContex
         vdb_dir: wr.vdb_dir.clone(),
         state_dir: wr.state_dir.clone(),
         features: Features::from_tokens(ctx.features.iter().map(String::as_str)),
-        config_protect: ConfigProtect::new(
+        config_protect: ConfigProtect::with_root(
+            &wr.eroot,
             ctx.config_protect.clone(),
             ctx.config_protect_mask.clone(),
         ),
@@ -432,19 +433,34 @@ fn apply_package_moves(
     Ok(())
 }
 
-/// Collect `._cfgNNNN_` config variants directly under `dir`.
+/// Collect `._cfgNNNN_` config variants under `dir`, pruning hidden
+/// dot-directories and skipping backup artifacts, matching Portage's
+/// `find_updated_config_files`.
 fn collect_variants(dir: &Path, out: &mut Vec<PendingUpdate>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            collect_variants(&path, out);
-        } else if let Some(update) = PendingUpdate::from_variant(&path) {
+            // Prune hidden dot-directories (`find -name '.*' -type d -prune`).
+            if !name.starts_with('.') {
+                collect_variants(&path, out);
+            }
+        } else if !is_backup_name(&name)
+            && let Some(update) = PendingUpdate::from_variant(&path)
+        {
             out.push(update);
         }
     }
+}
+
+/// Whether a file name is a backup artifact excluded from the pending-update
+/// scan: a `~`-suffixed file or a `*.bak` (case-insensitive), matching the
+/// `! -name '.*~' ! -iname '.*.bak'` filters in `find_updated_config_files`.
+fn is_backup_name(name: &str) -> bool {
+    name.ends_with('~') || name.to_ascii_lowercase().ends_with(".bak")
 }
 
 /// Prompt for a yes/no confirmation, defaulting to yes on an empty line. When
@@ -551,5 +567,50 @@ mod tests {
         assert!(cps.contains(&"dev-libs/a".to_owned()));
         assert!(cps.contains(&"dev-libs/b".to_owned()));
         assert!(cps.contains(&"sys-apps/c".to_owned()));
+    }
+
+    #[test]
+    fn is_backup_name_matches_tilde_and_bak() {
+        assert!(is_backup_name("._cfg0000_foo.conf~"));
+        assert!(is_backup_name("foo.bak"));
+        assert!(is_backup_name("foo.BAK"));
+        assert!(!is_backup_name("._cfg0000_foo.conf"));
+    }
+
+    #[test]
+    fn collect_variants_prunes_hidden_dirs_and_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("._cfg0000_foo.conf"), b"a").unwrap();
+        // Backup artifacts are skipped.
+        std::fs::write(root.join("._cfg0000_foo.conf~"), b"a").unwrap();
+        std::fs::write(root.join("._cfg0001_foo.conf.bak"), b"a").unwrap();
+        // A hidden dot-directory is pruned, so its variant is not reported.
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join(".hidden/._cfg0000_bar.conf"), b"b").unwrap();
+        // A normal subdirectory is still descended into.
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/._cfg0000_baz.conf"), b"c").unwrap();
+
+        let mut pending = Vec::new();
+        collect_variants(root, &mut pending);
+        let variants: Vec<String> = pending
+            .iter()
+            .map(|p| {
+                p.variant
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(variants.contains(&"._cfg0000_foo.conf".to_owned()));
+        assert!(variants.contains(&"._cfg0000_baz.conf".to_owned()));
+        assert!(
+            !variants
+                .iter()
+                .any(|v| v.ends_with('~') || v.to_lowercase().ends_with(".bak"))
+        );
+        assert!(!variants.contains(&"._cfg0000_bar.conf".to_owned()));
     }
 }

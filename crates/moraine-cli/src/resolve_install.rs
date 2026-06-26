@@ -1281,6 +1281,7 @@ mod tests {
             profile_set: Vec::new(),
             world: Vec::new(),
             preserved_rebuild: Vec::new(),
+            set_search_dirs: Vec::new(),
         };
         let planner = CliPlanner {
             repo_set: &repo_set,

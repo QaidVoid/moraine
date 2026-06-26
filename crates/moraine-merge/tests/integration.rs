@@ -518,6 +518,30 @@ fn config_protect_sequential_variants() {
 }
 
 #[test]
+fn config_protect_reuses_identical_highest_variant() {
+    let sb = Sandbox::new();
+    let cp = ConfigProtect::new(["/etc".to_string()], Vec::<String>::new());
+
+    // A live file plus an existing variant whose content equals the new file.
+    std::fs::create_dir_all(sb.eroot.join("etc")).unwrap();
+    std::fs::write(sb.live("/etc/foo.conf"), b"live").unwrap();
+    std::fs::write(sb.live("/etc/._cfg0000_foo.conf"), b"newer").unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/etc/foo.conf", b"newer")]);
+    let engine = MergeEngine::new(sb.context(Features::default(), cp));
+    engine
+        .apply(&[merge_op(image, state("cat/cfg", "1", "0"), None, false)])
+        .unwrap();
+    // The identical existing variant is reused; no new index is allocated.
+    assert_eq!(
+        std::fs::read(sb.live("/etc/._cfg0000_foo.conf")).unwrap(),
+        b"newer"
+    );
+    assert!(!sb.live("/etc/._cfg0001_foo.conf").exists());
+}
+
+#[test]
 fn config_protect_identical_writes_in_place() {
     let sb = Sandbox::new();
     let cp = ConfigProtect::new(["/etc".to_string()], Vec::<String>::new());
