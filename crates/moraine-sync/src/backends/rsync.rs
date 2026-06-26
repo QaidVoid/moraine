@@ -8,6 +8,7 @@
 //! the transfer (and, when enabled, verification) succeeds. The backend shells
 //! out to `rsync` through the injectable [`CommandRunner`].
 
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 
 use tracing::instrument;
@@ -75,9 +76,10 @@ impl<R: CommandRunner> RsyncBackend<R> {
 
     /// Build the tree-transfer command into the staging directory. The default
     /// option set mirrors Portage's `_set_rsync_defaults`; a `PORTAGE_RSYNC_OPTS`
-    /// override replaces the defaults, with the required options re-injected.
-    fn transfer_command(&self, ctx: &SyncContext<'_>) -> CommandSpec {
-        let src = format!("{}/", rsync_source(&ctx.options.uri));
+    /// override replaces the defaults, with the required options re-injected. An
+    /// `addr` override substitutes a resolved mirror address for the host.
+    fn transfer_command(&self, ctx: &SyncContext<'_>, addr: Option<IpAddr>) -> CommandSpec {
+        let src = format!("{}/", source_with_addr(&ctx.options.uri, addr));
         let dst = format!("{}/", ctx.staging.to_string_lossy());
 
         let mut opts: Vec<String> = match &ctx.options.rsync_opts_override {
@@ -142,6 +144,31 @@ impl<R: CommandRunner> RsyncBackend<R> {
         Ok(())
     }
 
+    /// Run the tree transfer, retrying across resolved mirror addresses on a
+    /// transport failure. The attempt budget is the larger of the configured
+    /// retry count (`sync-retries`/`PORTAGE_RSYNC_RETRIES`) and the number of
+    /// resolved addresses, so every mirror IP is tried at least once.
+    fn transfer_with_failover(&self, ctx: &SyncContext<'_>) -> Result<(), SyncError> {
+        let addrs = resolve_addresses(&ctx.options.uri);
+        let attempts = (ctx.options.retries as usize).max(addrs.len()).max(1);
+        let mut last = String::new();
+        for attempt in 0..attempts {
+            // Cycle through the resolved addresses; fall back to the hostname
+            // (no override) when resolution returned nothing.
+            let addr = addrs.get(attempt % addrs.len().max(1)).copied();
+            let transfer = self.transfer_command(ctx, addr);
+            match self.runner.run(&transfer) {
+                Ok(out) if out.success() => return Ok(()),
+                Ok(out) => last = out.stderr.trim().to_owned(),
+                Err(e) => last = e.to_string(),
+            }
+        }
+        Err(SyncError::Transport {
+            repo: ctx.repo.to_owned(),
+            reason: format!("tree transfer failed after {attempts} attempt(s): {last}"),
+        })
+    }
+
     /// Probe the server timestamp and decide freshness.
     #[instrument(skip(self, ctx), fields(repo = ctx.repo))]
     fn probe(&self, ctx: &SyncContext<'_>) -> Result<Freshness, SyncError> {
@@ -171,18 +198,18 @@ impl<R: CommandRunner> RsyncBackend<R> {
         kind: SyncKind,
     ) -> Result<SyncOutcome, SyncError> {
         self.check_vcs(ctx)?;
-        let transfer = self.transfer_command(ctx);
-        let out = self.runner.run(&transfer)?;
-        if !out.success() {
-            return Err(SyncError::Transport {
-                repo: ctx.repo.to_owned(),
-                reason: format!("tree transfer failed: {}", out.stderr.trim()),
-            });
-        }
+        self.transfer_with_failover(ctx)?;
 
         if ctx.options.verify_metamanifest {
             let verifier = Verifier::new(&self.runner);
-            verifier.verify_rsync_tree(ctx.repo, ctx.staging, None)?;
+            // Keep the isolated GnuPG home outside the staged tree so it is not
+            // committed into the live location.
+            let gnupg_home = ctx
+                .staging
+                .parent()
+                .unwrap_or(ctx.staging)
+                .join(format!(".gnupg-{}", ctx.repo));
+            verifier.verify_rsync_tree(ctx.repo, ctx.staging, ctx.options, &gnupg_home)?;
         }
 
         commit_staging(ctx.repo, ctx.staging, ctx.location)?;
@@ -240,6 +267,74 @@ fn rsync_source(uri: &str) -> String {
         return rest.to_string();
     }
     uri.to_string()
+}
+
+/// The rsync daemon port, used to resolve mirror addresses for failover.
+const RSYNC_PORT: u16 = 873;
+
+/// Resolve the mirror host's addresses for failover. The list is lightly
+/// rotated by the process id so a multi-homed mirror is not always contacted on
+/// the same address first (a cheap stand-in for Portage's address shuffle).
+/// Returns an empty list for a URI with no resolvable host (such as `file://`).
+fn resolve_addresses(uri: &str) -> Vec<IpAddr> {
+    let Some(host) = uri_host(uri) else {
+        return Vec::new();
+    };
+    let mut addrs: Vec<IpAddr> = (host.as_str(), RSYNC_PORT)
+        .to_socket_addrs()
+        .map(|it| it.map(|s| s.ip()).collect())
+        .unwrap_or_default();
+    addrs.dedup();
+    if !addrs.is_empty() {
+        let shift = (std::process::id() as usize) % addrs.len();
+        addrs.rotate_left(shift);
+    }
+    addrs
+}
+
+/// Extract the host component of an rsync source from a `sync-uri`, when it has
+/// one. `file://` paths and bare local paths have no host.
+fn uri_host(uri: &str) -> Option<String> {
+    let uri = uri.trim_end_matches('/');
+    if let Some(rest) = uri
+        .strip_prefix("rsync://")
+        .or_else(|| uri.strip_prefix("ssh://"))
+    {
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        return Some(host.split(':').next().unwrap_or(host).to_owned());
+    }
+    if uri.starts_with("file://") || uri.starts_with('/') {
+        return None;
+    }
+    // `host:/path` daemon shorthand.
+    uri.split_once(":/")
+        .map(|(host, _)| host.rsplit('@').next().unwrap_or(host).to_owned())
+}
+
+/// Build an rsync source, substituting a resolved address for the host when one
+/// is given. An IPv6 literal is bracketed as rsync requires.
+fn source_with_addr(uri: &str, addr: Option<IpAddr>) -> String {
+    let base = rsync_source(uri);
+    let Some(addr) = addr else {
+        return base;
+    };
+    let host = if addr.is_ipv6() {
+        format!("[{addr}]")
+    } else {
+        addr.to_string()
+    };
+    if let Some(rest) = base.strip_prefix("rsync://")
+        && let Some((_, path)) = rest.split_once('/')
+    {
+        return format!("rsync://{host}/{path}");
+    }
+    if let Some((h, path)) = base.split_once(":/")
+        && !h.contains('/')
+    {
+        return format!("{host}:/{path}");
+    }
+    base
 }
 
 fn read_timestamp(path: &Path) -> Option<i64> {
@@ -313,6 +408,36 @@ mod tests {
             "user@host:/srv/repo"
         );
         assert_eq!(rsync_source("ssh://host:2222/srv/repo"), "host:/srv/repo");
+    }
+
+    #[test]
+    fn uri_host_extracts_mirror_host() {
+        assert_eq!(
+            uri_host("rsync://mirror.example/gentoo/"),
+            Some("mirror.example".into())
+        );
+        assert_eq!(uri_host("user@host:/srv/repo"), Some("host".into()));
+        assert_eq!(uri_host("ssh://user@host:22/srv"), Some("host".into()));
+        assert_eq!(uri_host("file:///srv/mirror"), None);
+        assert_eq!(uri_host("/srv/mirror"), None);
+    }
+
+    #[test]
+    fn source_with_addr_substitutes_host() {
+        let v4: IpAddr = "1.2.3.4".parse().unwrap();
+        assert_eq!(
+            source_with_addr("rsync://mirror/gentoo", Some(v4)),
+            "rsync://1.2.3.4/gentoo"
+        );
+        let v6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(
+            source_with_addr("rsync://mirror/gentoo", Some(v6)),
+            "rsync://[::1]/gentoo"
+        );
+        assert_eq!(
+            source_with_addr("rsync://mirror/gentoo", None),
+            "rsync://mirror/gentoo"
+        );
     }
 
     #[test]

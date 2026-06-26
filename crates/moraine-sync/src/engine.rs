@@ -74,6 +74,13 @@ pub struct SyncEngine<'a, 'b, R: CommandRunner, M: MetadataRefresher> {
     defaults: SyncDefaults,
     staging_root: PathBuf,
     extras: ExtrasMap,
+    /// `PORTAGE_CONFIGROOT` for discovering `repo.postsync.d`/`postsync.d` hooks.
+    config_root: Option<PathBuf>,
+    /// `sync-hooks-only-on-change`: when set, hooks run only on a changed sync.
+    hooks_only_on_change: bool,
+    /// `FEATURES=metadata-transfer`: gate the post-sync cache transfer. Default
+    /// on; when off, the metadata refresh is skipped (matching `_sync_callback`).
+    metadata_transfer: bool,
 }
 
 impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
@@ -95,7 +102,31 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
             defaults: SyncDefaults::default(),
             staging_root: staging_root.as_ref().to_path_buf(),
             extras: ExtrasMap::new(),
+            config_root: None,
+            hooks_only_on_change: true,
+            metadata_transfer: true,
         }
+    }
+
+    /// Set whether `FEATURES=metadata-transfer` is enabled (default on). When
+    /// off, the post-sync metadata refresh is skipped.
+    pub fn with_metadata_transfer(mut self, enabled: bool) -> Self {
+        self.metadata_transfer = enabled;
+        self
+    }
+
+    /// Set `PORTAGE_CONFIGROOT` so `repo.postsync.d`/`postsync.d` hooks under
+    /// `<root>/etc/portage/` are discovered and run.
+    pub fn with_config_root(mut self, root: impl AsRef<Path>) -> Self {
+        self.config_root = Some(root.as_ref().to_path_buf());
+        self
+    }
+
+    /// Set `sync-hooks-only-on-change`: when `false`, hooks fire even on an
+    /// unchanged sync.
+    pub fn with_hooks_only_on_change(mut self, only_on_change: bool) -> Self {
+        self.hooks_only_on_change = only_on_change;
+        self
     }
 
     /// Override the engine-wide `sync-*` defaults.
@@ -207,7 +238,9 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
             history.record(&cfg.name, head.as_deref());
         }
 
-        let refresh = if outcome.changed {
+        // The post-sync metadata refresh runs only on a changed sync and only
+        // when FEATURES=metadata-transfer is enabled (matching `_sync_callback`).
+        let refresh = if outcome.changed && self.metadata_transfer {
             match self.refresher.refresh(&cfg.name, false) {
                 Ok(r) => Some(r),
                 Err(e) => return RepoResult::Failed(e),
@@ -224,6 +257,13 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
             return RepoResult::Failed(e);
         }
 
+        // postsync.d / repo.postsync.d hooks fire after the refresh.
+        if let Err(e) =
+            self.run_postsync_hooks(&cfg.name, &options.uri, &cfg.location, outcome.changed)
+        {
+            return RepoResult::Failed(e);
+        }
+
         RepoResult::Synced { outcome, refresh }
     }
 
@@ -235,6 +275,52 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
             path: staging.to_path_buf(),
             reason: format!("could not create staging for `{repo}`: {source}"),
         })
+    }
+
+    /// Run the `repo.postsync.d` (per-repo, argv `[name, uri, location]`) and
+    /// `postsync.d` (global, no args) hooks under `<config_root>/etc/portage/`,
+    /// in sorted order. Hooks run when the tree `changed` or when
+    /// `sync-hooks-only-on-change` is unset. A hook failure is reported.
+    fn run_postsync_hooks(
+        &self,
+        repo: &str,
+        uri: &str,
+        location: &Path,
+        changed: bool,
+    ) -> Result<(), SyncError> {
+        let Some(root) = &self.config_root else {
+            return Ok(());
+        };
+        if !changed && self.hooks_only_on_change {
+            return Ok(());
+        }
+        let portage = root.join("etc/portage");
+        let location = location.to_string_lossy().into_owned();
+        for hook in executable_hooks(&portage.join("repo.postsync.d")) {
+            let spec = CommandSpec::new(hook.to_string_lossy().into_owned())
+                .arg(repo)
+                .arg(uri)
+                .arg(&location);
+            self.run_hook(repo, &spec)?;
+        }
+        for hook in executable_hooks(&portage.join("postsync.d")) {
+            let spec = CommandSpec::new(hook.to_string_lossy().into_owned());
+            self.run_hook(repo, &spec)?;
+        }
+        Ok(())
+    }
+
+    /// Run one hook command, mapping a non-zero exit to a post-sync error.
+    fn run_hook(&self, repo: &str, spec: &CommandSpec) -> Result<(), SyncError> {
+        let out = self.runner.run(spec)?;
+        if out.success() {
+            Ok(())
+        } else {
+            Err(SyncError::PostSyncAction {
+                repo: repo.to_owned(),
+                reason: format!("hook `{}` failed: {}", spec.program, out.stderr.trim()),
+            })
+        }
     }
 
     /// Run a repository-level post-sync action.
@@ -253,4 +339,24 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
             })
         }
     }
+}
+
+/// The executable files directly under `dir`, in sorted name order. Returns an
+/// empty list when the directory is absent or holds no executables.
+fn executable_hooks(dir: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut hooks: Vec<PathBuf> = read
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+        .collect();
+    hooks.sort();
+    hooks
 }

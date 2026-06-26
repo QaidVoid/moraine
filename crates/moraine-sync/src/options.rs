@@ -89,6 +89,11 @@ pub struct SyncOptions {
     pub rsync_vcs_ignore: bool,
     /// rsync `sync-rsync-verify-metamanifest`: verify the metamanifest tree.
     pub verify_metamanifest: bool,
+    /// rsync `sync-rsync-verify-jobs`: parallel manifest-verification jobs.
+    pub rsync_verify_jobs: Option<u32>,
+    /// rsync `sync-rsync-verify-max-age`: warn when the Manifest `TIMESTAMP` is
+    /// older than this many days (0 disables the check).
+    pub rsync_verify_max_age_days: u32,
     /// git `sync-git-verify-commit-signature`: verify the head commit signature.
     pub git_verify_commit_signature: bool,
     /// git `sync-git-verify-max-age-days`: reject a head older than this (0 = off).
@@ -143,7 +148,12 @@ impl SyncOptions {
             .or_else(|| parse_u64(get("sync-timeout").as_deref()))
             .unwrap_or(defaults.timeout_secs);
 
-        let retries = parse_u32(get("sync-retries").as_deref()).unwrap_or(defaults.retries);
+        // `PORTAGE_RSYNC_RETRIES` overrides `sync-retries` for rsync; a negative
+        // value (Portage's default of -1, meaning "try every address") does not
+        // parse and falls through to the general retry count.
+        let retries = parse_u32(get("PORTAGE_RSYNC_RETRIES").as_deref())
+            .or_else(|| parse_u32(get("sync-retries").as_deref()))
+            .unwrap_or(defaults.retries);
 
         let depth = parse_u32(get("sync-depth").as_deref())
             .or_else(|| parse_u32(get("clone-depth").as_deref()))
@@ -176,6 +186,9 @@ impl SyncOptions {
             Some("no") | Some("false") | Some("0") => false,
             _ => defaults.verify,
         };
+        let rsync_verify_jobs = parse_u32(get("sync-rsync-verify-jobs").as_deref());
+        let rsync_verify_max_age_days =
+            parse_u32(get("sync-rsync-verify-max-age").as_deref()).unwrap_or(0);
         let git_verify_commit_signature = bool_key("sync-git-verify-commit-signature", false);
         let git_verify_max_age_days =
             parse_u32(get("sync-git-verify-max-age-days").as_deref()).unwrap_or(0);
@@ -210,6 +223,8 @@ impl SyncOptions {
             rsync_opts_override,
             rsync_vcs_ignore,
             verify_metamanifest,
+            rsync_verify_jobs,
+            rsync_verify_max_age_days,
             git_verify_commit_signature,
             git_verify_max_age_days,
             webrsync_verify_signature,

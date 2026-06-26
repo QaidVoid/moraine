@@ -371,6 +371,8 @@ fn rsync_server_out_of_date_preserves_tree() {
         rsync_opts_override: None,
         rsync_vcs_ignore: false,
         verify_metamanifest: false,
+        rsync_verify_jobs: None,
+        rsync_verify_max_age_days: 0,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
         webrsync_verify_signature: false,
@@ -419,6 +421,8 @@ fn rsync_transfer_includes_standard_excludes_and_extra_opts() {
         rsync_opts_override: None,
         rsync_vcs_ignore: false,
         verify_metamanifest: false,
+        rsync_verify_jobs: None,
+        rsync_verify_max_age_days: 0,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
         webrsync_verify_signature: false,
@@ -483,6 +487,8 @@ fn rsync_verification_failure_preserves_prior_tree() {
         rsync_opts_override: None,
         rsync_vcs_ignore: false,
         verify_metamanifest: true,
+        rsync_verify_jobs: None,
+        rsync_verify_max_age_days: 0,
         git_verify_commit_signature: true,
         git_verify_max_age_days: 0,
         webrsync_verify_signature: true,
@@ -506,6 +512,115 @@ fn rsync_verification_failure_preserves_prior_tree() {
         loc.join("marker").exists(),
         "prior tree must survive failed verification"
     );
+}
+
+#[test]
+fn metamanifest_verify_detects_tampered_file() {
+    use crate::verify::Verifier;
+    let tmp = TempDir::new().unwrap();
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("foo"), b"abc").unwrap();
+    let digest = moraine_common::hash::sha256(b"abc");
+    std::fs::write(
+        staging.join("Manifest"),
+        format!("DATA foo 3 SHA256 {digest}\nTIMESTAMP 2026-06-21T05:38:02Z\n"),
+    )
+    .unwrap();
+
+    let runner = FakeRunner::new().rule(|s| (s.program == "gpg").then(|| ok("")));
+    let mut opts = rsync_verify_opts();
+    opts.verify_metamanifest = true;
+    let verifier = Verifier::new(&runner);
+    let gnupg = tmp.path().join("gnupg");
+
+    // A clean tree with a matching signature and hash verifies.
+    verifier
+        .verify_rsync_tree("g", &staging, &opts, &gnupg)
+        .expect("clean tree must verify");
+
+    // Tampering a listed file fails even though the signature is accepted.
+    std::fs::write(staging.join("foo"), b"xyz").unwrap();
+    let err = verifier
+        .verify_rsync_tree("g", &staging, &opts, &gnupg)
+        .unwrap_err();
+    assert!(matches!(err, SyncError::Verification { .. }));
+
+    // A file listed in the Manifest but missing from the tree also fails.
+    std::fs::remove_file(staging.join("foo")).unwrap();
+    let err = verifier
+        .verify_rsync_tree("g", &staging, &opts, &gnupg)
+        .unwrap_err();
+    assert!(matches!(err, SyncError::Verification { .. }));
+}
+
+#[test]
+fn rsync_transfer_retries_on_transport_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("repo");
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+
+    let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let runner = FakeRunner::new().rule(move |s| {
+        if s.program == "rsync" && s.args.iter().any(|a| a == "--recursive") {
+            // Fail the first attempt, succeed on the retry.
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            Some(if n == 0 {
+                fail("connection refused")
+            } else {
+                ok("")
+            })
+        } else {
+            None
+        }
+    });
+    let backend = RsyncBackend::new(&runner);
+    let mut opts = rsync_verify_opts();
+    opts.verify_metamanifest = false;
+    opts.retries = 3;
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    let outcome = backend.fetch(&ctx).expect("retry must recover");
+    assert!(outcome.changed);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "one failure then one success"
+    );
+}
+
+fn rsync_verify_opts() -> SyncOptions {
+    SyncOptions {
+        sync_type: "rsync".into(),
+        uri: "rsync://x".into(),
+        auto_sync: true,
+        timeout_secs: 5,
+        retries: 1,
+        depth: None,
+        rsync_extra_opts: vec![],
+        rsync_opts_override: None,
+        rsync_vcs_ignore: false,
+        verify_metamanifest: true,
+        rsync_verify_jobs: None,
+        rsync_verify_max_age_days: 0,
+        git_verify_commit_signature: false,
+        git_verify_max_age_days: 0,
+        webrsync_verify_signature: false,
+        webrsync_keep_snapshots: false,
+        openpgp_key_path: None,
+        openpgp_keyserver: None,
+        key_refresh: crate::options::KeyRefresh::Disabled,
+        refresh_retries: 0,
+        post_sync: None,
+        volatile: false,
+    }
 }
 
 // --- git backend ------------------------------------------------------------
@@ -625,6 +740,48 @@ fn git_volatile_repo_is_not_clobbered() {
     }
 }
 
+#[test]
+fn postsync_hooks_run_with_argv_and_change_gate() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = TempDir::new().unwrap();
+    let loc = make_repo(tmp.path(), "gentoo", "");
+    let set = discover_set(
+        tmp.path(),
+        &format!(
+            "[gentoo]\nlocation = {}\nsync-type = webrsync\nsync-uri = https://m\n",
+            loc.display()
+        ),
+    );
+    // A repo.postsync.d hook (executable).
+    let hooks = tmp.path().join("config/etc/portage/repo.postsync.d");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("10-notify");
+    std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let runner = FakeRunner::new()
+        .rule(|s| (s.program == "emerge-webrsync").then(|| ok("")))
+        .rule(|s| s.program.ends_with("10-notify").then(|| ok("")));
+    let registry = BackendRegistry::new(vec![Box::new(WebrsyncBackend::new(&runner))]);
+    let refresher = FakeRefresher::new();
+    let staging = tmp.path().join("staging");
+    let engine = SyncEngine::new(&set, &registry, &refresher, &runner, &staging)
+        .with_config_root(tmp.path().join("config"));
+
+    let mut history = RevisionHistory::new();
+    let report = engine.sync_all(&mut history);
+    assert!(report.get("gentoo").unwrap().is_synced());
+    let hook_call = runner
+        .calls()
+        .into_iter()
+        .find(|c| c.program.ends_with("10-notify"))
+        .expect("hook must run");
+    // argv is [reponame, sync_uri, repo_location].
+    assert_eq!(hook_call.args[0], "gentoo");
+    assert_eq!(hook_call.args[1], "https://m");
+    assert_eq!(hook_call.args[2], loc.to_string_lossy());
+}
+
 fn git_opts(depth: Option<u32>) -> SyncOptions {
     SyncOptions {
         sync_type: "git".into(),
@@ -637,6 +794,8 @@ fn git_opts(depth: Option<u32>) -> SyncOptions {
         rsync_opts_override: None,
         rsync_vcs_ignore: false,
         verify_metamanifest: false,
+        rsync_verify_jobs: None,
+        rsync_verify_max_age_days: 0,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
         webrsync_verify_signature: false,
@@ -671,6 +830,8 @@ fn webrsync_signature_rejection_is_verification_error() {
         rsync_opts_override: None,
         rsync_vcs_ignore: false,
         verify_metamanifest: true,
+        rsync_verify_jobs: None,
+        rsync_verify_max_age_days: 0,
         git_verify_commit_signature: true,
         git_verify_max_age_days: 0,
         webrsync_verify_signature: true,
@@ -756,6 +917,8 @@ fn webrsync_opts() -> SyncOptions {
         rsync_opts_override: None,
         rsync_vcs_ignore: false,
         verify_metamanifest: false,
+        rsync_verify_jobs: None,
+        rsync_verify_max_age_days: 0,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
         webrsync_verify_signature: false,

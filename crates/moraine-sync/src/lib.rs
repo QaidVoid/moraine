@@ -35,6 +35,7 @@ pub mod command;
 pub mod engine;
 pub mod error;
 pub mod extras;
+pub mod manifest;
 pub mod options;
 pub mod outcome;
 pub mod pool;
