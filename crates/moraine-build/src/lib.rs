@@ -39,6 +39,7 @@ pub mod phase;
 pub mod runner;
 pub mod sandbox;
 pub mod srcuri;
+pub mod strip;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -214,6 +215,9 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
 
     // 5. Drive phases.
     let report = driver.run_all()?;
+
+    // 5b. Strip ELF objects in the image, gated on nostrip/RESTRICT=strip.
+    strip::strip_image(&layout.image, &request.config, &pkg.restrict, runner);
 
     // 6. Build-info metadata.
     let mut info = BuildInfo::default();

@@ -39,6 +39,7 @@ fn context(root: &std::path::Path) -> MergeContext {
         config_protect: ConfigProtect::new(Vec::new(), Vec::new()),
         collision_ignore: Vec::new(),
         uninstall_ignore: Vec::new(),
+        install_mask: Default::default(),
     }
 }
 

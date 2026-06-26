@@ -32,6 +32,7 @@ pub mod collision;
 pub mod contents;
 pub mod error;
 pub mod image;
+pub mod install_mask;
 pub mod plan;
 pub mod preserve;
 pub mod protect;
@@ -120,6 +121,9 @@ pub struct MergeContext {
     /// `UNINSTALL_IGNORE` globs: owned paths matching any are never removed on
     /// unmerge.
     pub uninstall_ignore: Vec<String>,
+    /// The combined `INSTALL_MASK`/`PKG_INSTALL_MASK` filter: matching image
+    /// paths are dropped before they enter CONTENTS.
+    pub install_mask: install_mask::InstallMask,
 }
 
 impl MergeContext {
@@ -176,7 +180,7 @@ pub(crate) fn path_matches_any(path: &str, globs: &[String]) -> bool {
 
 /// A minimal `fnmatch` supporting `*` (any run, separators included) and `?`
 /// (any single character).
-fn fnmatch(text: &str, pat: &str) -> bool {
+pub(crate) fn fnmatch(text: &str, pat: &str) -> bool {
     let (t, p) = (text.as_bytes(), pat.as_bytes());
     // Iterative backtracking match.
     let (mut ti, mut pi) = (0, 0);
@@ -259,6 +263,7 @@ mod tests {
             config_protect: ConfigProtect::default(),
             collision_ignore: Vec::new(),
             uninstall_ignore: Vec::new(),
+            install_mask: Default::default(),
         };
         assert_eq!(
             ctx.live_path("/usr/bin/foo"),

@@ -48,7 +48,18 @@ pub(crate) fn place_image(
     let span = tracing::info_span!("merge", pkg = %op.state.cpv);
     let _enter = span.enter();
 
-    let items = image::scan(&op.image_dir, ctx.features.xattr)?;
+    let mut items = image::scan(&op.image_dir, ctx.features.xattr)?;
+
+    // INSTALL_MASK: drop masked paths before any file enters CONTENTS, so masked
+    // doc/man/info and configured paths are never merged or recorded.
+    if !ctx.install_mask.is_empty() {
+        let before = items.len();
+        items.retain(|item| !ctx.install_mask.is_masked(&item.install_path));
+        let removed = before - items.len();
+        if removed > 0 {
+            tracing::info!(count = removed, "INSTALL_MASK filtered staged paths");
+        }
+    }
 
     // Collision protection runs entirely before any mutation.
     let collisions = {

@@ -85,7 +85,21 @@ pub(crate) fn merge_context(ctx: &ConfigContext, wr: &WriteRoots) -> MergeContex
         ),
         collision_ignore: whitespace_list(ctx.vars.get("COLLISION_IGNORE")),
         uninstall_ignore: whitespace_list(ctx.vars.get("UNINSTALL_IGNORE")),
+        install_mask: install_mask_from(ctx),
     }
+}
+
+/// Build the combined INSTALL_MASK filter from configuration and the
+/// `nodoc`/`noman`/`noinfo` FEATURES.
+fn install_mask_from(ctx: &ConfigContext) -> moraine_merge::install_mask::InstallMask {
+    let features: Vec<&str> = ctx.features.iter().map(String::as_str).collect();
+    let spec = moraine_merge::install_mask::combined_spec(
+        ctx.vars.get("INSTALL_MASK").unwrap_or_default(),
+        ctx.vars.get("PKG_INSTALL_MASK").unwrap_or_default(),
+        ctx.vars.get("EPREFIX").unwrap_or_default(),
+        &features,
+    );
+    moraine_merge::install_mask::InstallMask::new(&spec)
 }
 
 /// Split a whitespace-separated configuration value into owned tokens.

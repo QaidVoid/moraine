@@ -44,7 +44,14 @@ impl Sandbox {
             config_protect: cp,
             collision_ignore: Vec::new(),
             uninstall_ignore: Vec::new(),
+            install_mask: Default::default(),
         }
+    }
+
+    fn context_masked(&self, mask: &str) -> MergeContext {
+        let mut ctx = self.context(Features::default(), ConfigProtect::default());
+        ctx.install_mask = moraine_merge::install_mask::InstallMask::new(mask);
+        ctx
     }
 
     fn live(&self, install_path: &str) -> PathBuf {
@@ -112,6 +119,32 @@ fn merge_op(image: PathBuf, st: PackageState, replaces: Option<&str>, in_world: 
         in_world,
         elog: Vec::new(),
     }))
+}
+
+#[test]
+fn install_mask_filters_paths_before_contents() {
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(
+        tmp.path(),
+        &[
+            ("/usr/bin/keep", b"x"),
+            ("/usr/share/doc/foo/readme", b"docs"),
+        ],
+    );
+
+    let engine = MergeEngine::new(sb.context_masked("/usr/share/doc"));
+    engine
+        .apply(&[merge_op(image, state("cat/p", "1", "0"), None, false)])
+        .unwrap();
+
+    // The kept file is merged; the masked doc path is neither merged nor owned.
+    assert!(sb.live("/usr/bin/keep").exists());
+    assert!(!sb.live("/usr/share/doc/foo/readme").exists());
+    let store = moraine_vdb::Store::load(moraine_vdb::StorePaths::in_dir(&sb.vdb)).unwrap();
+    let rec = &store.records()[0];
+    assert!(rec.contents.owner("/usr/bin/keep").is_some());
+    assert!(rec.contents.owner("/usr/share/doc/foo/readme").is_none());
 }
 
 #[test]
