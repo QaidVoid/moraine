@@ -82,6 +82,11 @@ pub struct SyncOptions {
     pub depth: Option<u32>,
     /// Extra rsync options from `sync-rsync-extra-opts`.
     pub rsync_extra_opts: Vec<String>,
+    /// A full `PORTAGE_RSYNC_OPTS` override replacing the default option set, when
+    /// set. Required options and excludes are re-injected by the backend.
+    pub rsync_opts_override: Option<Vec<String>>,
+    /// `sync-rsync-vcs-ignore`: sync into a VCS-controlled target without aborting.
+    pub rsync_vcs_ignore: bool,
     /// rsync `sync-rsync-verify-metamanifest`: verify the metamanifest tree.
     pub verify_metamanifest: bool,
     /// git `sync-git-verify-commit-signature`: verify the head commit signature.
@@ -102,6 +107,9 @@ pub struct SyncOptions {
     pub refresh_retries: u32,
     /// The repository-level post-sync command from `post-sync`, when set.
     pub post_sync: Option<Vec<String>>,
+    /// Whether the repository is `volatile` (user-managed): its revision history
+    /// is not recorded and the git backend never clobbers it.
+    pub volatile: bool,
 }
 
 impl SyncOptions {
@@ -145,6 +153,13 @@ impl SyncOptions {
         let rsync_extra_opts = get("sync-rsync-extra-opts")
             .map(|s| s.split_whitespace().map(str::to_owned).collect())
             .unwrap_or_default();
+        let rsync_opts_override = get("PORTAGE_RSYNC_OPTS")
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split_whitespace().map(str::to_owned).collect());
+        let rsync_vcs_ignore = matches!(
+            get("sync-rsync-vcs-ignore").as_deref(),
+            Some("yes") | Some("true") | Some("1")
+        );
 
         // Each backend's verify key is parsed independently so enabling one does
         // not silently force another.
@@ -192,6 +207,8 @@ impl SyncOptions {
             retries,
             depth,
             rsync_extra_opts,
+            rsync_opts_override,
+            rsync_vcs_ignore,
             verify_metamanifest,
             git_verify_commit_signature,
             git_verify_max_age_days,
@@ -202,6 +219,7 @@ impl SyncOptions {
             key_refresh,
             refresh_retries,
             post_sync,
+            volatile: false,
         })
     }
 }

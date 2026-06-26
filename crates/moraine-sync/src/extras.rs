@@ -19,6 +19,9 @@ pub struct RepoExtras {
     pub auto_sync: Option<bool>,
     /// The `post-sync` action argv, when present.
     pub post_sync: Option<Vec<String>>,
+    /// The `volatile` value: a user-managed repository whose revision history is
+    /// not recorded and which the git backend never clobbers.
+    pub volatile: bool,
 }
 
 /// The `auto-sync`/`post-sync` settings for every repository, by section name.
@@ -96,6 +99,9 @@ impl ExtrasMap {
                     "post-sync" => {
                         entry.post_sync =
                             Some(value.split_whitespace().map(str::to_owned).collect());
+                    }
+                    "volatile" => {
+                        entry.volatile = matches!(value, "yes" | "true" | "1" | "Yes" | "True");
                     }
                     _ => {}
                 }

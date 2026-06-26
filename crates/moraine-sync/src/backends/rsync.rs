@@ -60,10 +60,7 @@ impl<R: CommandRunner> RsyncBackend<R> {
     /// Build the timestamp-probe command: transfer only `metadata/timestamp.chk`
     /// into the staging directory with a bounded connection timeout.
     fn probe_command(&self, ctx: &SyncContext<'_>) -> CommandSpec {
-        let src = format!(
-            "{}/metadata/timestamp.chk",
-            ctx.options.uri.trim_end_matches('/')
-        );
+        let src = format!("{}/metadata/timestamp.chk", rsync_source(&ctx.options.uri));
         let dst = ctx
             .staging
             .join("timestamp.chk")
@@ -76,22 +73,73 @@ impl<R: CommandRunner> RsyncBackend<R> {
             .arg(dst)
     }
 
-    /// Build the tree-transfer command into the staging directory.
+    /// Build the tree-transfer command into the staging directory. The default
+    /// option set mirrors Portage's `_set_rsync_defaults`; a `PORTAGE_RSYNC_OPTS`
+    /// override replaces the defaults, with the required options re-injected.
     fn transfer_command(&self, ctx: &SyncContext<'_>) -> CommandSpec {
-        let src = format!("{}/", ctx.options.uri.trim_end_matches('/'));
+        let src = format!("{}/", rsync_source(&ctx.options.uri));
         let dst = format!("{}/", ctx.staging.to_string_lossy());
-        CommandSpec::new("rsync")
-            .arg("--recursive")
-            .arg("--links")
-            .arg("--perms")
-            .arg("--times")
-            .arg("--compress")
-            .arg("--delete")
-            .arg(format!("--timeout={}", ctx.options.timeout_secs))
-            .args(STANDARD_EXCLUDES.iter().copied())
-            .args(ctx.options.rsync_extra_opts.iter().cloned())
-            .arg(src)
-            .arg(dst)
+
+        let mut opts: Vec<String> = match &ctx.options.rsync_opts_override {
+            Some(over) => {
+                // `_validate_rsync_opts`: keep the user options, re-inject the
+                // required ones and the excludes that must always be present.
+                let mut o = over.clone();
+                for req in ["--recursive", "--times"] {
+                    if !o.iter().any(|a| a == req) {
+                        o.push(req.to_string());
+                    }
+                }
+                o
+            }
+            None => [
+                "--recursive",
+                "--links",
+                "--safe-links",
+                "--perms",
+                "--times",
+                "--omit-dir-times",
+                "--compress",
+                "--force",
+                "--whole-file",
+                "--delete",
+                "--stats",
+                "--human-readable",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        };
+        opts.push(format!("--timeout={}", ctx.options.timeout_secs));
+        for exclude in STANDARD_EXCLUDES {
+            if !opts.iter().any(|a| a == exclude) {
+                opts.push((*exclude).to_string());
+            }
+        }
+        opts.extend(ctx.options.rsync_extra_opts.iter().cloned());
+
+        CommandSpec::new("rsync").args(opts).arg(src).arg(dst)
+    }
+
+    /// Abort the sync when the target is a VCS-controlled checkout and
+    /// `sync-rsync-vcs-ignore` is not set, rather than silently letting rsync
+    /// overwrite a `.git`/`.svn`/... tree.
+    fn check_vcs(&self, ctx: &SyncContext<'_>) -> Result<(), SyncError> {
+        if ctx.options.rsync_vcs_ignore {
+            return Ok(());
+        }
+        const VCS_DIRS: &[&str] = &[".git", ".svn", ".hg", ".bzr", "CVS"];
+        for vcs in VCS_DIRS {
+            if ctx.location.join(vcs).exists() {
+                return Err(SyncError::Config {
+                    repo: ctx.repo.to_owned(),
+                    reason: format!(
+                        "target is {vcs}-controlled; set sync-rsync-vcs-ignore to override"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Probe the server timestamp and decide freshness.
@@ -122,6 +170,7 @@ impl<R: CommandRunner> RsyncBackend<R> {
         ctx: &SyncContext<'_>,
         kind: SyncKind,
     ) -> Result<SyncOutcome, SyncError> {
+        self.check_vcs(ctx)?;
         let transfer = self.transfer_command(ctx);
         let out = self.runner.run(&transfer)?;
         if !out.success() {
@@ -174,6 +223,25 @@ impl<R: CommandRunner> Backend for RsyncBackend<R> {
 
 /// Read the integer timestamp from a `timestamp.chk` file, ignoring a trailing
 /// human-readable suffix.
+/// Translate a `sync-uri` into an rsync source root: an `rsync://` URI is kept,
+/// a `file://` URI is stripped to its local path, and an `ssh://host/path` URI is
+/// rewritten to rsync's `host:/path` form. Any other value is returned trimmed.
+fn rsync_source(uri: &str) -> String {
+    let uri = uri.trim_end_matches('/');
+    if let Some(path) = uri.strip_prefix("file://") {
+        return path.to_string();
+    }
+    if let Some(rest) = uri.strip_prefix("ssh://") {
+        // `host[:port]/path` -> `host:/path` (rsync over ssh).
+        if let Some((host, path)) = rest.split_once('/') {
+            let host = host.split(':').next().unwrap_or(host);
+            return format!("{host}:/{path}");
+        }
+        return rest.to_string();
+    }
+    uri.to_string()
+}
+
 fn read_timestamp(path: &Path) -> Option<i64> {
     let content = std::fs::read_to_string(path).ok()?;
     content
@@ -231,6 +299,20 @@ mod tests {
     #[test]
     fn freshness_current_when_equal() {
         assert_eq!(classify_freshness(100, Some(100)), Freshness::Current);
+    }
+
+    #[test]
+    fn rsync_source_handles_file_and_ssh_schemes() {
+        assert_eq!(
+            rsync_source("rsync://host/gentoo-portage/"),
+            "rsync://host/gentoo-portage"
+        );
+        assert_eq!(rsync_source("file:///srv/mirror/"), "/srv/mirror");
+        assert_eq!(
+            rsync_source("ssh://user@host/srv/repo"),
+            "user@host:/srv/repo"
+        );
+        assert_eq!(rsync_source("ssh://host:2222/srv/repo"), "host:/srv/repo");
     }
 
     #[test]

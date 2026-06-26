@@ -165,6 +165,7 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
         if let Some(post) = extras.post_sync {
             options.post_sync = Some(post);
         }
+        options.volatile = extras.volatile;
 
         if !options.auto_sync && !explicitly_named {
             return RepoResult::Skipped;
@@ -197,11 +198,14 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
         let _ = std::fs::remove_dir_all(&staging);
 
         // Record revision history: use the outcome head, else query the backend.
+        // A volatile (user-managed) repository records no revision history.
         let head = match &outcome.head {
             Some(h) => Some(h.clone()),
             None => backend.retrieve_head(&ctx).ok().flatten(),
         };
-        history.record(&cfg.name, head.as_deref());
+        if !options.volatile {
+            history.record(&cfg.name, head.as_deref());
+        }
 
         let refresh = if outcome.changed {
             match self.refresher.refresh(&cfg.name, false) {

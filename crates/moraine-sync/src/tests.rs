@@ -368,6 +368,8 @@ fn rsync_server_out_of_date_preserves_tree() {
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
+        rsync_opts_override: None,
+        rsync_vcs_ignore: false,
         verify_metamanifest: false,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
@@ -378,6 +380,7 @@ fn rsync_server_out_of_date_preserves_tree() {
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
+        volatile: false,
     };
     let ctx = SyncContext {
         repo: "g",
@@ -413,6 +416,8 @@ fn rsync_transfer_includes_standard_excludes_and_extra_opts() {
         retries: 1,
         depth: None,
         rsync_extra_opts: vec!["--bwlimit=1000".into()],
+        rsync_opts_override: None,
+        rsync_vcs_ignore: false,
         verify_metamanifest: false,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
@@ -423,6 +428,7 @@ fn rsync_transfer_includes_standard_excludes_and_extra_opts() {
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
+        volatile: false,
     };
     let ctx = SyncContext {
         repo: "g",
@@ -474,6 +480,8 @@ fn rsync_verification_failure_preserves_prior_tree() {
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
+        rsync_opts_override: None,
+        rsync_vcs_ignore: false,
         verify_metamanifest: true,
         git_verify_commit_signature: true,
         git_verify_max_age_days: 0,
@@ -484,6 +492,7 @@ fn rsync_verification_failure_preserves_prior_tree() {
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
+        volatile: false,
     };
     let ctx = SyncContext {
         repo: "g",
@@ -576,7 +585,9 @@ fn git_change_detected_only_when_head_moves() {
             } else {
                 None
             }
-        });
+        })
+        // The non-volatile clobber path also runs remote/clean/reset/gc.
+        .rule(|s| (s.program == "git").then(|| ok("")));
     let backend = GitBackend::new(&runner);
     let opts = git_opts(None);
     let ctx = SyncContext {
@@ -589,6 +600,31 @@ fn git_change_detected_only_when_head_moves() {
     assert!(!out.changed, "head did not move, so no change");
 }
 
+#[test]
+fn git_volatile_repo_is_not_clobbered() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    std::fs::create_dir_all(loc.join(".git")).unwrap();
+    let staging = tmp.path().join("staging/g");
+    let runner = FakeRunner::new().rule(|s| (s.program == "git").then(|| ok("h")));
+    let backend = GitBackend::new(&runner);
+    let mut opts = git_opts(None);
+    opts.volatile = true;
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    backend.update(&ctx).unwrap();
+    // A volatile repo must never run the destructive clobber commands.
+    for call in runner.calls() {
+        assert!(!call.args.iter().any(|a| a == "clean"));
+        assert!(!call.args.iter().any(|a| a == "reset"));
+        assert!(!call.args.iter().any(|a| a == "gc"));
+    }
+}
+
 fn git_opts(depth: Option<u32>) -> SyncOptions {
     SyncOptions {
         sync_type: "git".into(),
@@ -598,6 +634,8 @@ fn git_opts(depth: Option<u32>) -> SyncOptions {
         retries: 1,
         depth,
         rsync_extra_opts: vec![],
+        rsync_opts_override: None,
+        rsync_vcs_ignore: false,
         verify_metamanifest: false,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
@@ -608,6 +646,7 @@ fn git_opts(depth: Option<u32>) -> SyncOptions {
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
+        volatile: false,
     }
 }
 
@@ -629,6 +668,8 @@ fn webrsync_signature_rejection_is_verification_error() {
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
+        rsync_opts_override: None,
+        rsync_vcs_ignore: false,
         verify_metamanifest: true,
         git_verify_commit_signature: true,
         git_verify_max_age_days: 0,
@@ -639,6 +680,7 @@ fn webrsync_signature_rejection_is_verification_error() {
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
+        volatile: false,
     };
     let ctx = SyncContext {
         repo: "g",
@@ -711,6 +753,8 @@ fn webrsync_opts() -> SyncOptions {
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
+        rsync_opts_override: None,
+        rsync_vcs_ignore: false,
         verify_metamanifest: false,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
@@ -721,6 +765,7 @@ fn webrsync_opts() -> SyncOptions {
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
         post_sync: None,
+        volatile: false,
     }
 }
 
