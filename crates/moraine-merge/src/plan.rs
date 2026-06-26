@@ -39,6 +39,8 @@ pub struct MergeOp {
     pub replaces: Option<String>,
     /// Whether the package was explicitly requested and so joins `@world`.
     pub in_world: bool,
+    /// The build-time elog messages to carry into the post-merge report.
+    pub elog: Vec<crate::state::ElogRecord>,
 }
 
 /// An unmerge operation: the package to remove from the live root.

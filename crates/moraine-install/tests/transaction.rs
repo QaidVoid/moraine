@@ -51,6 +51,7 @@ impl StepRunner for FakeRunner {
             state: state_for(&task.cpv, &task.cp, &task.slot),
             replaces: task.replaces.clone(),
             in_world: task.in_world,
+            elog: Vec::new(),
         };
         Ok(Realized::Apply(Operation::Merge(Box::new(op))))
     }

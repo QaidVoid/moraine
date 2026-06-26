@@ -110,6 +110,7 @@ fn merge_op(image: PathBuf, st: PackageState, replaces: Option<&str>, in_world: 
         state: st,
         replaces: replaces.map(str::to_string),
         in_world,
+        elog: Vec::new(),
     }))
 }
 

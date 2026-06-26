@@ -296,9 +296,16 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     };
     let applier = EngineApplier::new(merge_context(ctx, &wr));
     let engine = TransactionEngine::new(&runner, &applier, &wr.state_dir);
-    engine
+    let report = engine
         .run(&Transaction::new(tasks))
         .map_err(|e| miette!("install failed: {e}"))?;
+    // Dispatch the build-time elog through the configured modules.
+    crate::elog::dispatch(
+        &report.elog,
+        ctx.vars.get("PORTAGE_ELOG_CLASSES"),
+        ctx.vars.get("PORTAGE_ELOG_SYSTEM"),
+        &wr.eroot,
+    );
     println!("Installation complete.");
     Ok(())
 }

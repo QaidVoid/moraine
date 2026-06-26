@@ -13,6 +13,7 @@ pub mod binhost;
 pub mod config;
 pub mod corpus;
 pub mod diagnostics;
+pub mod elog;
 pub mod news;
 pub mod plan;
 pub mod render;

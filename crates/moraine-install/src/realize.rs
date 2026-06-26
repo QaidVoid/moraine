@@ -234,13 +234,37 @@ impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
         }
 
         let state = state_from_request(task, &request, &outcome, scan, build_time);
+        // Carry the build-time elog through the merge into the install report.
+        let elog = outcome
+            .report
+            .elog
+            .iter()
+            .map(|m| moraine_merge::ElogRecord {
+                level: elog_class(m.level).to_owned(),
+                phase: m.phase.clone(),
+                text: m.text.clone(),
+            })
+            .collect();
         let op = MergeOp {
             image_dir: outcome.image_dir,
             state,
             replaces: task.replaces.clone(),
             in_world: task.in_world,
+            elog,
         };
         Ok(Realized::Apply(Operation::Merge(Box::new(op))))
+    }
+}
+
+/// Map a build `ElogLevel` to its lowercase elog class name.
+fn elog_class(level: moraine_build::ElogLevel) -> &'static str {
+    use moraine_build::ElogLevel;
+    match level {
+        ElogLevel::Info => "info",
+        ElogLevel::Log => "log",
+        ElogLevel::Warn => "warn",
+        ElogLevel::Error => "error",
+        ElogLevel::Qa => "qa",
     }
 }
 
@@ -458,6 +482,8 @@ pub fn realize_binpkg(bytes: &[u8], task: &InstallTask, stage_dir: &Path) -> Res
         state,
         replaces: task.replaces.clone(),
         in_world: task.in_world,
+        // A binary package's stored build-time elog is not yet surfaced here.
+        elog: Vec::new(),
     };
     Ok(Realized::Apply(Operation::Merge(Box::new(op))))
 }

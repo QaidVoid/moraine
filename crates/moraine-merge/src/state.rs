@@ -238,12 +238,27 @@ impl PackageState {
 /// services. The CLI renders them; the merge engine does not run phase functions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PostMergeReport {
-    /// elog messages dispatched for the operation.
-    pub elog: Vec<String>,
+    /// The build-time elog messages carried through this operation, for the
+    /// install/CLI layer to dispatch.
+    pub elog: Vec<ElogRecord>,
     /// News items marked relevant by the operation.
     pub news_marked: Vec<String>,
     /// Pending config updates: the `._cfgNNNN_` variant install paths created.
     pub config_updates: Vec<String>,
+}
+
+/// One build-time elog message threaded through the merge into the install
+/// report. The level is a lowercase class name (`info`, `log`, `warn`, `error`,
+/// or `qa`) matching the elog class set, kept as a string so the merge crate
+/// does not depend on the build crate's `ElogLevel`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ElogRecord {
+    /// The message class: `info`, `log`, `warn`, `error`, or `qa`.
+    pub level: String,
+    /// The phase that emitted the message.
+    pub phase: String,
+    /// The message text.
+    pub text: String,
 }
 
 impl PostMergeReport {

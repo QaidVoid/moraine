@@ -223,7 +223,7 @@ impl MergeEngine {
         let reconciled = self.reconcile(store, registry)?;
 
         let report = PostMergeReport {
-            elog: vec![format!("merged {}", op.state.cpv)],
+            elog: op.elog.clone(),
             news_marked: vec![op.state.cpv.clone()],
             config_updates: result.config_updates,
         };
@@ -274,10 +274,8 @@ impl MergeEngine {
 
         let reconciled = self.reconcile(store, registry)?;
 
-        let report = PostMergeReport {
-            elog: vec![format!("unmerged {}", op.cpv)],
-            ..PostMergeReport::default()
-        };
+        // An unmerge runs no build phases, so it carries no elog.
+        let report = PostMergeReport::default();
 
         Ok(OperationOutcome {
             cpv: op.cpv.clone(),

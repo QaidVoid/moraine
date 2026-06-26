@@ -37,6 +37,18 @@ pub struct TransactionReport {
     pub world_additions: Vec<String>,
     /// Pending CONFIG_PROTECT variant paths left by the transaction.
     pub config_updates: Vec<String>,
+    /// The build-time elog messages aggregated across the transaction, each
+    /// tagged with the package that produced it.
+    pub elog: Vec<PackageElog>,
+}
+
+/// The build-time elog of one merged package, for end-of-run dispatch.
+#[derive(Debug, Clone)]
+pub struct PackageElog {
+    /// The `category/package-version` that produced the messages.
+    pub cpv: String,
+    /// The elog records carried through the merge.
+    pub messages: Vec<moraine_merge::ElogRecord>,
 }
 
 /// Executes transactions against an injected step runner and applier.
@@ -85,6 +97,12 @@ impl<'a, S: StepRunner, A: Applier> TransactionEngine<'a, S, A> {
                 report
                     .config_updates
                     .extend(outcome.report.config_updates.iter().cloned());
+                if !outcome.report.elog.is_empty() {
+                    report.elog.push(PackageElog {
+                        cpv: task.cpv.clone(),
+                        messages: outcome.report.elog.clone(),
+                    });
+                }
                 if task.in_world {
                     report.world_additions.push(task.cp.clone());
                 }
