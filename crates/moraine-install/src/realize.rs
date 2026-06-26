@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use moraine_binpkg::greenfield::WriteOptions;
 use moraine_binpkg::{MetadataMap, read_package};
-use moraine_build::{BuildRequest, CommandRunner, build_package};
+use moraine_build::{BuildOutcome, BuildRequest, CommandRunner, build_package};
 use moraine_merge::state::PackageState;
 use moraine_merge::{MergeOp, Operation};
 
@@ -154,6 +154,8 @@ pub struct BuildOptions {
     pub pkgdir: PathBuf,
     /// The container write options.
     pub write_options: WriteOptions,
+    /// The output container format from `BINPKG_FORMAT`.
+    pub binpkg_format: moraine_binpkg::BinpkgFormat,
 }
 
 impl Default for BuildOptions {
@@ -163,6 +165,7 @@ impl Default for BuildOptions {
             buildpkgonly: false,
             pkgdir: PathBuf::from("/var/cache/binpkgs"),
             write_options: WriteOptions::default(),
+            binpkg_format: moraine_binpkg::BinpkgFormat::default(),
         }
     }
 }
@@ -194,19 +197,25 @@ impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
             reason: format!("build failed: {e}"),
         })?;
 
+        // Scan the staged image and read BUILD_TIME once, feeding both the binary
+        // package metadata and the recorded installed state.
+        let scan = moraine_build::scan_image_sonames(&outcome.image_dir);
+        let build_time = read_line_u64(&outcome.build_info_dir.join("BUILD_TIME"));
+
         if self.options.buildpkg || self.options.buildpkgonly {
             let (category, _) = task.cp.split_once('/').unwrap_or((task.cp.as_str(), ""));
             let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
             let dir = self.options.pkgdir.join(category);
             std::fs::create_dir_all(&dir).map_err(|e| InstallError::io(&dir, e))?;
-            let out = dir.join(format!("{pf}.gpkg"));
-            let metadata = metadata_from_request(task, &request);
+            let out = dir.join(format!("{pf}.{}", self.options.binpkg_format.extension()));
+            let metadata = metadata_from_request(task, &request, &scan, build_time);
             package_image_dir(
                 &task.cpv,
                 &outcome.image_dir,
                 &metadata,
                 &out,
                 &self.options.write_options,
+                self.options.binpkg_format,
             )?;
         }
 
@@ -214,7 +223,7 @@ impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
             return Ok(Realized::PackagedOnly);
         }
 
-        let state = state_from_request(task, &request);
+        let state = state_from_request(task, &request, &outcome, scan, build_time);
         let op = MergeOp {
             image_dir: outcome.image_dir,
             state,
@@ -227,7 +236,13 @@ impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
 
 /// Build the installed-state record from the task identity and the build
 /// request's resolved package and USE set.
-fn state_from_request(task: &InstallTask, request: &BuildRequest) -> PackageState {
+fn state_from_request(
+    task: &InstallTask,
+    request: &BuildRequest,
+    outcome: &BuildOutcome,
+    scan: moraine_build::SonameScan,
+    build_time: Option<u64>,
+) -> PackageState {
     let pkg = &request.package;
     let (category, package) = task.cp.split_once('/').unwrap_or((task.cp.as_str(), ""));
     let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
@@ -255,6 +270,16 @@ fn state_from_request(task: &InstallTask, request: &BuildRequest) -> PackageStat
     }
     let meta = |key: &str| pkg.reduced_meta.get(key).cloned().unwrap_or_default();
 
+    // The saved environment from build-info, alongside the scanned soname linkage
+    // and BUILD_TIME passed in by the caller.
+    let environment = std::fs::read(outcome.build_info_dir.join("environment.bz2")).ok();
+    let to_sonames = |pairs: Vec<(String, String)>| -> Vec<moraine_merge::state::Soname> {
+        pairs
+            .into_iter()
+            .map(|(bucket, soname)| moraine_merge::state::Soname { bucket, soname })
+            .collect()
+    };
+
     PackageState {
         cpv: task.cpv.clone(),
         category: category.to_owned(),
@@ -272,22 +297,89 @@ fn state_from_request(task: &InstallTask, request: &BuildRequest) -> PackageStat
         restrict: pkg.restrict.join(" "),
         repository: Some(pkg.ident.repository.clone()),
         defined_phases: pkg.defined_phases.clone(),
-        build_time: None,
+        build_time,
         chost: request
             .config
             .vars
             .get("CHOST")
             .cloned()
             .unwrap_or_default(),
-        provides: Vec::new(),
-        requires: Vec::new(),
-        environment: None,
+        provides: to_sonames(scan.provides),
+        requires: to_sonames(scan.requires),
+        environment,
+        inherited: split_ws(&meta("INHERITED")),
+        features: request
+            .config
+            .vars
+            .get("FEATURES")
+            .map(|s| split_ws(s))
+            .unwrap_or_default(),
+        size: Some(dir_size(&outcome.image_dir)),
+        build_id: None,
+        needed: render_needed_lines(&scan.needed_lines),
     }
 }
 
+/// Split a whitespace-separated string into owned tokens.
+fn split_ws(s: &str) -> Vec<String> {
+    s.split_whitespace().map(str::to_owned).collect()
+}
+
+/// Render scanned NEEDED lines into the `arch;path;soname;rpath;needed` text form.
+fn render_needed_lines(lines: &[moraine_build::NeededLine]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| {
+            format!(
+                "{};{};{};;{}",
+                l.bucket,
+                l.path,
+                l.soname.clone().unwrap_or_default(),
+                l.needed.join(",")
+            )
+        })
+        .collect()
+}
+
+/// Sum the sizes of every regular file under `dir`, the installed `SIZE`.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Read a single-line `u64` from `path`, returning `None` when absent or
+/// unparseable.
+fn read_line_u64(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
 /// Build a binary-package metadata map from the build request, for the
-/// `--buildpkg` byproduct.
-fn metadata_from_request(task: &InstallTask, request: &BuildRequest) -> MetadataMap {
+/// `--buildpkg` byproduct, including the scanned soname linkage and BUILD_TIME so
+/// the emitted container carries them.
+fn metadata_from_request(
+    task: &InstallTask,
+    request: &BuildRequest,
+    scan: &moraine_build::SonameScan,
+    build_time: Option<u64>,
+) -> MetadataMap {
     let pkg = &request.package;
     let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
     let mut meta = MetadataMap::new();
@@ -309,7 +401,32 @@ fn metadata_from_request(task: &InstallTask, request: &BuildRequest) -> Metadata
             meta.set_str(key, value);
         }
     }
+    let provides = render_soname_field(&scan.provides);
+    if !provides.is_empty() {
+        meta.set_str("PROVIDES", &provides);
+    }
+    let requires = render_soname_field(&scan.requires);
+    if !requires.is_empty() {
+        meta.set_str("REQUIRES", &requires);
+    }
+    if let Some(bt) = build_time {
+        meta.set_str("BUILD_TIME", bt.to_string());
+    }
     meta
+}
+
+/// Render `(bucket, soname)` pairs into Portage's `bucket: soname soname` field
+/// form, the inverse of `moraine_binpkg::parse_sonames`.
+fn render_soname_field(pairs: &[(String, String)]) -> String {
+    let mut by_bucket: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for (bucket, soname) in pairs {
+        by_bucket.entry(bucket).or_default().push(soname);
+    }
+    let mut out = Vec::new();
+    for (bucket, sonames) in by_bucket {
+        out.push(format!("{bucket}: {}", sonames.join(" ")));
+    }
+    out.join(" ")
 }
 
 /// Unpack a binary package and build the merge operation for `task`, staging the
@@ -323,10 +440,7 @@ pub fn realize_binpkg(bytes: &[u8], task: &InstallTask, stage_dir: &Path) -> Res
     let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
     let image_dir = stage_dir.join(pf);
     std::fs::create_dir_all(&image_dir).map_err(|e| InstallError::io(&image_dir, e))?;
-    let mut archive = tar::Archive::new(pkg.image.as_slice());
-    archive
-        .unpack(&image_dir)
-        .map_err(|e| InstallError::io(&image_dir, e))?;
+    stage_image(&pkg.image, &image_dir)?;
 
     let state = state_from_metadata(task, &pkg.metadata);
     let op = MergeOp {
@@ -336,6 +450,64 @@ pub fn realize_binpkg(bytes: &[u8], task: &InstallTask, stage_dir: &Path) -> Res
         in_world: task.in_world,
     };
     Ok(Realized::Apply(Operation::Merge(Box::new(op))))
+}
+
+/// Stage a binary package's image tar into `dest`: decompress the stream when it
+/// carries a recognized compression header (a real Portage `tar.bz2`/`tar.xz`
+/// xpak image), then extract each member with any leading `image/` arcname
+/// component stripped, mirroring Portage's `tar_safe_extract(image, "image")`.
+/// Both the gpkg and xpak paths go through this one implementation.
+fn stage_image(image: &[u8], dest: &Path) -> Result<()> {
+    let decompressed = maybe_decompress(image)?;
+    let mut archive = tar::Archive::new(decompressed.as_ref());
+    archive.set_preserve_permissions(true);
+    let entries = archive
+        .entries()
+        .map_err(|e| InstallError::io(dest, std::io::Error::other(e.to_string())))?;
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|e| InstallError::io(dest, std::io::Error::other(e.to_string())))?;
+        let path = entry
+            .path()
+            .map_err(|e| InstallError::io(dest, std::io::Error::other(e.to_string())))?
+            .into_owned();
+        let rel: PathBuf = path
+            .strip_prefix("image")
+            .map(Path::to_path_buf)
+            .unwrap_or(path);
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let out = dest.join(&rel);
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| InstallError::io(parent, e))?;
+        }
+        entry.unpack(&out).map_err(|e| InstallError::io(&out, e))?;
+    }
+    Ok(())
+}
+
+/// Decompress an image stream when it begins with a recognized compression
+/// header (bzip2, gzip, zstd, xz); otherwise return it unchanged (a plain tar).
+fn maybe_decompress(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    use moraine_binpkg::Compression;
+    let comp = match bytes {
+        [0x42, 0x5a, 0x68, ..] => Some(Compression::Bzip2), // "BZh"
+        [0x1f, 0x8b, ..] => Some(Compression::Gzip),        // gzip
+        [0x28, 0xb5, 0x2f, 0xfd, ..] => Some(Compression::Zstd), // zstd
+        [0xfd, b'7', b'z', b'X', b'Z', 0x00, ..] => Compression::from_suffix("xz").ok(),
+        _ => None,
+    };
+    match comp {
+        Some(c) => {
+            let out = c.decompress(bytes).map_err(|e| InstallError::Realize {
+                cpv: "binpkg image".to_string(),
+                reason: format!("could not decompress image: {e}"),
+            })?;
+            Ok(std::borrow::Cow::Owned(out))
+        }
+        None => Ok(std::borrow::Cow::Borrowed(bytes)),
+    }
 }
 
 /// Build the installed-state record from the task identity and container
@@ -365,18 +537,33 @@ fn state_from_metadata(task: &InstallTask, meta: &MetadataMap) -> PackageState {
         }
     }
 
+    // The recorded SLOT may carry a sub-slot as `slot/subslot`.
+    let slot_raw = if task.slot.is_empty() {
+        scalar("SLOT")
+    } else {
+        task.slot.clone()
+    };
+    let (slot, subslot) = split_slot(&slot_raw);
+
+    let sonames = |key: &str| -> Vec<moraine_merge::state::Soname> {
+        meta.get_str(key)
+            .map(|raw| {
+                moraine_binpkg::resolution::parse_sonames(&raw)
+                    .into_iter()
+                    .map(|(bucket, soname)| moraine_merge::state::Soname { bucket, soname })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
     PackageState {
         cpv: format!("{category}/{pf}"),
         category: category.to_owned(),
         package: package.to_owned(),
         version,
         eapi: meta.get_str("EAPI").unwrap_or_else(|| "0".to_owned()),
-        slot: if task.slot.is_empty() {
-            scalar("SLOT")
-        } else {
-            task.slot.clone()
-        },
-        subslot: None,
+        slot,
+        subslot,
         use_flags: split("USE"),
         iuse: split("IUSE"),
         depends,
@@ -390,9 +577,22 @@ fn state_from_metadata(task: &InstallTask, meta: &MetadataMap) -> PackageState {
             .get_str("BUILD_TIME")
             .and_then(|s| s.trim().parse().ok()),
         chost: scalar("CHOST"),
-        provides: Vec::new(),
-        requires: Vec::new(),
+        provides: sonames("PROVIDES"),
+        requires: sonames("REQUIRES"),
         environment: None,
+        inherited: split("INHERITED"),
+        features: split("FEATURES"),
+        size: meta.get_str("SIZE").and_then(|s| s.trim().parse().ok()),
+        build_id: meta.get_str("BUILD_ID").and_then(|s| s.trim().parse().ok()),
+        needed: Vec::new(),
+    }
+}
+
+/// Split a recorded `SLOT` of the form `slot` or `slot/subslot` into its parts.
+fn split_slot(raw: &str) -> (String, Option<String>) {
+    match raw.split_once('/') {
+        Some((slot, sub)) => (slot.to_owned(), Some(sub.to_owned())),
+        None => (raw.to_owned(), None),
     }
 }
 
@@ -443,6 +643,50 @@ mod tests {
         );
         assert_eq!(op.state.eapi, "8");
         assert!(op.image_dir.join("usr/bin/foo").exists());
+    }
+
+    #[test]
+    fn gpkg_and_xpak_stage_root_relative() {
+        // Build a root-relative image tar shared by both formats.
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        let data = b"x";
+        header.set_size(data.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/bin/foo", data.as_slice())
+            .unwrap();
+        let image_tar = builder.into_inner().unwrap();
+        let mut meta = MetadataMap::new();
+        meta.set_str("EAPI", "8");
+        meta.set_str("SLOT", "0");
+        meta.set_str("PF", "foo-1.2");
+
+        for format in [
+            moraine_binpkg::BinpkgFormat::Gpkg,
+            moraine_binpkg::BinpkgFormat::Xpak,
+        ] {
+            let bytes = format
+                .write(&meta, &image_tar, moraine_binpkg::Compression::Bzip2)
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut task = InstallTask::merge("app/foo-1.2", "app/foo", "0");
+            task.source = SourceKind::Binary;
+            let realized = realize_binpkg(&bytes, &task, dir.path()).unwrap();
+            let Realized::Apply(Operation::Merge(op)) = realized else {
+                panic!("expected a merge op for {format:?}");
+            };
+            // The `image/` arcname (gpkg) is stripped; xpak is already root-relative.
+            assert!(
+                op.image_dir.join("usr/bin/foo").exists(),
+                "staged tree must be root-relative for {format:?}"
+            );
+            assert!(
+                !op.image_dir.join("image/usr/bin/foo").exists(),
+                "the image/ prefix must be stripped for {format:?}"
+            );
+        }
     }
 
     #[test]

@@ -90,6 +90,8 @@ pub(crate) fn encode_record(
                 EntryKind::Obj { md5, mtime } => WireEntryKind::Obj { md5, mtime },
                 EntryKind::Sym { target, mtime } => WireEntryKind::Sym { target, mtime },
                 EntryKind::Dir => WireEntryKind::Dir,
+                EntryKind::Fif => WireEntryKind::Fif,
+                EntryKind::Dev => WireEntryKind::Dev,
             },
         })
         .collect();
@@ -125,6 +127,10 @@ pub(crate) fn encode_record(
             digest: e.digest.clone(),
             blob: e.blob.clone(),
         }),
+        inherited: rec.inherited.clone(),
+        features: rec.features.clone(),
+        size: rec.size,
+        needed: rec.needed.clone(),
     }
 }
 
@@ -226,6 +232,8 @@ pub(crate) fn decode_record(
                 mtime: *mtime,
             },
             WireEntryKind::Dir => EntryKind::Dir,
+            WireEntryKind::Fif => EntryKind::Fif,
+            WireEntryKind::Dev => EntryKind::Dev,
         };
         map.insert(e.path.clone(), kind);
     }
@@ -259,5 +267,9 @@ pub(crate) fn decode_record(
         requires,
         contents,
         environment,
+        inherited: wire.inherited.clone(),
+        features: wire.features.clone(),
+        size: wire.size,
+        needed: wire.needed.clone(),
     })
 }

@@ -28,6 +28,7 @@ pub mod error;
 pub mod import;
 pub mod query;
 pub mod store;
+pub mod updates;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -39,6 +40,10 @@ pub use error::{DiscoveryError, ImportError, RepoError, Result};
 pub use import::{ImportIssue, ImportReport, import_repo};
 pub use query::{Candidate, RepoIndex, RepoStore};
 pub use store::{FORMAT_VERSION, LoadedEntry, LoadedStore, StoredEntry};
+pub use updates::{
+    Cp, UpdateCommand, UpdateError, UpdateFile, grab_updates, load_mtimes, parse_updates,
+    store_mtimes,
+};
 
 /// Build the incremental-reimport index from on-disk store entries, which retain
 /// `_mtime_` and `_md5_`. The importer reuses an entry whose `_mtime_` and

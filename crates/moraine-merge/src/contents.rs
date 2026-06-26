@@ -69,6 +69,22 @@ pub(crate) fn dir_entry(install_path: &str) -> Entry {
     }
 }
 
+/// Build a `fif` CONTENTS entry for a named pipe at `install_path`.
+pub(crate) fn fif_entry(install_path: &str) -> Entry {
+    Entry {
+        path: install_path.to_string(),
+        kind: EntryKind::Fif,
+    }
+}
+
+/// Build a `dev` CONTENTS entry for a device node at `install_path`.
+pub(crate) fn dev_entry(install_path: &str) -> Entry {
+    Entry {
+        path: install_path.to_string(),
+        kind: EntryKind::Dev,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

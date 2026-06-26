@@ -129,6 +129,16 @@ pub struct PackageState {
     pub requires: Vec<Soname>,
     /// The saved build environment blob, if one was captured.
     pub environment: Option<Vec<u8>>,
+    /// The recorded `INHERITED` eclass names.
+    pub inherited: Vec<String>,
+    /// The `FEATURES` active when the package was built.
+    pub features: Vec<String>,
+    /// The installed `SIZE` in bytes, if known.
+    pub size: Option<u64>,
+    /// The `BUILD_ID` for binpkg-multi-instance installs, if any.
+    pub build_id: Option<u64>,
+    /// The verbatim `NEEDED.ELF.2` lines from the post-build scan.
+    pub needed: Vec<String>,
 }
 
 impl PackageState {
@@ -207,13 +217,17 @@ impl PackageState {
             repository: self.repository.as_deref().map(|r| interner.intern(r)),
             defined_phases: self.defined_phases,
             build_time: self.build_time,
-            build_id: None,
+            build_id: self.build_id,
             counter,
             chost: self.chost,
             provides,
             requires,
             contents,
             environment,
+            inherited: self.inherited,
+            features: self.features,
+            size: self.size,
+            needed: self.needed,
         })
     }
 }

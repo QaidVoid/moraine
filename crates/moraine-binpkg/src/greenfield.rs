@@ -112,6 +112,9 @@ impl Serialize for Compression {
             Compression::Bzip2 => 1,
             Compression::Gzip => 2,
             Compression::Zstd => 3,
+            // The greenfield format only stores the in-process codecs; the
+            // read-only system-tool codecs never reach a greenfield write.
+            Compression::Xz | Compression::Lz4 | Compression::Lzip | Compression::Lzop => 3,
         };
         ser.serialize_u8(tag)
     }

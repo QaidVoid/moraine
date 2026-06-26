@@ -67,6 +67,11 @@ pub(crate) fn unmerge(
 
     for entry in entries {
         let live = ctx.live_path(&entry.path);
+        // UNINSTALL_IGNORE: never remove a path matching an ignore glob.
+        if crate::path_matches_any(&entry.path, &ctx.uninstall_ignore) {
+            result.skipped.push(entry.path.clone());
+            continue;
+        }
         match &entry.kind {
             EntryKind::Dir => {
                 // A directory is removed only when empty after its entries are
@@ -94,6 +99,9 @@ pub(crate) fn unmerge(
                     result.skipped.push(entry.path.clone());
                     continue;
                 }
+                // Neutralize any outstanding hardlink to a suid/sgid file by
+                // stripping its mode before unlinking, matching Portage.
+                neutralize_mode(&live);
                 match std::fs::remove_file(&live) {
                     Ok(()) => result.removed.push(entry.path.clone()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -104,6 +112,29 @@ pub(crate) fn unmerge(
             }
             EntryKind::Sym { target, .. } => {
                 if should_skip_sym(ctx, store, interner, cpv, &entry.path, target)? {
+                    result.skipped.push(entry.path.clone());
+                    continue;
+                }
+                // Preserve a symlink-to-directory while another package owns a
+                // path reachable through it (bug #326685).
+                if live.is_dir() && other_owns_through(store, interner, &entry.path, cpv) {
+                    result.skipped.push(entry.path.clone());
+                    continue;
+                }
+                match std::fs::remove_file(&live) {
+                    Ok(()) => result.removed.push(entry.path.clone()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        result.skipped.push(entry.path.clone());
+                    }
+                    Err(source) => return Err(MergeError::Io { path: live, source }),
+                }
+            }
+            EntryKind::Fif | EntryKind::Dev => {
+                // Special files carry no content to verify; remove unless config
+                // protected or now owned by another package.
+                if ctx.config_protect.is_protected(&entry.path)
+                    || collision::owner_of(store, interner, &entry.path, Some(cpv)).is_some()
+                {
                     result.skipped.push(entry.path.clone());
                     continue;
                 }
@@ -119,6 +150,33 @@ pub(crate) fn unmerge(
     }
 
     Ok(result)
+}
+
+/// Strip a regular file's mode to zero before unlink so an outstanding hardlink
+/// to a suid/sgid file is rendered harmless. Best effort: a symlink is skipped
+/// and an unprivileged failure is ignored.
+fn neutralize_mode(live: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if let Ok(meta) = std::fs::symlink_metadata(live)
+        && meta.file_type().is_file()
+    {
+        let _ = std::fs::set_permissions(live, std::fs::Permissions::from_mode(0o0));
+    }
+}
+
+/// Whether an installed package other than `cpv` owns any path reachable through
+/// the directory symlink at `sym_path` (a path under `sym_path/`).
+fn other_owns_through(store: &Store, interner: &Interner, sym_path: &str, cpv: &str) -> bool {
+    let prefix = format!("{sym_path}/");
+    for record in store.records() {
+        if record.cpv(interner) == cpv {
+            continue;
+        }
+        if record.contents.iter().any(|e| e.path.starts_with(&prefix)) {
+            return true;
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]

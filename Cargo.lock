@@ -119,7 +119,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "miniz_oxide",
- "object",
+ "object 0.37.3",
  "rustc-demangle",
  "windows-link",
 ]
@@ -774,13 +774,16 @@ dependencies = [
 name = "moraine-build"
 version = "0.1.0"
 dependencies = [
+ "bzip2",
  "insta",
  "moraine-atom",
  "moraine-common",
  "moraine-config",
  "moraine-eapi",
  "moraine-repo",
+ "object 0.39.1",
  "proptest",
+ "rustix",
  "tempfile",
  "thiserror",
  "tracing",
@@ -850,11 +853,14 @@ version = "0.1.0"
 name = "moraine-install"
 version = "0.1.0"
 dependencies = [
+ "moraine-atom",
  "moraine-binpkg",
  "moraine-build",
  "moraine-common",
  "moraine-config",
+ "moraine-eapi",
  "moraine-merge",
+ "moraine-repo",
  "moraine-resolve",
  "moraine-sync",
  "moraine-vdb",
@@ -881,9 +887,11 @@ dependencies = [
  "moraine-vdb",
  "moraine-version",
  "proptest",
+ "rustix",
  "tempfile",
  "thiserror",
  "tracing",
+ "xattr",
 ]
 
 [[package]]
@@ -1005,6 +1013,15 @@ name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
 dependencies = [
  "memchr",
 ]

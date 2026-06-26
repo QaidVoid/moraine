@@ -66,6 +66,12 @@ pub const HEADER_KEYS: &[&str] = &[
     "USE_EXPAND_IMPLICIT",
     "USE_EXPAND_UNPREFIXED",
     "VERSION",
+    "TIMESTAMP",
+    "PACKAGES",
+    "ARCH",
+    "PROFILE",
+    "URI",
+    "TTL",
 ];
 
 /// A single package stanza: the cpv plus its metadata map (canonical keys).
@@ -78,24 +84,36 @@ pub struct PackageEntry {
 }
 
 impl PackageEntry {
-    /// Resolve this package's download location relative to the header.
-    ///
-    /// Uses the stanza's PKGINDEX_URI or BASE_URI when present, otherwise the
-    /// header's URI, joined with the relative path under `SIZE`/cpv. The result
-    /// is `<base>/<cpv>.gpkg.tar` style; the precise suffix is left to the
-    /// caller. Returns the resolved base URI joined with the stanza `PATH` key
-    /// when present.
+    /// Resolve this package's full download URL: the stanza `PKGINDEX_URI` or
+    /// `BASE_URI`, else the header `URI`, with the stanza `PATH` appended as
+    /// `<base>/<PATH>` (`BASE_URI.rstrip("/") + "/" + PATH.lstrip("/")`), matching
+    /// Portage's `BinpkgFetcher`. Returns `None` when no base URI is configured.
     pub fn download_base(&self, header: &BTreeMap<String, String>) -> Option<String> {
-        if let Some(uri) = self.metadata.get_str("PKGINDEX_URI") {
-            return Some(uri);
+        let base = self
+            .metadata
+            .get_str("PKGINDEX_URI")
+            .or_else(|| self.metadata.get_str("BASE_URI"))
+            .or_else(|| header.get("URI").cloned())
+            .or_else(|| header.get("PKGINDEX_URI").cloned())?;
+        let base = base.trim_end_matches('/');
+        match self.metadata.get_str("PATH") {
+            Some(path) if !path.is_empty() => {
+                Some(format!("{base}/{}", path.trim_start_matches('/')))
+            }
+            _ => Some(base.to_string()),
         }
-        if let Some(uri) = self.metadata.get_str("BASE_URI") {
-            return Some(uri);
-        }
-        header
-            .get("URI")
-            .or_else(|| header.get("PKGINDEX_URI"))
-            .cloned()
+    }
+
+    /// Record the container integrity keys a binhost client validates against:
+    /// `MD5` and `SHA1` over the container bytes, `SIZE`, and the pkgdir-relative
+    /// `PATH`, matching Portage's `_pkgindex_entry`.
+    pub fn record_container(&mut self, container: &[u8], rel_path: &str) {
+        self.metadata
+            .set_str("MD5", moraine_common::hash::md5(container));
+        self.metadata
+            .set_str("SHA1", moraine_common::hash::sha1(container));
+        self.metadata.set_str("SIZE", container.len().to_string());
+        self.metadata.set_str("PATH", rel_path);
     }
 }
 
@@ -210,6 +228,31 @@ impl PackagesIndex {
             out.push('\n');
         }
         out
+    }
+
+    /// Populate the binhost header keys a client validates against: `TIMESTAMP`
+    /// (index generation time), `PACKAGES` (the stanza count), `ARCH`, `PROFILE`,
+    /// `URI` (the base download URI), and `TTL` (staleness window in seconds),
+    /// matching `_update_pkgindex_header`. Empty optional values are skipped.
+    pub fn populate_header(
+        &mut self,
+        timestamp: i64,
+        arch: &str,
+        profile: &str,
+        uri: &str,
+        ttl: u64,
+    ) {
+        let count = self.packages.len();
+        self.header
+            .insert("TIMESTAMP".to_string(), timestamp.to_string());
+        self.header
+            .insert("PACKAGES".to_string(), count.to_string());
+        self.header.insert("TTL".to_string(), ttl.to_string());
+        for (key, value) in [("ARCH", arch), ("PROFILE", profile), ("URI", uri)] {
+            if !value.is_empty() {
+                self.header.insert(key.to_string(), value.to_string());
+            }
+        }
     }
 
     /// Add or replace the stanza for `entry`'s cpv.
@@ -341,6 +384,36 @@ mod tests {
             metadata: meta,
         });
         index
+    }
+
+    #[test]
+    fn container_digests_header_and_download_path() {
+        let mut index = sample_index();
+        let container = b"the binary package bytes";
+        index.packages[0].record_container(container, "dev-libs/foo-1.2.3.gpkg.tar");
+        index.populate_header(
+            1_700_000_500,
+            "amd64",
+            "default/linux",
+            "https://binhost/p",
+            3600,
+        );
+
+        let interner = Interner::new();
+        let text = index.emit(&interner);
+        assert!(text.contains(&format!("MD5: {}", moraine_common::hash::md5(container))));
+        assert!(text.contains(&format!("SHA1: {}", moraine_common::hash::sha1(container))));
+        assert!(text.contains(&format!("SIZE: {}", container.len())));
+        assert!(text.contains("PATH: dev-libs/foo-1.2.3.gpkg.tar"));
+        // Header keys a client validates against.
+        assert!(text.contains("TIMESTAMP: 1700000500"));
+        assert!(text.contains("PACKAGES: 1"));
+        assert!(text.contains("TTL: 3600"));
+        assert!(text.contains("PROFILE: default/linux"));
+
+        // download_base appends PATH to the base URI.
+        let url = index.packages[0].download_base(&index.header).unwrap();
+        assert_eq!(url, "https://binhost/p/dev-libs/foo-1.2.3.gpkg.tar");
     }
 
     #[test]

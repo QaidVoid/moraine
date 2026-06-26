@@ -216,12 +216,13 @@ impl Store {
 
     /// Add or replace `record` in the store by appending to the journal.
     ///
-    /// The record is stamped with the next counter value and the in-memory set is
-    /// updated so the change is visible without a reload. The primary file is not
-    /// rewritten.
-    pub fn add(&mut self, mut record: PackageRecord) -> Result<(), VdbError> {
-        self.counter += 1;
-        record.counter = self.counter;
+    /// The record arrives already stamped with its counter by the caller (the
+    /// merge engine, which also persists that same value to the global counter
+    /// file), so the store does not re-stamp it; it only advances its own counter
+    /// high-water mark. The in-memory set is updated so the change is visible
+    /// without a reload. The primary file is not rewritten.
+    pub fn add(&mut self, record: PackageRecord) -> Result<(), VdbError> {
+        self.counter = self.counter.max(record.counter);
 
         let mut tb = TokenBuilder::default();
         let wire = encode_record(&record, &self.interner, &mut tb);
@@ -271,6 +272,161 @@ impl Store {
             !(r.category == category && r.package == package && r.version.as_str() == version)
         });
         Ok(self.records.len() != before)
+    }
+
+    /// The `category/package` string of a record.
+    fn cp_string(&self, rec: &PackageRecord) -> String {
+        let cat = self.interner.resolve(rec.category).unwrap_or_default();
+        let pkg = self.interner.resolve(rec.package).unwrap_or_default();
+        format!("{cat}/{pkg}")
+    }
+
+    /// Whether a record passes a repository filter (matches `repo_filter`, or no
+    /// filter is given).
+    fn repo_matches(&self, rec: &PackageRecord, repo_filter: Option<&str>) -> bool {
+        match repo_filter {
+            None => true,
+            Some(want) => {
+                rec.repository
+                    .and_then(|r| self.interner.resolve(r))
+                    .as_deref()
+                    == Some(want)
+            }
+        }
+    }
+
+    /// Stamp a record with the next counter and persist it as a journaled
+    /// replacement (greatest-counter-wins by key).
+    fn journal_replace(&mut self, mut record: PackageRecord) -> Result<(), VdbError> {
+        self.counter += 1;
+        record.counter = self.counter;
+        self.add(record)
+    }
+
+    /// Apply a `move` package rename to the installed store: rename every record
+    /// of `old_cp` (honoring `repo_filter`) to `new_cp`, skipping a record whose
+    /// destination cpv already exists. Returns the number renamed.
+    pub fn move_ent(
+        &mut self,
+        old_cp: &str,
+        new_cp: &str,
+        repo_filter: Option<&str>,
+    ) -> Result<usize, VdbError> {
+        let Some((new_cat, new_pkg)) = new_cp.split_once('/') else {
+            return Ok(0);
+        };
+        let matches: Vec<PackageRecord> = self
+            .records
+            .iter()
+            .filter(|r| self.cp_string(r) == old_cp && self.repo_matches(r, repo_filter))
+            .cloned()
+            .collect();
+        let mut renamed = 0;
+        for rec in matches {
+            let new_cpv = format!("{new_cp}-{}", rec.version.as_str());
+            // "dest already exists; keep this puppy where it is" (vartree.py).
+            if self
+                .records
+                .iter()
+                .any(|r| r.cpv(&self.interner) == new_cpv)
+            {
+                continue;
+            }
+            let version = rec.version.as_str().to_string();
+            self.remove(rec.category, rec.package, &version)?;
+            let mut moved = rec;
+            moved.category = self.interner.intern(new_cat);
+            moved.package = self.interner.intern(new_pkg);
+            self.journal_replace(moved)?;
+            renamed += 1;
+        }
+        Ok(renamed)
+    }
+
+    /// Apply a `slotmove` to the installed store: rewrite the recorded `SLOT` of
+    /// every record of `atom_cp` currently at `old_slot` (honoring `repo_filter`)
+    /// to `new_slot`, preserving the recorded sub-slot (the new slot token carries
+    /// none). Returns the number changed.
+    pub fn move_slot_ent(
+        &mut self,
+        atom_cp: &str,
+        old_slot: &str,
+        new_slot: &str,
+        repo_filter: Option<&str>,
+    ) -> Result<usize, VdbError> {
+        let matches: Vec<PackageRecord> = self
+            .records
+            .iter()
+            .filter(|r| {
+                self.cp_string(r) == atom_cp
+                    && self.interner.resolve(r.slot.slot).as_deref() == Some(old_slot)
+                    && self.repo_matches(r, repo_filter)
+            })
+            .cloned()
+            .collect();
+        let mut changed = 0;
+        for mut rec in matches {
+            rec.slot.slot = self.interner.intern(new_slot);
+            self.journal_replace(rec)?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    /// Rewrite every record's `*DEPEND` atoms for the given cp `renames` and
+    /// `slotmoves` (`(cp, old_slot, new_slot)`), updating both the verbatim `raw`
+    /// string and the re-parsed AST. Returns the number of records changed.
+    pub fn update_ents(
+        &mut self,
+        renames: &[(String, String)],
+        slotmoves: &[(String, String, String)],
+    ) -> Result<usize, VdbError> {
+        use crate::record::{Depend, DependKind};
+        let records = self.records.clone();
+        let mut changed = 0;
+        for rec in records {
+            let self_cp = self.cp_string(&rec);
+            let features = moraine_eapi::features_for(&rec.eapi);
+            let mut updated = rec.clone();
+            let mut dirty = false;
+            for kind in DependKind::ALL {
+                let Some(dep) = updated.depends.get(kind) else {
+                    continue;
+                };
+                let mut raw = dep.raw.clone();
+                for (old, new) in renames {
+                    raw = moraine_atom::rewrite_dep_cp(
+                        &raw,
+                        old,
+                        new,
+                        &self_cp,
+                        features,
+                        &self.interner,
+                    );
+                }
+                for (cp, old_slot, new_slot) in slotmoves {
+                    raw = moraine_atom::rewrite_dep_slot(
+                        &raw,
+                        cp,
+                        old_slot,
+                        new_slot,
+                        features,
+                        &self.interner,
+                    );
+                }
+                if raw != dep.raw {
+                    let ast = moraine_atom::DepSpec::parse(&raw, features, &self.interner)
+                        .unwrap_or_else(|_| dep.ast.clone());
+                    *updated.depends.slot_mut(kind) = Some(Depend { raw, ast });
+                    dirty = true;
+                }
+            }
+            if dirty {
+                self.journal_replace(updated)?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
     }
 
     /// Fold the journal into the primary file and rebuild the token table from

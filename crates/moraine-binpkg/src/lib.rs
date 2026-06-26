@@ -25,10 +25,12 @@ pub mod compress;
 pub mod detect;
 pub mod error;
 pub mod fetch;
+pub mod format;
 pub mod gpkg;
 pub mod greenfield;
 pub mod index;
 pub mod metadata;
+pub mod moves;
 pub mod resolution;
 pub mod signature;
 pub mod xpak;
@@ -36,12 +38,14 @@ pub mod xpak;
 pub use compress::Compression;
 pub use detect::{Format, detect};
 pub use error::{ContainerError, FetchError, IndexError};
+pub use format::BinpkgFormat;
 pub use index::{PackageEntry, PackagesIndex, build_local_index};
 pub use metadata::MetadataMap;
 pub use resolution::{
     BinaryCandidate, Eligibility, Rejection, TargetConfig, UsepkgMode, UsepkgPolicy, Verdict,
     check_compatibility,
 };
+pub use signature::{SignatureConfig, SignaturePolicy};
 
 /// A binary package read into memory: its metadata and decompressed image.
 ///

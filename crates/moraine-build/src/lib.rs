@@ -27,6 +27,7 @@
 //! runner by reference, so the full pipeline can be driven against fakes.
 
 pub mod bashlib;
+pub mod elf;
 pub mod env;
 pub mod error;
 pub mod fetch;
@@ -44,12 +45,15 @@ use std::path::PathBuf;
 
 use tracing::instrument;
 
+pub use elf::{NeededLine, SonameScan, scan_image_sonames};
 pub use env::{ConfigEnv, EnvBuilder, PackageIdent, PhaseEnv};
 pub use error::{BuildError, PhaseKind, Result};
-pub use fetch::{FetchConfig, FetchStatus, FetchedFile, Fetcher, RestrictFlags};
+pub use fetch::{
+    CustomMirrors, FetchConfig, FetchStatus, FetchedFile, Fetcher, MirrorLayout, RestrictFlags,
+};
 pub use ipc::{IpcHandler, Query, QueryRoot, Response as IpcResponse, VersionQuery};
 pub use layout::BuildLayout;
-pub use manifest::{Manifest, VerifyOutcome};
+pub use manifest::{Manifest, ManifestType, VerifyOutcome, verify_package};
 pub use metadata::BuildInfo;
 pub use phase::{ElogLevel, ElogMessage, PhaseDriver, PhaseReport, PhaseRun};
 pub use runner::{CommandOutput, CommandRunner, CommandSpec, SystemRunner};
@@ -154,19 +158,30 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
     let src_map =
         srcuri::parse_and_reduce(&pkg.src_uri, &request.use_flags, pkg.ident.eapi_features())?;
     let manifest = Manifest::read(&pkg.manifest_path)?;
-    let fetcher = Fetcher::new(runner, &request.fetch, &manifest, request.require_digest);
-    let restrict = RestrictFlags::from_tokens(pkg.restrict.iter().map(String::as_str));
-    let fetched = fetcher.fetch_all(&src_map.a(), restrict)?;
-
-    // 4. Phase library and sandbox.
+    // Verify the ebuild and its `files/` aux entries against the Manifest before
+    // the ebuild is sourced (the GLEP 74 integrity chain).
+    if let Some(pkg_dir) = pkg.ebuild_path.parent() {
+        let ebuild_name = pkg
+            .ebuild_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        crate::manifest::verify_package(
+            &manifest,
+            pkg_dir,
+            ebuild_name,
+            &request.fetch.required_hashes,
+            false,
+        )?;
+    }
+    // 4. Phase library and sandbox (built before fetch so pkg_nofetch can run on
+    // a fetch-restricted package whose distfiles are missing).
     let library = bashlib::PhaseLibrary::materialize(layout.temp.join("bashlib"))?;
     let sandbox = SandboxSelector::from_config(
         &request.config,
         pkg.restrict.iter().map(String::as_str),
         request.namespace_support,
     );
-
-    // 5. Drive phases.
     let driver = PhaseDriver::new(
         runner,
         &env,
@@ -178,6 +193,26 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
         request.run_tests,
         None,
     );
+
+    let fetcher = Fetcher::new(runner, &request.fetch, &manifest, request.require_digest);
+    let restrict = RestrictFlags::from_tokens(pkg.restrict.iter().map(String::as_str));
+    let fetched = match fetcher.fetch_all(&src_map.a(), restrict) {
+        Ok(fetched) => fetched,
+        Err(BuildError::RestrictedFetch { distfile }) => {
+            // Emit the standard fetch-restriction notice and run pkg_nofetch for
+            // the ebuild's manual-download instructions before aborting.
+            tracing::warn!(
+                "Fetch failed for {}/{}: {distfile} requires manual download (RESTRICT=fetch)",
+                pkg.ident.category,
+                pkg.ident.pf
+            );
+            let _ = driver.run_nofetch();
+            return Err(BuildError::RestrictedFetch { distfile });
+        }
+        Err(e) => return Err(e),
+    };
+
+    // 5. Drive phases.
     let report = driver.run_all()?;
 
     // 6. Build-info metadata.

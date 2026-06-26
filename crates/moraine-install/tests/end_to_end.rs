@@ -37,6 +37,8 @@ fn context(root: &std::path::Path) -> MergeContext {
         state_dir: root.join("var/lib/portage"),
         features: Features::default(),
         config_protect: ConfigProtect::new(Vec::new(), Vec::new()),
+        collision_ignore: Vec::new(),
+        uninstall_ignore: Vec::new(),
     }
 }
 

@@ -73,4 +73,57 @@ impl SignatureConfig {
             Err(ContainerError::Signature(stderr))
         }
     }
+
+    /// Verify an inline cleartext-signed document (a `-----BEGIN PGP SIGNED
+    /// MESSAGE-----` blob, as `binpkg-signing` embeds in the gpkg Manifest),
+    /// returning the verified cleartext body on success.
+    ///
+    /// Runs the configured `gpg --decrypt`, which both checks the signature and
+    /// emits the signed text; a non-zero exit rejects the document.
+    pub fn verify_inline(&self, signed: &[u8]) -> Result<Vec<u8>, ContainerError> {
+        let span = tracing::info_span!("binpkg.signature.verify_inline");
+        let _enter = span.enter();
+
+        let dir = tempfile::tempdir().map_err(ContainerError::IoBare)?;
+        let path = dir.path().join("Manifest.asc");
+        std::fs::write(&path, signed).with_path(&path)?;
+
+        let mut cmd = Command::new(&self.gpg_command);
+        cmd.arg("--batch").arg("--status-fd").arg("2");
+        if let Some(keyring) = &self.keyring {
+            cmd.arg("--no-default-keyring")
+                .arg("--keyring")
+                .arg(keyring);
+        }
+        for extra in &self.extra_args {
+            cmd.arg(extra);
+        }
+        cmd.arg("--decrypt").arg(&path);
+
+        let output = cmd.output().map_err(|source| {
+            ContainerError::Signature(format!("failed to launch `{}`: {source}", self.gpg_command))
+        })?;
+
+        if output.status.success() {
+            tracing::info!("inline signature verified");
+            Ok(output.stdout)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            tracing::warn!(%stderr, "inline signature verification failed");
+            Err(ContainerError::Signature(stderr))
+        }
+    }
+}
+
+/// The policy for a gpkg Manifest signature, mirroring Portage's
+/// `binpkg-request-signature`/`binpkg-ignore-signature`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SignaturePolicy {
+    /// Verify a present signature; an unsigned Manifest is accepted.
+    #[default]
+    VerifyIfPresent,
+    /// A missing Manifest signature is fatal.
+    RequestSignature,
+    /// Signature verification is skipped entirely.
+    IgnoreSignature,
 }

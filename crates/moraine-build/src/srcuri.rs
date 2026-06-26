@@ -220,6 +220,12 @@ fn parse_uri(tokens: &[&str], pos: &mut usize, features: EapiFeatures) -> Result
         if *name == ")" || *name == "(" || name.ends_with('?') {
             return Err(BuildError::src_uri("'->' destination is not a filename"));
         }
+        // PMS 12.1.2: the arrow destination is a plain filename, never a path.
+        if name.contains('/') {
+            return Err(BuildError::src_uri(
+                "'->' destination must not contain a path separator",
+            ));
+        }
         *pos += 1;
         Some((*name).to_string())
     } else {
@@ -319,6 +325,16 @@ mod tests {
     #[test]
     fn arrow_rejected_before_eapi_two() {
         let err = parse_and_reduce("https://example.com/a -> b", &use_set(&[]), eapi(0));
+        assert!(matches!(err, Err(BuildError::SrcUri { .. })));
+    }
+
+    #[test]
+    fn arrow_destination_with_path_separator_rejected() {
+        let err = parse_and_reduce(
+            "https://example.com/a -> sub/dir/foo.tar.gz",
+            &use_set(&[]),
+            eapi(8),
+        );
         assert!(matches!(err, Err(BuildError::SrcUri { .. })));
     }
 

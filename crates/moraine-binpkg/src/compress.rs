@@ -21,6 +21,14 @@ pub enum Compression {
     Gzip,
     /// zstd.
     Zstd,
+    /// xz, decompressed via the system `xz` tool.
+    Xz,
+    /// lz4, decompressed via the system `lz4` tool.
+    Lz4,
+    /// lzip (`.lz`), decompressed via the system `lzip` tool.
+    Lzip,
+    /// lzop (`.lzo`), decompressed via the system `lzop` tool.
+    Lzop,
 }
 
 impl Compression {
@@ -33,21 +41,42 @@ impl Compression {
             Compression::Bzip2 => "bz2",
             Compression::Gzip => "gz",
             Compression::Zstd => "zst",
+            Compression::Xz => "xz",
+            Compression::Lz4 => "lz4",
+            Compression::Lzip => "lz",
+            Compression::Lzop => "lzo",
         }
     }
 
     /// Parse a GPKG member suffix into a codec.
     ///
     /// Accepts the suffix after `tar.` (for example `bz2`) or an empty string
-    /// for an uncompressed inner tar. Returns an error for `xz`, which is noted
-    /// as a future codec, and for any other unknown suffix.
+    /// for an uncompressed inner tar, covering the full gpkg suffix set so any
+    /// genuine Portage container is recognized. The `xz`/`lz4`/`lz`/`lzo` codecs
+    /// decompress through the matching system tool.
     pub fn from_suffix(suffix: &str) -> Result<Self, ContainerError> {
         match suffix {
-            "" => Ok(Compression::None),
+            "" | "tar" => Ok(Compression::None),
             "bz2" => Ok(Compression::Bzip2),
             "gz" => Ok(Compression::Gzip),
             "zst" | "zstd" => Ok(Compression::Zstd),
+            "xz" => Ok(Compression::Xz),
+            "lz4" => Ok(Compression::Lz4),
+            "lz" => Ok(Compression::Lzip),
+            "lzo" => Ok(Compression::Lzop),
             other => Err(ContainerError::UnsupportedCompression(other.to_string())),
+        }
+    }
+
+    /// The system tool that decompresses this codec, when it is not handled
+    /// in-process.
+    fn system_tool(self) -> Option<&'static str> {
+        match self {
+            Compression::Xz => Some("xz"),
+            Compression::Lz4 => Some("lz4"),
+            Compression::Lzip => Some("lzip"),
+            Compression::Lzop => Some("lzop"),
+            _ => None,
         }
     }
 
@@ -68,6 +97,10 @@ impl Compression {
                 enc.finish().map_err(ContainerError::IoBare)
             }
             Compression::Zstd => zstd::stream::encode_all(data, 0).map_err(ContainerError::IoBare),
+            // The writer never emits these; the reader decompresses them.
+            Compression::Xz | Compression::Lz4 | Compression::Lzip | Compression::Lzop => Err(
+                ContainerError::UnsupportedCompression(format!("{}: write", self.suffix())),
+            ),
         }
     }
 
@@ -88,8 +121,38 @@ impl Compression {
                 Ok(out)
             }
             Compression::Zstd => zstd::stream::decode_all(data).map_err(ContainerError::IoBare),
+            Compression::Xz | Compression::Lz4 | Compression::Lzip | Compression::Lzop => {
+                decompress_with_tool(self.system_tool().unwrap(), data)
+            }
         }
     }
+}
+
+/// Decompress `data` by piping it through `tool -dc` (stdin to stdout), the
+/// fallback for codecs without an in-process crate, matching Portage which
+/// shells out to the same tools.
+fn decompress_with_tool(tool: &str, data: &[u8]) -> Result<Vec<u8>, ContainerError> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(tool)
+        .arg("-dc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(ContainerError::IoBare)?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(data)
+        .map_err(ContainerError::IoBare)?;
+    let output = child.wait_with_output().map_err(ContainerError::IoBare)?;
+    if !output.status.success() {
+        return Err(ContainerError::UnsupportedCompression(format!(
+            "{tool} decompression failed"
+        )));
+    }
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -120,9 +183,16 @@ mod tests {
     }
 
     #[test]
-    fn xz_reported_unsupported() {
+    fn full_gpkg_suffix_set_recognized() {
+        // The whole gpkg suffix set is recognized; the system-tool codecs map to
+        // their variants, and a truly unknown suffix still errors.
+        assert_eq!(Compression::from_suffix("xz").unwrap(), Compression::Xz);
+        assert_eq!(Compression::from_suffix("lz4").unwrap(), Compression::Lz4);
+        assert_eq!(Compression::from_suffix("lz").unwrap(), Compression::Lzip);
+        assert_eq!(Compression::from_suffix("lzo").unwrap(), Compression::Lzop);
+        assert_eq!(Compression::Xz.suffix(), "xz");
         assert!(matches!(
-            Compression::from_suffix("xz"),
+            Compression::from_suffix("bogus"),
             Err(ContainerError::UnsupportedCompression(_))
         ));
     }

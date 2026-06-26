@@ -27,6 +27,12 @@ pub enum EntryKind {
     },
     /// A directory. Carries no extra fields.
     Dir,
+    /// A named pipe (FIFO). Carries no extra fields, matching Portage's `fif`
+    /// CONTENTS node type.
+    Fif,
+    /// A character or block device node. Carries no extra fields, matching
+    /// Portage's `dev` CONTENTS node type.
+    Dev,
 }
 
 /// A single manifest entry: a path and its kind.

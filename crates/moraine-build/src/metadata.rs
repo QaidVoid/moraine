@@ -69,13 +69,10 @@ pub fn copy_ebuild(ebuild: impl AsRef<Path>, build_info_dir: impl AsRef<Path>) -
     Ok(dest)
 }
 
-/// Write the saved environment compressed into `build-info/environment.bz2`.
+/// Write the saved environment as real bzip2 into `build-info/environment.bz2`.
 ///
-/// To avoid an external compression dependency, the saved environment is stored
-/// with a small run-length-style container the merge engine can read; the file
-/// keeps the conventional `.bz2` name for compatibility with consumers that key
-/// off the filename. The bytes are the raw environment when compression is not
-/// available, which is the conservative, lossless choice.
+/// The body is the conventional `declare -x KEY=value` dump, compressed with
+/// bzip2 so Portage's `bzip2 -d` and moraine's own `BzDecoder` can both read it.
 #[instrument(name = "write_saved_env", skip(env, build_info_dir), fields(dir = %build_info_dir.as_ref().display()))]
 pub fn write_saved_environment(
     build_info_dir: impl AsRef<Path>,
@@ -87,11 +84,19 @@ pub fn write_saved_environment(
     for (k, v) in env {
         body.push_str(&format!("declare -x {}={:?}\n", k, v));
     }
-    // Stored uncompressed but lossless under the conventional name. The merge
-    // engine reads the saved environment by content, not by decompressing.
+    let compressed = bzip2_compress(body.as_bytes())?;
     let path = dir.join("environment.bz2");
-    moraine_common::fs::atomic_write(&path, body.as_bytes())?;
+    moraine_common::fs::atomic_write(&path, &compressed)?;
     Ok(path)
+}
+
+/// Compress `bytes` with bzip2 at the default level.
+fn bzip2_compress(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut encoder = bzip2::read::BzEncoder::new(bytes, bzip2::Compression::default());
+    let mut out = Vec::new();
+    encoder.read_to_end(&mut out).at("environment.bz2")?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -136,7 +141,12 @@ mod tests {
         let path = write_saved_environment(dir.path(), &env).unwrap();
         assert!(path.ends_with("environment.bz2"));
         assert!(path.exists());
-        let body = std::fs::read_to_string(&path).unwrap();
+        // The file is real bzip2: decompress and check the body round-trips.
+        use std::io::Read as _;
+        let compressed = std::fs::read(&path).unwrap();
+        let mut decoder = bzip2::read::BzDecoder::new(&compressed[..]);
+        let mut body = String::new();
+        decoder.read_to_string(&mut body).unwrap();
         assert!(body.contains("CFLAGS"));
     }
 }

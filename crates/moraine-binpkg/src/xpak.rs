@@ -13,6 +13,7 @@
 //! distance from the start of the blob back from the end-of-file region. The
 //! importer is read-only and does not rewrite the source.
 
+use crate::compress::Compression;
 use crate::error::ContainerError;
 use crate::metadata::MetadataMap;
 
@@ -183,6 +184,14 @@ pub fn build_blob(metadata: &MetadataMap) -> Vec<u8> {
 
 /// Build a complete tbz2 file from an image stream and a metadata map.
 ///
+/// Write a `BINPKG_FORMAT=xpak` `.tbz2` container from a root-relative image tar
+/// and `metadata`: bzip2-compress the image and append the xpak blob. Portage
+/// installs the result unchanged.
+pub fn write_tbz2(metadata: &MetadataMap, image_tar: &[u8]) -> Result<Vec<u8>, ContainerError> {
+    let compressed = Compression::Bzip2.compress(image_tar)?;
+    Ok(build_tbz2(&compressed, metadata))
+}
+
 /// Used by tests. `image` is the leading `tar.bz2` stream emitted verbatim.
 pub fn build_tbz2(image: &[u8], metadata: &MetadataMap) -> Vec<u8> {
     let blob = build_blob(metadata);

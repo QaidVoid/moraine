@@ -7,7 +7,7 @@
 //! preserved-libs registry after every operation, and recovers an interrupted
 //! operation found at startup.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use moraine_vdb::store::{Store, StorePaths};
 
@@ -36,9 +36,12 @@ pub struct OperationOutcome {
     pub reconciled: Vec<String>,
 }
 
-/// A held installed-store lock, released on drop.
+/// A held installed-store lock: a real advisory `flock(LOCK_EX)` on the lock
+/// file, held for the operation's duration. The lock is released when the file
+/// handle is dropped; the lock file itself is never unlinked, so a concurrent
+/// acquirer blocks on the same inode rather than racing a recreated file.
 struct LockGuard {
-    path: PathBuf,
+    _file: std::fs::File,
 }
 
 impl LockGuard {
@@ -46,24 +49,22 @@ impl LockGuard {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_path(parent)?;
         }
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(path)
             .map_err(|source| MergeError::Lock {
                 path: path.to_path_buf(),
                 source,
             })?;
-        Ok(Self {
-            path: path.to_path_buf(),
-        })
-    }
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(|e| {
+            MergeError::Lock {
+                path: path.to_path_buf(),
+                source: std::io::Error::from_raw_os_error(e.raw_os_error()),
+            }
+        })?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -194,6 +195,9 @@ impl MergeEngine {
         *counter += 1;
         let stamped = *counter;
         let record = op.state.clone().into_record(&interner, contents, stamped)?;
+        // Materialize the authoritative Portage-format dbdir, then update the
+        // derived `installed.mvdb` cache.
+        moraine_vdb::vardb::export_record(&self.ctx.vdb_dir, &record, &interner, None)?;
         store.add(record)?;
 
         // A same-slot replacement supersedes the prior version's installed
@@ -202,6 +206,9 @@ impl MergeEngine {
             && let Some((category, package, version)) = split_cpv(store, &interner, prior)
         {
             store.remove(category, package, &version)?;
+            if let (Some(c), Some(p)) = (interner.resolve(category), interner.resolve(package)) {
+                moraine_vdb::vardb::remove_record(&self.ctx.vdb_dir, &c, &p, &version)?;
+            }
         }
 
         // World update happens only after the record is committed.
@@ -252,6 +259,10 @@ impl MergeEngine {
                 _ => None,
             };
             store.remove(category, package, &version)?;
+            // Drop the Portage-format dbdir as well.
+            if let (Some(c), Some(p)) = (interner.resolve(category), interner.resolve(package)) {
+                moraine_vdb::vardb::remove_record(&self.ctx.vdb_dir, &c, &p, &version)?;
+            }
             if !op.replaced
                 && let Some(cp) = cp
             {

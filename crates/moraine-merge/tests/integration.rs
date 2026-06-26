@@ -42,6 +42,8 @@ impl Sandbox {
             state_dir: self.state.clone(),
             features,
             config_protect: cp,
+            collision_ignore: Vec::new(),
+            uninstall_ignore: Vec::new(),
         }
     }
 
@@ -94,6 +96,11 @@ fn state(cp: &str, version: &str, slot: &str) -> PackageState {
         provides: vec![],
         requires: vec![],
         environment: None,
+        inherited: vec![],
+        features: vec![],
+        size: None,
+        build_id: None,
+        needed: vec![],
     }
 }
 
@@ -146,6 +153,162 @@ fn regular_file_placed_with_md5_and_mtime_and_atomic() {
         rec.contents.owner("/usr/bin"),
         Some(moraine_vdb::EntryKind::Dir)
     ));
+}
+
+#[test]
+fn file_mode_preserved_from_image() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/usr/bin/tool", b"x")]);
+    // Stamp a distinctive mode (setuid + 0750) on the source.
+    std::fs::set_permissions(
+        image.join("usr/bin/tool"),
+        std::fs::Permissions::from_mode(0o4750),
+    )
+    .unwrap();
+
+    let engine = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()));
+    engine
+        .apply(&[merge_op(image, state("cat/p", "1", "0"), None, false)])
+        .unwrap();
+
+    let mode = std::fs::symlink_metadata(sb.live("/usr/bin/tool"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o4750, "source mode must be reproduced on placement");
+}
+
+#[test]
+fn fifo_placed_recorded_and_unmerged() {
+    use std::os::unix::fs::FileTypeExt as _;
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let image = tmp.path().join("image");
+    std::fs::create_dir_all(image.join("run")).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(image.join("run/pipe"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo failed");
+
+    let engine = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()));
+    engine
+        .apply(&[merge_op(image, state("cat/p", "1", "0"), None, false)])
+        .unwrap();
+
+    let live = sb.live("/run/pipe");
+    assert!(
+        std::fs::symlink_metadata(&live)
+            .unwrap()
+            .file_type()
+            .is_fifo(),
+        "placed entry must be a FIFO"
+    );
+    let store = moraine_vdb::Store::load(moraine_vdb::StorePaths::in_dir(&sb.vdb)).unwrap();
+    assert!(matches!(
+        store.records()[0].contents.owner("/run/pipe"),
+        Some(moraine_vdb::EntryKind::Fif)
+    ));
+
+    // Unmerge removes the FIFO.
+    let engine2 = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()));
+    engine2
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "cat/p-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+    assert!(!live.exists(), "FIFO must be removed on unmerge");
+}
+
+#[test]
+fn hardlink_recreated_as_hardlink() {
+    use std::os::unix::fs::MetadataExt as _;
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let image = tmp.path().join("image");
+    std::fs::create_dir_all(image.join("usr/bin")).unwrap();
+    std::fs::write(image.join("usr/bin/a"), b"shared").unwrap();
+    std::fs::hard_link(image.join("usr/bin/a"), image.join("usr/bin/b")).unwrap();
+
+    let engine = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()));
+    engine
+        .apply(&[merge_op(image, state("cat/p", "1", "0"), None, false)])
+        .unwrap();
+
+    let a = std::fs::symlink_metadata(sb.live("/usr/bin/a")).unwrap();
+    let b = std::fs::symlink_metadata(sb.live("/usr/bin/b")).unwrap();
+    assert_eq!(a.ino(), b.ino(), "placed files must share one inode");
+    assert_eq!(a.nlink(), 2);
+}
+
+#[test]
+fn symlink_onto_directory_is_hard_collision() {
+    let sb = Sandbox::new();
+    // A directory already exists where the new package ships a symlink.
+    std::fs::create_dir_all(sb.eroot.join("opt/thing")).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/opt/keep", b"x")]);
+    add_symlink(&image, "/opt/thing", "elsewhere");
+
+    // No collision-protect: a symlink onto a directory still aborts (PMS ban).
+    let engine = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()));
+    let err = engine
+        .apply(&[merge_op(image, state("cat/p", "1", "0"), None, false)])
+        .unwrap_err();
+    assert!(matches!(err, moraine_merge::MergeError::Collision { .. }));
+    assert!(sb.live("/opt/thing").is_dir(), "directory left intact");
+}
+
+#[test]
+fn type_conflict_blocker_is_backed_up() {
+    let sb = Sandbox::new();
+    // A plain file sits where the new package ships a directory.
+    std::fs::create_dir_all(&sb.eroot).unwrap();
+    std::fs::write(sb.live("/data"), b"old file").unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/data/inner", b"new")]);
+    let engine = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()));
+    engine
+        .apply(&[merge_op(image, state("cat/p", "1", "0"), None, false)])
+        .unwrap();
+
+    assert!(sb.live("/data").is_dir(), "directory now placed");
+    assert!(sb.live("/data/inner").is_file());
+    assert_eq!(
+        std::fs::read(sb.live("/data.backup.0")).unwrap(),
+        b"old file",
+        "type-conflicting blocker backed up"
+    );
+}
+
+#[test]
+fn collision_ignore_exempts_path() {
+    let sb = Sandbox::new();
+    std::fs::create_dir_all(sb.eroot.join("etc")).unwrap();
+    std::fs::write(sb.live("/etc/ignored.conf"), b"pre-existing").unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/etc/ignored.conf", b"new")]);
+    let mut ctx = sb.context(
+        Features {
+            collision_protect: true,
+            ..Features::default()
+        },
+        ConfigProtect::default(),
+    );
+    ctx.collision_ignore = vec!["/etc/*.conf".to_string()];
+    let engine = MergeEngine::new(ctx);
+    // collision-protect would abort, but the ignore glob exempts the path.
+    engine
+        .apply(&[merge_op(image, state("cat/p", "1", "0"), None, false)])
+        .unwrap();
+    assert_eq!(std::fs::read(sb.live("/etc/ignored.conf")).unwrap(), b"new");
 }
 
 #[test]
@@ -389,6 +552,221 @@ fn config_protect_mask_writes_in_place() {
 }
 
 #[test]
+fn keep_file_exempt_from_config_protection() {
+    let sb = Sandbox::new();
+    let cp = ConfigProtect::new(["/etc".to_string()], Vec::<String>::new());
+    std::fs::create_dir_all(sb.eroot.join("etc")).unwrap();
+    std::fs::write(sb.live("/etc/.keep"), b"stale").unwrap();
+
+    // A zero-byte `.keep` marker overwrites in place despite CONFIG_PROTECT.
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/etc/.keep", b"")]);
+    let engine = MergeEngine::new(sb.context(Features::default(), cp));
+    engine
+        .apply(&[merge_op(image, state("cat/p", "1", "0"), None, false)])
+        .unwrap();
+    assert_eq!(std::fs::read(sb.live("/etc/.keep")).unwrap(), b"");
+    assert!(!sb.live("/etc/._cfg0000_.keep").exists());
+}
+
+#[test]
+fn config_protect_if_modified_overwrites_unmodified() {
+    let sb = Sandbox::new();
+    let cp = ConfigProtect::new(["/etc".to_string()], Vec::<String>::new());
+    let feats = Features {
+        config_protect_if_modified: true,
+        ..Features::default()
+    };
+
+    // v1 installs the config in place.
+    let tmp = tempfile::tempdir().unwrap();
+    let image1 = build_image(tmp.path(), &[("/etc/foo.conf", b"a")]);
+    MergeEngine::new(sb.context(feats, cp.clone()))
+        .apply(&[merge_op(image1, state("cat/cfg", "1", "0"), None, false)])
+        .unwrap();
+
+    // v2 with new content; the admin has not touched the live file, so it is
+    // overwritten in place with no `._cfg` variant.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let image2 = build_image(tmp2.path(), &[("/etc/foo.conf", b"b")]);
+    MergeEngine::new(sb.context(feats, cp))
+        .apply(&[merge_op(
+            image2,
+            state("cat/cfg", "2", "0"),
+            Some("cat/cfg-1"),
+            false,
+        )])
+        .unwrap();
+    assert_eq!(std::fs::read(sb.live("/etc/foo.conf")).unwrap(), b"b");
+    assert!(!sb.live("/etc/._cfg0000_foo.conf").exists());
+}
+
+#[test]
+fn config_protect_if_modified_protects_modified() {
+    let sb = Sandbox::new();
+    let cp = ConfigProtect::new(["/etc".to_string()], Vec::<String>::new());
+    let feats = Features {
+        config_protect_if_modified: true,
+        ..Features::default()
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let image1 = build_image(tmp.path(), &[("/etc/foo.conf", b"a")]);
+    MergeEngine::new(sb.context(feats, cp.clone()))
+        .apply(&[merge_op(image1, state("cat/cfg", "1", "0"), None, false)])
+        .unwrap();
+
+    // The admin edits the live file, so the new version must protect it.
+    std::fs::write(sb.live("/etc/foo.conf"), b"admin edit").unwrap();
+    let tmp2 = tempfile::tempdir().unwrap();
+    let image2 = build_image(tmp2.path(), &[("/etc/foo.conf", b"b")]);
+    MergeEngine::new(sb.context(feats, cp))
+        .apply(&[merge_op(
+            image2,
+            state("cat/cfg", "2", "0"),
+            Some("cat/cfg-1"),
+            false,
+        )])
+        .unwrap();
+    assert_eq!(
+        std::fs::read(sb.live("/etc/foo.conf")).unwrap(),
+        b"admin edit"
+    );
+    assert_eq!(
+        std::fs::read(sb.live("/etc/._cfg0000_foo.conf")).unwrap(),
+        b"b"
+    );
+}
+
+#[test]
+fn config_variant_reuses_matching_index() {
+    let sb = Sandbox::new();
+    let cp = ConfigProtect::new(["/etc".to_string()], Vec::<String>::new());
+    std::fs::create_dir_all(sb.eroot.join("etc")).unwrap();
+    std::fs::write(sb.live("/etc/foo.conf"), b"live").unwrap();
+    std::fs::write(sb.live("/etc/._cfg0000_foo.conf"), b"pending").unwrap();
+
+    // New content equals the existing pending variant: reuse it, no new index.
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/etc/foo.conf", b"pending")]);
+    MergeEngine::new(sb.context(Features::default(), cp))
+        .apply(&[merge_op(image, state("cat/cfg", "1", "0"), None, false)])
+        .unwrap();
+    assert!(!sb.live("/etc/._cfg0001_foo.conf").exists());
+    assert_eq!(
+        std::fs::read(sb.live("/etc/._cfg0000_foo.conf")).unwrap(),
+        b"pending"
+    );
+}
+
+#[test]
+fn noconfmem_skips_reoffer_after_admin_dismissal() {
+    let sb = Sandbox::new();
+    let cp = ConfigProtect::new(["/etc".to_string()], Vec::<String>::new());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let image1 = build_image(tmp.path(), &[("/etc/foo.conf", b"a")]);
+    MergeEngine::new(sb.context(Features::default(), cp.clone()))
+        .apply(&[merge_op(image1, state("cat/cfg", "1", "0"), None, false)])
+        .unwrap();
+
+    // v2 offers "b" as a variant (admin left the live file at "a").
+    let tmp2 = tempfile::tempdir().unwrap();
+    let image2 = build_image(tmp2.path(), &[("/etc/foo.conf", b"b")]);
+    MergeEngine::new(sb.context(Features::default(), cp.clone()))
+        .apply(&[merge_op(
+            image2,
+            state("cat/cfg", "2", "0"),
+            Some("cat/cfg-1"),
+            false,
+        )])
+        .unwrap();
+    assert!(sb.live("/etc/._cfg0000_foo.conf").exists());
+
+    // The admin dismisses the update by deleting the variant. A later merge of
+    // the same content must not re-offer it.
+    std::fs::remove_file(sb.live("/etc/._cfg0000_foo.conf")).unwrap();
+    let tmp3 = tempfile::tempdir().unwrap();
+    let image3 = build_image(tmp3.path(), &[("/etc/foo.conf", b"b")]);
+    MergeEngine::new(sb.context(Features::default(), cp))
+        .apply(&[merge_op(
+            image3,
+            state("cat/cfg", "3", "0"),
+            Some("cat/cfg-2"),
+            false,
+        )])
+        .unwrap();
+    assert!(
+        !sb.live("/etc/._cfg0000_foo.conf").exists(),
+        "already-offered content must not be re-offered"
+    );
+    assert_eq!(std::fs::read(sb.live("/etc/foo.conf")).unwrap(), b"a");
+}
+
+#[test]
+fn merge_exports_portage_vdb_dir() {
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/usr/bin/foo", b"hello")]);
+    let mut st = state("app-misc/foo", "1.2", "3");
+    st.subslot = Some("4".to_string());
+    let out = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()))
+        .apply(&[merge_op(image, st, None, false)])
+        .unwrap();
+
+    let dbdir = sb.vdb.join("app-misc/foo-1.2");
+    assert!(dbdir.is_dir(), "dbdir must be materialized");
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("SLOT")).unwrap().trim(),
+        "3/4"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("CATEGORY"))
+            .unwrap()
+            .trim(),
+        "app-misc"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("PF")).unwrap().trim(),
+        "foo-1.2"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("EAPI")).unwrap().trim(),
+        "8"
+    );
+    // The recorded COUNTER equals the value reported to the caller (single stamp).
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("COUNTER"))
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap(),
+        out[0].counter.unwrap()
+    );
+    // CONTENTS lists the placed file and its parents.
+    let contents = std::fs::read_to_string(dbdir.join("CONTENTS")).unwrap();
+    assert!(contents.lines().any(|l| l.starts_with("obj /usr/bin/foo ")));
+    assert!(contents.lines().any(|l| l == "dir /usr/bin"));
+
+    // The exported tree imports back to an equivalent record.
+    let interner = std::sync::Arc::new(moraine_common::Interner::new());
+    let records = moraine_vdb::import_vdb(&sb.vdb, &interner).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].cpv(&interner), "app-misc/foo-1.2");
+    assert_eq!(
+        interner.resolve(records[0].slot.slot).unwrap().as_ref(),
+        "3"
+    );
+    assert_eq!(
+        interner
+            .resolve(records[0].slot.subslot.unwrap())
+            .unwrap()
+            .as_ref(),
+        "4"
+    );
+}
+
+#[test]
 fn world_and_counter_update_after_commit() {
     let sb = Sandbox::new();
     let tmp = tempfile::tempdir().unwrap();
@@ -446,6 +824,61 @@ fn unmerge_removes_unmodified_skips_modified_and_nonempty_dirs() {
     // Package removed from world.
     let world = std::fs::read_to_string(sb.state.join("world")).unwrap_or_default();
     assert!(!world.contains("cat/pkg"));
+}
+
+#[test]
+fn uninstall_ignore_keeps_path() {
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/opt/keep/data", b"x")]);
+    MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()))
+        .apply(&[merge_op(image, state("cat/p", "1", "0"), None, false)])
+        .unwrap();
+
+    let mut ctx = sb.context(Features::default(), ConfigProtect::default());
+    ctx.uninstall_ignore = vec!["/opt/keep".to_string()];
+    MergeEngine::new(ctx)
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "cat/p-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+    assert!(
+        sb.live("/opt/keep/data").exists(),
+        "UNINSTALL_IGNORE path must be kept"
+    );
+}
+
+#[test]
+fn symlink_to_directory_preserved_while_used() {
+    let sb = Sandbox::new();
+    // Package A ships a real dir and a symlink dir pointing at it.
+    let tmp = tempfile::tempdir().unwrap();
+    let image_a = build_image(tmp.path(), &[("/real/.keep", b"")]);
+    add_symlink(&image_a, "/linkdir", "real");
+    MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()))
+        .apply(&[merge_op(image_a, state("cat/a", "1", "0"), None, false)])
+        .unwrap();
+
+    // Package B owns a file reachable through the symlink.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let image_b = build_image(tmp2.path(), &[("/linkdir/file", b"y")]);
+    MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()))
+        .apply(&[merge_op(image_b, state("cat/b", "1", "0"), None, false)])
+        .unwrap();
+
+    // Unmerge A: the symlink dir is still used by B, so it is preserved.
+    MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()))
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "cat/a-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+    let link = sb.live("/linkdir");
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "in-use directory symlink must be preserved"
+    );
 }
 
 #[test]
@@ -565,6 +998,64 @@ fn preserve_libs_keeps_still_needed_soname_and_drops_when_unneeded() {
         out2[0]
             .reconciled
             .contains(&"/usr/lib/libfoo.so.1".to_string())
+    );
+}
+
+#[test]
+fn preserve_libs_keeps_soname_symlink_chain() {
+    use moraine_merge::state::Soname;
+    let sb = Sandbox::new();
+    let features = Features {
+        preserve_libs: true,
+        ..Features::default()
+    };
+
+    // Provider v1 ships the real versioned library plus its bare soname symlink.
+    let tmp = tempfile::tempdir().unwrap();
+    let image1 = build_image(tmp.path(), &[("/usr/lib/libfoo.so.1.2.3", b"abi1")]);
+    add_symlink(&image1, "/usr/lib/libfoo.so.1", "libfoo.so.1.2.3");
+    let mut prov1 = state("lib/foo", "1", "0");
+    prov1.provides = vec![Soname {
+        bucket: "x86_64".to_string(),
+        soname: "libfoo.so.1".to_string(),
+    }];
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(image1, prov1, None, false)])
+        .unwrap();
+
+    // A consumer requires libfoo.so.1.
+    let tmpc = tempfile::tempdir().unwrap();
+    let imagec = build_image(tmpc.path(), &[("/usr/bin/consumer", b"app")]);
+    let mut cons = state("app/consumer", "1", "0");
+    cons.requires = vec![Soname {
+        bucket: "x86_64".to_string(),
+        soname: "libfoo.so.1".to_string(),
+    }];
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(imagec, cons, None, false)])
+        .unwrap();
+
+    // Upgrade the provider to a new soname, dropping libfoo.so.1.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let image2 = build_image(tmp2.path(), &[("/usr/lib/libfoo.so.2.0.0", b"abi2")]);
+    add_symlink(&image2, "/usr/lib/libfoo.so.2", "libfoo.so.2.0.0");
+    let mut prov2 = state("lib/foo", "2", "0");
+    prov2.provides = vec![Soname {
+        bucket: "x86_64".to_string(),
+        soname: "libfoo.so.2".to_string(),
+    }];
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(image2, prov2, Some("lib/foo-1"), false)])
+        .unwrap();
+
+    // Both the soname symlink and its real target are preserved.
+    assert!(
+        std::fs::symlink_metadata(sb.live("/usr/lib/libfoo.so.1")).is_ok(),
+        "soname symlink must be preserved"
+    );
+    assert!(
+        sb.live("/usr/lib/libfoo.so.1.2.3").exists(),
+        "real versioned library must be preserved"
     );
 }
 

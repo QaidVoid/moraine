@@ -185,9 +185,16 @@ impl IndexedBinhost {
         if let Some(path) = entry.metadata.get_str("PATH") {
             return Some(path);
         }
-        // Fall back to the conventional `<cat>/<pf>.gpkg` layout.
+        // Fall back to the conventional layout. With `binpkg-multi-instance` a
+        // stanza carries a `BUILD_ID`, giving `<cat>/<pf>-<buildid>.gpkg.tar`;
+        // otherwise the single-instance `<cat>/<pf>.gpkg.tar`.
         let (category, pf) = cpv.split_once('/')?;
-        Some(format!("{category}/{pf}.gpkg"))
+        match entry.metadata.get_str("BUILD_ID") {
+            Some(id) if !id.trim().is_empty() => {
+                Some(format!("{category}/{pf}-{}.gpkg.tar", id.trim()))
+            }
+            _ => Some(format!("{category}/{pf}.gpkg.tar")),
+        }
     }
 }
 
@@ -197,7 +204,7 @@ impl BinpkgSource for IndexedBinhost {
             return Ok(None);
         };
         let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
-        let dest = self.stage.join(format!("{pf}.gpkg"));
+        let dest = self.stage.join(format!("{pf}.gpkg.tar"));
         let url = format!("{}/{}", self.base_uri, path);
         if self.fetch.run(&url, &dest).is_err() {
             return Ok(None);

@@ -8,10 +8,12 @@
 pub mod atom;
 pub mod depspec;
 mod error;
+pub mod rewrite;
 
 pub use atom::{Atom, Blocker, Operator, PackageRef, SlotOp, UseDep, UseDepKind, UseRequirement};
 pub use depspec::DepSpec;
 pub use error::{AtomError, DepError};
+pub use rewrite::{rewrite_dep_cp, rewrite_dep_slot};
 
 #[cfg(test)]
 mod tests {

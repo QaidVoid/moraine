@@ -134,6 +134,14 @@ pub struct PackageRecord {
     pub contents: Contents,
     /// A reference to the saved build environment blob, if one was recorded.
     pub environment: Option<EnvironmentRef>,
+    /// The recorded `INHERITED` eclass names.
+    pub inherited: Vec<String>,
+    /// The `FEATURES` active when the package was built.
+    pub features: Vec<String>,
+    /// The installed `SIZE` in bytes, if recorded.
+    pub size: Option<u64>,
+    /// The verbatim `NEEDED.ELF.2` lines, preserving per-object linkage.
+    pub needed: Vec<String>,
 }
 
 /// The five `*DEPEND` fields kept together, addressable by [`DependKind`].

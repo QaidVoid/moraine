@@ -7,7 +7,8 @@
 //! written to a sibling named `._cfgNNNN_<name>` at the lowest unused index, and
 //! the path is recorded as a pending config update.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// The CONFIG_PROTECT policy: the protected and masked directory prefixes.
 ///
@@ -84,6 +85,66 @@ pub fn variant_name(target_name: &str, existing: &[String]) -> String {
             return candidate;
         }
         idx += 1;
+    }
+}
+
+/// The config memory (`CONFIG_MEMORY_FILE`): the md5 digests already offered to
+/// the admin for each protected config path, so an identical update is not
+/// re-offered as a fresh `._cfg` variant (Portage's `noconfmem`).
+///
+/// The on-disk form is one line per path: `<install_path>\t<md5>,<md5>,...`.
+#[derive(Debug, Default)]
+pub(crate) struct ConfMem {
+    path: PathBuf,
+    offered: BTreeMap<String, Vec<String>>,
+}
+
+impl ConfMem {
+    /// Load the config memory from `path`, returning an empty store when the file
+    /// is absent or unreadable.
+    pub(crate) fn load(path: PathBuf) -> Self {
+        let mut offered = BTreeMap::new();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                if let Some((install_path, digests)) = line.split_once('\t') {
+                    offered.insert(
+                        install_path.to_string(),
+                        digests.split(',').map(str::to_string).collect(),
+                    );
+                }
+            }
+        }
+        Self { path, offered }
+    }
+
+    /// Whether `md5` has already been offered for `install_path`.
+    pub(crate) fn already_offered(&self, install_path: &str, md5: &str) -> bool {
+        self.offered
+            .get(install_path)
+            .is_some_and(|v| v.iter().any(|m| m == md5))
+    }
+
+    /// Record that `md5` was offered for `install_path`.
+    pub(crate) fn record(&mut self, install_path: &str, md5: &str) {
+        let entry = self.offered.entry(install_path.to_string()).or_default();
+        if !entry.iter().any(|m| m == md5) {
+            entry.push(md5.to_string());
+        }
+    }
+
+    /// Persist the config memory, creating the parent directory if needed.
+    pub(crate) fn save(&self) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = String::new();
+        for (install_path, digests) in &self.offered {
+            out.push_str(install_path);
+            out.push('\t');
+            out.push_str(&digests.join(","));
+            out.push('\n');
+        }
+        std::fs::write(&self.path, out)
     }
 }
 

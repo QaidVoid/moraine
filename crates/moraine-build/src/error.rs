@@ -118,6 +118,16 @@ pub enum BuildError {
         distfile: String,
     },
 
+    /// A packaged file (`EBUILD`/`AUX`/`MISC`) failed Manifest verification
+    /// before the ebuild was sourced.
+    #[error("Manifest verification failed for `{name}`: {reason}")]
+    ManifestMismatch {
+        /// The `TYPE/name` of the entry that failed.
+        name: String,
+        /// Why verification failed.
+        reason: String,
+    },
+
     /// A phase process exited non-zero.
     #[error("phase {phase} failed with exit status {status}")]
     Phase {

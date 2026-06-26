@@ -158,7 +158,9 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
             PhaseKind::PkgPretend => f.required_use,
             // src_prepare and src_configure are EAPI 2+; use_deps gates at 2.
             PhaseKind::SrcPrepare | PhaseKind::SrcConfigure => f.use_deps,
-            PhaseKind::PkgNofetch => false,
+            // pkg_nofetch is not part of the normal phase order; it is run on
+            // demand by the fetch-restricted path via `run_nofetch`.
+            PhaseKind::PkgNofetch => true,
             _ => true,
         }
     }
@@ -219,6 +221,15 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
             report.runs.push(run);
         }
         Ok(report)
+    }
+
+    /// Run the `pkg_nofetch` phase on demand for a fetch-restricted package whose
+    /// distfiles are missing, so the ebuild can print its manual-download
+    /// instructions. Returns the phase's elog messages.
+    pub fn run_nofetch(&self) -> Result<Vec<ElogMessage>> {
+        let mut elog = Vec::new();
+        let (_, _) = self.run_phase(PhaseKind::PkgNofetch, &BTreeMap::new(), &mut elog)?;
+        Ok(elog)
     }
 
     /// Run a single phase, returning its record and the updated carried env.

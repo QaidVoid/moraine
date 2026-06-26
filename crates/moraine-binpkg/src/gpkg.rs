@@ -21,7 +21,7 @@ use moraine_common::hash::{blake2b, sha512};
 use crate::compress::Compression;
 use crate::error::ContainerError;
 use crate::metadata::MetadataMap;
-use crate::signature::SignatureConfig;
+use crate::signature::{SignatureConfig, SignaturePolicy};
 
 const MARKER_PREFIX: &str = "gpkg-1";
 
@@ -81,6 +81,20 @@ pub fn read(
     bytes: &[u8],
     signature: Option<&SignatureConfig>,
 ) -> Result<GpkgPackage, ContainerError> {
+    read_with_policy(bytes, signature, SignaturePolicy::default())
+}
+
+/// Import a GPKG file under an explicit signature `policy`.
+///
+/// When the `Manifest` carries an inline cleartext PGP signature, it is verified
+/// with the configured `signature` and the `DATA` checksums are parsed only from
+/// the verified body. `RequestSignature` rejects an unsigned Manifest;
+/// `IgnoreSignature` skips verification.
+pub fn read_with_policy(
+    bytes: &[u8],
+    signature: Option<&SignatureConfig>,
+    policy: SignaturePolicy,
+) -> Result<GpkgPackage, ContainerError> {
     let span = tracing::info_span!("binpkg.gpkg.read", size = bytes.len());
     let _enter = span.enter();
 
@@ -93,11 +107,31 @@ pub fn read(
         ));
     }
 
-    let manifest = lookup
-        .get("Manifest")
-        .map(|m| parse_manifest(&m.bytes))
-        .transpose()?
-        .unwrap_or_default();
+    // Resolve the Manifest, verifying an inline cleartext signature and parsing
+    // DATA only from the verified body.
+    let manifest = match lookup.get("Manifest") {
+        Some(m) => {
+            let signed = is_inline_signed(&m.bytes);
+            if policy == SignaturePolicy::RequestSignature && !signed {
+                return Err(ContainerError::Signature(
+                    "binpkg-request-signature: Manifest is not signed".into(),
+                ));
+            }
+            let body = if signed && policy != SignaturePolicy::IgnoreSignature {
+                match signature {
+                    Some(config) => config.verify_inline(&m.bytes)?,
+                    // No key to verify with: parse the cleartext body unverified.
+                    None => extract_cleartext_body(&m.bytes),
+                }
+            } else if signed {
+                extract_cleartext_body(&m.bytes)
+            } else {
+                m.bytes.clone()
+            };
+            parse_manifest(&body)?
+        }
+        None => Default::default(),
+    };
 
     // Verify any signed members and detached signatures.
     if let Some(config) = signature {
@@ -128,6 +162,130 @@ pub fn read(
         image,
         image_compression: image_comp,
     })
+}
+
+/// Write a GPKG container from `metadata` and a root-relative `image_tar`,
+/// compressing both inner tars with `comp`.
+///
+/// The outer tar shares a single `<basename>` prefix and carries `gpkg-1`, the
+/// `metadata.tar.<comp>` (members under `metadata/`), the `image.tar.<comp>`
+/// (members re-prefixed under `image/`), and a `Manifest` of per-member BLAKE2B
+/// and SHA512 digests over the stored (compressed) bytes. Portage installs the
+/// result unchanged.
+pub fn write(
+    metadata: &MetadataMap,
+    image_tar: &[u8],
+    comp: Compression,
+) -> Result<Vec<u8>, ContainerError> {
+    let basename = metadata
+        .get_str("PF")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "gpkg".to_string());
+
+    let meta_inner = build_metadata_tar(metadata)?;
+    let image_inner = reprefix_image_tar(image_tar)?;
+    let meta_stored = comp.compress(&meta_inner)?;
+    let image_stored = comp.compress(&image_inner)?;
+    let meta_name = format!("metadata.tar.{}", comp.suffix());
+    let image_name = format!("image.tar.{}", comp.suffix());
+
+    let mut manifest = String::new();
+    for (name, bytes) in [(&meta_name, &meta_stored), (&image_name, &image_stored)] {
+        manifest.push_str(&format!(
+            "DATA {name} {} BLAKE2B {} SHA512 {}\n",
+            bytes.len(),
+            blake2b(bytes),
+            sha512(bytes),
+        ));
+    }
+
+    let mut builder = tar::Builder::new(Vec::new());
+    append_outer(&mut builder, &format!("{basename}/gpkg-1"), b"")?;
+    append_outer(
+        &mut builder,
+        &format!("{basename}/{meta_name}"),
+        &meta_stored,
+    )?;
+    append_outer(
+        &mut builder,
+        &format!("{basename}/{image_name}"),
+        &image_stored,
+    )?;
+    append_outer(
+        &mut builder,
+        &format!("{basename}/Manifest"),
+        manifest.as_bytes(),
+    )?;
+    builder
+        .into_inner()
+        .map_err(|e| ContainerError::MalformedGpkg(format!("gpkg outer tar: {e}")))
+}
+
+/// Append one outer-tar member.
+fn append_outer(
+    builder: &mut tar::Builder<Vec<u8>>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), ContainerError> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, name, bytes)
+        .map_err(|e| ContainerError::MalformedGpkg(format!("gpkg member `{name}`: {e}")))
+}
+
+/// Build the metadata inner tar, storing each key under `metadata/<key>`.
+fn build_metadata_tar(metadata: &MetadataMap) -> Result<Vec<u8>, ContainerError> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, value) in metadata.iter() {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(value.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("metadata/{name}"), value.as_slice())
+            .map_err(|e| ContainerError::MalformedGpkg(format!("metadata member: {e}")))?;
+    }
+    builder
+        .into_inner()
+        .map_err(|e| ContainerError::MalformedGpkg(format!("metadata tar: {e}")))
+}
+
+/// Re-tar a root-relative image tar with every member under the `image/` arcname.
+fn reprefix_image_tar(image_tar: &[u8]) -> Result<Vec<u8>, ContainerError> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut archive = tar::Archive::new(image_tar);
+    let entries = archive
+        .entries()
+        .map_err(|e| ContainerError::MalformedGpkg(format!("image tar: {e}")))?;
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|e| ContainerError::MalformedGpkg(format!("image entry: {e}")))?;
+        let mut header = entry.header().clone();
+        let path = entry
+            .path()
+            .map_err(|e| ContainerError::MalformedGpkg(format!("image path: {e}")))?;
+        let rel = path.to_string_lossy();
+        let rel = rel.trim_start_matches("./").trim_start_matches('/');
+        if rel.is_empty() || rel == "." {
+            continue;
+        }
+        let name = format!("image/{rel}");
+        let mut buf = Vec::new();
+        entry
+            .read_to_end(&mut buf)
+            .map_err(|e| ContainerError::MalformedGpkg(format!("image read: {e}")))?;
+        header.set_size(buf.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, &name, buf.as_slice())
+            .map_err(|e| ContainerError::MalformedGpkg(format!("image member `{name}`: {e}")))?;
+    }
+    builder
+        .into_inner()
+        .map_err(|e| ContainerError::MalformedGpkg(format!("image tar build: {e}")))
 }
 
 fn find_inner<'m>(members: &'m [Member], stem: &str) -> Result<&'m Member, ContainerError> {
@@ -233,6 +391,51 @@ fn read_outer(bytes: &[u8]) -> Result<Vec<Member>, ContainerError> {
         out.push(Member { rel, bytes: buf });
     }
     Ok(out)
+}
+
+/// Whether a Manifest blob is an inline cleartext-signed PGP document.
+fn is_inline_signed(bytes: &[u8]) -> bool {
+    let needle = b"-----BEGIN PGP SIGNATURE-----";
+    bytes.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Extract the cleartext body of an inline cleartext-signed Manifest: the lines
+/// between the `BEGIN PGP SIGNED MESSAGE` header block and the signature, with
+/// PGP dash-escaping (`- `) removed. A non-signed blob is returned unchanged.
+fn extract_cleartext_body(bytes: &[u8]) -> Vec<u8> {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => return bytes.to_vec(),
+    };
+    if !text.contains("-----BEGIN PGP SIGNED MESSAGE-----") {
+        return bytes.to_vec();
+    }
+    let mut out = String::new();
+    let mut in_headers = false;
+    let mut in_body = false;
+    for line in text.lines() {
+        if line.starts_with("-----BEGIN PGP SIGNED MESSAGE-----") {
+            in_headers = true;
+            continue;
+        }
+        if in_headers && !in_body {
+            // Armor headers (Hash: ...) end at the first blank line.
+            if line.is_empty() {
+                in_body = true;
+            }
+            continue;
+        }
+        if line.starts_with("-----BEGIN PGP SIGNATURE-----") {
+            break;
+        }
+        if in_body {
+            // Un-dash-escape a line that begins with "- ".
+            let line = line.strip_prefix("- ").unwrap_or(line);
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
 }
 
 /// Parse a `Manifest` blob into per-member digest entries.
@@ -357,6 +560,41 @@ mod tests {
         m
     }
 
+    fn root_relative_image_tar() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let content = b"hello from image";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/bin/foo", content.as_slice())
+            .unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn writer_round_trips_through_reader() {
+        for comp in [Compression::Bzip2, Compression::Gzip, Compression::Zstd] {
+            let meta = sample_metadata();
+            let bytes = write(&meta, &root_relative_image_tar(), comp).unwrap();
+            assert!(is_gpkg(&bytes), "produced container is a gpkg ({comp:?})");
+            let pkg = read(&bytes, None).unwrap();
+            assert_eq!(pkg.metadata(), &meta);
+            // Image members are stored under the `image/` arcname.
+            let mut archive = tar::Archive::new(pkg.image());
+            let names: Vec<String> = archive
+                .entries()
+                .unwrap()
+                .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                names.iter().any(|n| n == "image/usr/bin/foo"),
+                "image members carry the image/ prefix: {names:?}"
+            );
+        }
+    }
+
     #[test]
     fn import_each_codec() {
         for comp in [Compression::Bzip2, Compression::Gzip, Compression::Zstd] {
@@ -378,6 +616,80 @@ mod tests {
         file[mid] ^= 0xff;
         let res = read(&file, None);
         assert!(res.is_err());
+    }
+
+    /// Build a gpkg whose Manifest is wrapped in an inline cleartext PGP
+    /// signature, so the real DATA lines sit in the signed body.
+    fn build_gpkg_signed(meta: &MetadataMap, comp: Compression) -> Vec<u8> {
+        let basename = "cat_pkg-1-2";
+        let meta_tar = comp.compress(&build_inner_metadata_tar(meta)).unwrap();
+        let image_tar = comp.compress(&build_inner_image_tar()).unwrap();
+        let meta_name = format!("metadata.tar.{}", comp.suffix());
+        let image_name = format!("image.tar.{}", comp.suffix());
+        let data = format!(
+            "DATA {meta_name} {} BLAKE2B {} SHA512 {}\nDATA {image_name} {} BLAKE2B {} SHA512 {}\n",
+            meta_tar.len(),
+            blake2b(&meta_tar),
+            sha512(&meta_tar),
+            image_tar.len(),
+            blake2b(&image_tar),
+            sha512(&image_tar),
+        );
+        let manifest = format!(
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n{data}-----BEGIN PGP SIGNATURE-----\n\nABCDEF==\n-----END PGP SIGNATURE-----\n"
+        );
+
+        let mut builder = tar::Builder::new(Vec::new());
+        append_member(&mut builder, &format!("{basename}/gpkg-1"), b"");
+        append_member(&mut builder, &format!("{basename}/{meta_name}"), &meta_tar);
+        append_member(
+            &mut builder,
+            &format!("{basename}/{image_name}"),
+            &image_tar,
+        );
+        append_member(
+            &mut builder,
+            &format!("{basename}/Manifest"),
+            manifest.as_bytes(),
+        );
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn cleartext_body_extracts_data_lines() {
+        let signed = b"-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nDATA x 1 BLAKE2B aa\n-----BEGIN PGP SIGNATURE-----\nsig\n-----END PGP SIGNATURE-----\n";
+        let body = extract_cleartext_body(signed);
+        assert_eq!(body, b"DATA x 1 BLAKE2B aa\n");
+    }
+
+    #[test]
+    fn ignore_signature_reads_signed_manifest() {
+        let meta = sample_metadata();
+        let file = build_gpkg_signed(&meta, Compression::Gzip);
+        // Without verification the signed Manifest still yields the real DATA
+        // lines (no PGP-framing junk), so the package reads and verifies.
+        let pkg = read_with_policy(&file, None, SignaturePolicy::IgnoreSignature).unwrap();
+        assert_eq!(pkg.metadata(), &meta);
+    }
+
+    #[test]
+    fn signed_manifest_rejected_on_bad_signature() {
+        let meta = sample_metadata();
+        let file = build_gpkg_signed(&meta, Compression::Gzip);
+        // A gpg that always fails rejects the package under verify-if-present.
+        let config = SignatureConfig {
+            gpg_command: "false".to_string(),
+            keyring: None,
+            extra_args: Vec::new(),
+        };
+        assert!(read_with_policy(&file, Some(&config), SignaturePolicy::VerifyIfPresent).is_err());
+    }
+
+    #[test]
+    fn request_signature_rejects_unsigned_manifest() {
+        let meta = sample_metadata();
+        let file = build_gpkg(&meta, Compression::Gzip, false);
+        assert!(read_with_policy(&file, None, SignaturePolicy::RequestSignature).is_err());
     }
 
     #[test]

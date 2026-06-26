@@ -13,8 +13,10 @@ moraine-eapi = { version = "0.1.0", path = "../moraine-eapi" }
 moraine-resolve = { version = "0.1.0", path = "../moraine-resolve" }
 moraine-vdb = { version = "0.1.0", path = "../moraine-vdb" }
 moraine-version = { version = "0.1.0", path = "../moraine-version" }
+rustix = { version = "1.1.4", features = ["fs"] }
 thiserror = "2.0.18"
 tracing = "0.1.44"
+xattr = "1.6.1"
 
 [lints]
 workspace = true

@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The format version this build reads and writes.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 2;
 
 /// The complete primary store file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +108,18 @@ pub(crate) struct WireRecord {
     pub contents: Vec<WireEntry>,
     /// The saved build-environment reference, if recorded.
     pub environment: Option<WireEnv>,
+    /// INHERITED eclass names.
+    #[serde(default)]
+    pub inherited: Vec<String>,
+    /// FEATURES tokens active at build time.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Installed SIZE in bytes, if recorded.
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// Verbatim `NEEDED.ELF.2` lines, preserving per-object linkage.
+    #[serde(default)]
+    pub needed: Vec<String>,
 }
 
 /// A CONTENTS entry on disk.
@@ -138,6 +150,10 @@ pub(crate) enum WireEntryKind {
     },
     /// A directory.
     Dir,
+    /// A named pipe (FIFO).
+    Fif,
+    /// A character or block device node.
+    Dev,
 }
 
 /// The saved build-environment reference on disk.

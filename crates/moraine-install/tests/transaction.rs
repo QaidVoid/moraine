@@ -116,6 +116,11 @@ fn state_for(cpv: &str, cp: &str, slot: &str) -> PackageState {
         provides: Vec::new(),
         requires: Vec::new(),
         environment: None,
+        inherited: Vec::new(),
+        features: Vec::new(),
+        size: None,
+        build_id: None,
+        needed: Vec::new(),
     }
 }
 

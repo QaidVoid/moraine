@@ -188,7 +188,30 @@ fn import_package_dir(dir: &Path, interner: &Interner) -> Result<PackageRecord, 
         requires,
         contents,
         environment,
+        inherited: read_aux("INHERITED")?
+            .map(|s| split_ws(&s))
+            .unwrap_or_default(),
+        features: read_aux("FEATURES")?
+            .map(|s| split_ws(&s))
+            .unwrap_or_default(),
+        size: read_line_file(dir, "SIZE")?.and_then(|s| s.trim().parse().ok()),
+        needed: read_needed_lines(dir)?,
     })
+}
+
+/// Read the verbatim `NEEDED.ELF.2` lines, returning an empty list when the file
+/// is absent.
+fn read_needed_lines(dir: &Path) -> Result<Vec<String>, VdbError> {
+    let path = dir.join("NEEDED.ELF.2");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(s
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(VdbError::Io { path, source }),
+    }
 }
 
 /// Read a one-line aux file, returning its trimmed contents if it exists and is
@@ -281,12 +304,22 @@ fn parse_contents(dir: &Path, cpv: &str) -> Result<Contents, VdbError> {
 /// - `obj <path> <md5> <mtime>`
 /// - `sym <path> -> <target> <mtime>`
 /// - the legacy old-symlink form `sym <path> -> <target> <mtime> <something>`
+/// - `fif <path>` (named pipe)
+/// - `dev <path>` (device node)
 fn parse_contents_line(line: &str) -> Option<Entry> {
     let (kind, rest) = line.split_once(' ')?;
     match kind {
         "dir" => Some(Entry {
             path: rest.trim().to_string(),
             kind: EntryKind::Dir,
+        }),
+        "fif" => Some(Entry {
+            path: rest.trim().to_string(),
+            kind: EntryKind::Fif,
+        }),
+        "dev" => Some(Entry {
+            path: rest.trim().to_string(),
+            kind: EntryKind::Dev,
         }),
         "obj" => {
             // `<path> <md5> <mtime>`: split the trailing md5 and mtime from the

@@ -272,6 +272,9 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         buildpkg: prefs.buildpkg,
         buildpkgonly: prefs.buildpkgonly,
         pkgdir: pkgdir.clone(),
+        binpkg_format: moraine_binpkg::BinpkgFormat::parse(
+            ctx.vars.get("BINPKG_FORMAT").unwrap_or("gpkg"),
+        ),
         ..BuildOptions::default()
     };
     // Try a local package first, then the binhost.
@@ -509,6 +512,32 @@ impl CliPlanner<'_> {
             tokens if tokens.is_empty() => defaults.resumecommand,
             tokens => tokens,
         };
+        // Protocol-specific FETCHCOMMAND_<PROTO>/RESUMECOMMAND_<PROTO> templates.
+        let mut fetchcommand_proto = std::collections::BTreeMap::new();
+        let mut resumecommand_proto = std::collections::BTreeMap::new();
+        for (key, value) in self.ctx.vars.iter() {
+            if let Some(proto) = key.strip_prefix("FETCHCOMMAND_") {
+                fetchcommand_proto.insert(proto.to_ascii_lowercase(), tokenize(value));
+            } else if let Some(proto) = key.strip_prefix("RESUMECOMMAND_") {
+                resumecommand_proto.insert(proto.to_ascii_lowercase(), tokenize(value));
+            }
+        }
+        let ro_distdirs = self
+            .ctx
+            .vars
+            .get("PORTAGE_RO_DISTDIRS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(PathBuf::from)
+            .collect();
+        let checksum_try_mirrors = self
+            .ctx
+            .vars
+            .get("PORTAGE_FETCH_CHECKSUM_TRY_MIRRORS")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(5);
+
+        let defaults = FetchConfig::new(&distdir);
         FetchConfig {
             distdir,
             fetchcommand,
@@ -517,7 +546,40 @@ impl CliPlanner<'_> {
             thirdparty: crate::config::thirdparty_mirrors(self.repo_set),
             resume_min_size: 350_000,
             max_attempts: 3,
+            required_hashes: required_manifest_hashes(self.repo_set),
+            fetchcommand_proto,
+            resumecommand_proto,
+            ssh_opts: self
+                .ctx
+                .vars
+                .get("PORTAGE_SSH_OPTS")
+                .unwrap_or_default()
+                .to_string(),
+            checksum_try_mirrors,
+            distlocks: self.ctx.features.iter().any(|f| f == "distlocks"),
+            ro_distdirs,
+            custom_mirrors: moraine_build::CustomMirrors::default(),
+            mirror_layout: defaults.mirror_layout,
         }
+    }
+}
+
+/// The union of `manifest-required-hashes` across the active repositories,
+/// defaulting to `{BLAKE2B, SHA512}` when none are declared.
+fn required_manifest_hashes(
+    repo_set: &moraine_repo::RepoSet,
+) -> std::collections::BTreeSet<String> {
+    let union: std::collections::BTreeSet<String> = repo_set
+        .ordered()
+        .flat_map(|r| r.manifest_required_hashes.iter().cloned())
+        .collect();
+    if union.is_empty() {
+        ["BLAKE2B", "SHA512"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    } else {
+        union
     }
 }
 

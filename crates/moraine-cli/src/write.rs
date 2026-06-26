@@ -82,7 +82,18 @@ pub(crate) fn merge_context(ctx: &ConfigContext, wr: &WriteRoots) -> MergeContex
             ctx.config_protect.clone(),
             ctx.config_protect_mask.clone(),
         ),
+        collision_ignore: whitespace_list(ctx.vars.get("COLLISION_IGNORE")),
+        uninstall_ignore: whitespace_list(ctx.vars.get("UNINSTALL_IGNORE")),
     }
+}
+
+/// Split a whitespace-separated configuration value into owned tokens.
+fn whitespace_list(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Load the installed store under `vdb_dir`, importing the classic Portage vdb
@@ -90,20 +101,43 @@ pub(crate) fn merge_context(ctx: &ConfigContext, wr: &WriteRoots) -> MergeContex
 /// `installed.mvdb` is empty, so existing installs are visible. The import is
 /// persisted when the store is writable (root) and otherwise kept in memory.
 pub(crate) fn load_installed_store(vdb_dir: &Path) -> Result<Store> {
-    let store = Store::load(StorePaths::in_dir(vdb_dir)).into_diagnostic()?;
-    if !store.records().is_empty() {
-        return Ok(store);
+    match Store::load(StorePaths::in_dir(vdb_dir)) {
+        Ok(store) if !store.records().is_empty() => Ok(store),
+        // An empty cache: derive it from the authoritative directory tree.
+        Ok(store) => Ok(rebuild_cache_from_tree(vdb_dir)?.unwrap_or(store)),
+        // The cache format changed: the `/var/db/pkg` tree is authoritative, so
+        // rebuild the cache from it rather than failing.
+        Err(moraine_vdb::VdbError::UnsupportedVersion { found, expected }) => {
+            tracing::info!(
+                found,
+                expected,
+                "vdb cache format changed; rebuilding from tree"
+            );
+            match rebuild_cache_from_tree(vdb_dir)? {
+                Some(store) => Ok(store),
+                None => Ok(Store::empty(StorePaths::in_dir(vdb_dir))),
+            }
+        }
+        Err(e) => Err(e).into_diagnostic(),
     }
+}
+
+/// Rebuild the `installed.mvdb` cache from the Portage-format `/var/db/pkg` tree.
+/// Returns `None` when the tree holds no records.
+fn rebuild_cache_from_tree(vdb_dir: &Path) -> Result<Option<Store>> {
     let interner = std::sync::Arc::new(moraine_common::Interner::new());
     let records = match moraine_vdb::import_vdb(vdb_dir, &interner) {
         Ok(records) if !records.is_empty() => records,
-        _ => return Ok(store),
+        _ => return Ok(None),
     };
-    tracing::info!(count = records.len(), "imported classic vdb");
+    tracing::info!(
+        count = records.len(),
+        "rebuilt vdb cache from directory tree"
+    );
     let imported = Store::from_records(StorePaths::in_dir(vdb_dir), interner, records);
     // Best effort: persist so later runs load it directly.
     let _ = imported.write_primary();
-    Ok(imported)
+    Ok(Some(imported))
 }
 
 /// Read installed packages from the store under `vdb_dir`.
@@ -339,6 +373,61 @@ pub fn sync(cli: &Cli, roots: &Roots) -> Result<()> {
     }
     if failed {
         return Err(miette!("one or more repositories failed to sync"));
+    }
+
+    // Replay package moves (profiles/updates) across the installed store, world,
+    // and /etc/portage after a successful sync. A failure here is reported but
+    // does not discard the synced tree.
+    if let Err(e) = apply_package_moves(&repo_set, &wr, roots) {
+        eprintln!("warning: package-move replay failed: {e}");
+    }
+    Ok(())
+}
+
+/// Run the global package-move pass after a successful sync, gated by the
+/// per-update-file mtime map and persisting the new mtimes only once the whole
+/// pass commits.
+fn apply_package_moves(
+    repo_set: &moraine_repo::RepoSet,
+    wr: &WriteRoots,
+    roots: &Roots,
+) -> Result<()> {
+    let mut store = load_installed_store(&wr.vdb_dir)?;
+    let repos: Vec<(String, PathBuf)> = repo_set
+        .ordered()
+        .map(|r| (r.name.clone(), r.location.clone()))
+        .collect();
+    let world_path = wr.state_dir.join("world");
+    let config_dir = roots.config_dir().join("etc/portage");
+    let mtime_path = wr.state_dir.join("package-move-mtimes");
+    let mtimes = moraine_repo::load_mtimes(&mtime_path);
+
+    let report =
+        moraine_install::global_update(&mut store, &repos, &world_path, &config_dir, &mtimes)
+            .map_err(|e| miette!("{e}"))?;
+
+    // Commit the store, then record the new update-file mtimes (only after the
+    // whole pass succeeds, so an interrupted pass re-runs the whole batch).
+    store.compact().into_diagnostic()?;
+    let mut new_mtimes = mtimes;
+    for (path, mtime) in &report.applied_files {
+        new_mtimes.insert(path.clone(), *mtime);
+    }
+    let _ = moraine_repo::store_mtimes(&mtime_path, &new_mtimes);
+
+    let total = report.vdb_renames
+        + report.vdb_slotmoves
+        + report.world_renames
+        + report.config_files_changed;
+    if total > 0 {
+        println!(
+            "Applied package moves: {} renamed, {} re-slotted, {} dep rewrites, {} world, {} config files",
+            report.vdb_renames,
+            report.vdb_slotmoves,
+            report.dep_rewrites,
+            report.world_renames,
+            report.config_files_changed
+        );
     }
     Ok(())
 }

@@ -7,6 +7,13 @@ use moraine_vdb::record::{Depend, DependKind, EnvironmentRef, PackageRecord, Slo
 use moraine_vdb::soname::{Provides, Requires, SonameEntry};
 use moraine_vdb::store::{Store, StorePaths};
 
+/// Add `record` stamped with the next counter value, mirroring how the merge
+/// engine stamps a record exactly once before handing it to the store.
+fn add_stamped(store: &mut Store, mut record: PackageRecord) {
+    record.counter = store.counter() + 1;
+    store.add(record).unwrap();
+}
+
 fn sample_record(interner: &Interner, version: &str) -> PackageRecord {
     let features = moraine_eapi::features_for("8");
     let rdepend_raw = "dev-libs/openssl:0/3=".to_string();
@@ -76,6 +83,10 @@ fn sample_record(interner: &Interner, version: &str) -> PackageRecord {
             digest: "abc".to_string(),
             blob: vec![1, 2, 3, 4],
         }),
+        inherited: vec!["eutils".to_string(), "toolchain-funcs".to_string()],
+        features: vec!["userfetch".to_string()],
+        size: Some(4096),
+        needed: vec!["x86_64;/usr/lib/libwidget.so.1;libwidget.so.1;;libc.so.6".to_string()],
     }
 }
 
@@ -123,6 +134,79 @@ fn record_round_trips_through_primary_file() {
     // Environment reference preserved.
     let env = rec.environment.as_ref().unwrap();
     assert_eq!(env.blob, vec![1, 2, 3, 4]);
+
+    // New aux fields preserved across the wire format.
+    assert_eq!(rec.inherited, vec!["eutils", "toolchain-funcs"]);
+    assert_eq!(rec.features, vec!["userfetch"]);
+    assert_eq!(rec.size, Some(4096));
+    assert_eq!(
+        rec.needed,
+        vec!["x86_64;/usr/lib/libwidget.so.1;libwidget.so.1;;libc.so.6"]
+    );
+}
+
+#[test]
+fn vardb_export_round_trips_through_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let vdb = dir.path();
+    let interner = Interner::new();
+    let mut record = sample_record(&interner, "1.2.3");
+    // The sample's placeholder environment blob is not real bzip2; the importer
+    // decompresses environment.bz2, so drop it for this round-trip.
+    record.environment = None;
+
+    moraine_vdb::vardb::export_record(vdb, &record, &interner, None).unwrap();
+
+    // The dbdir carries the new aux files.
+    let dbdir = vdb.join("app-misc/widget-1.2.3");
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("INHERITED"))
+            .unwrap()
+            .trim(),
+        "eutils toolchain-funcs"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("FEATURES"))
+            .unwrap()
+            .trim(),
+        "userfetch"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("SIZE")).unwrap().trim(),
+        "4096"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("BUILD_ID"))
+            .unwrap()
+            .trim(),
+        "7"
+    );
+    // The verbatim NEEDED line is written, not a reconstruction.
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("NEEDED.ELF.2"))
+            .unwrap()
+            .trim(),
+        "x86_64;/usr/lib/libwidget.so.1;libwidget.so.1;;libc.so.6"
+    );
+
+    // Re-importing the exported tree recovers the fields.
+    let li = std::sync::Arc::new(Interner::new());
+    let records = moraine_vdb::import_vdb(vdb, &li).unwrap();
+    assert_eq!(records.len(), 1);
+    let r = &records[0];
+    assert_eq!(li.resolve(r.slot.subslot.unwrap()).as_deref(), Some("2"));
+    assert_eq!(r.build_time, Some(1_700_000_100));
+    assert_eq!(r.build_id, Some(7));
+    assert_eq!(r.size, Some(4096));
+    assert_eq!(r.inherited, vec!["eutils", "toolchain-funcs"]);
+    assert_eq!(r.features, vec!["userfetch"]);
+    assert_eq!(
+        r.needed,
+        vec!["x86_64;/usr/lib/libwidget.so.1;libwidget.so.1;;libc.so.6"]
+    );
+    // PROVIDES/REQUIRES are derived from the NEEDED line.
+    assert!(r.provides.provides(li.intern("libwidget.so.1")));
+    assert!(r.requires.sonames().any(|s| s == li.intern("libc.so.6")));
 }
 
 #[test]
@@ -160,9 +244,9 @@ fn counter_increases_on_every_mutation() {
     let mut store = Store::empty(paths);
     let interner = store.interner().clone();
 
-    store.add(sample_record(&interner, "1.0")).unwrap();
+    add_stamped(&mut store, sample_record(&interner, "1.0"));
     let first = store.counter();
-    store.add(sample_record(&interner, "2.0")).unwrap();
+    add_stamped(&mut store, sample_record(&interner, "2.0"));
     let second = store.counter();
 
     assert!(second > first);
@@ -177,7 +261,7 @@ fn journal_highest_counter_wins() {
     // Write a primary file with version 1.0 at a low counter.
     let mut store = Store::empty(paths.clone());
     let interner = store.interner().clone();
-    store.add(sample_record(&interner, "1.0")).unwrap();
+    add_stamped(&mut store, sample_record(&interner, "1.0"));
     store.compact().unwrap();
 
     // Append a journal record replacing the same package with a newer license.
@@ -185,7 +269,7 @@ fn journal_highest_counter_wins() {
     let li = store.interner().clone();
     let mut replacement = sample_record(&li, "1.0");
     replacement.license = "MIT".to_string();
-    store.add(replacement).unwrap();
+    add_stamped(&mut store, replacement);
 
     // Reload: journal record (higher counter) must win.
     let loaded = Store::load(paths).unwrap();
@@ -285,4 +369,146 @@ fn match_atom_honors_version_and_slot() {
 
     let wrong_slot = moraine_atom::Atom::parse("app-misc/widget:9", features, li).unwrap();
     assert_eq!(store.match_atom(&wrong_slot).len(), 0);
+}
+
+/// Build a record for `cp-version` with the given RDEPEND, reusing the sample.
+fn record_with(interner: &Interner, cp: &str, version: &str, rdepend: &str) -> PackageRecord {
+    let mut r = sample_record(interner, version);
+    let (cat, pkg) = cp.split_once('/').unwrap();
+    r.category = interner.intern(cat);
+    r.package = interner.intern(pkg);
+    let features = moraine_eapi::features_for("8");
+    let ast = DepSpec::parse(rdepend, features, interner).unwrap();
+    r.depends.rdepend = Some(Depend {
+        raw: rdepend.to_string(),
+        ast,
+    });
+    r
+}
+
+#[test]
+fn move_ent_renames_and_update_ents_rewrites_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StorePaths::in_dir(dir.path());
+    let mut store = Store::empty(paths.clone());
+    let i = store.interner().clone();
+
+    add_stamped(
+        &mut store,
+        record_with(&i, "dev-util/foo", "1", "dev-libs/zlib"),
+    );
+    add_stamped(
+        &mut store,
+        record_with(&i, "app-misc/bar", "1", ">=dev-util/foo-1:0[ssl]"),
+    );
+
+    // Rename dev-util/foo -> dev-libs/foo.
+    assert_eq!(
+        store
+            .move_ent("dev-util/foo", "dev-libs/foo", None)
+            .unwrap(),
+        1
+    );
+    // Rewrite the dependency atoms referencing the old name everywhere.
+    assert_eq!(
+        store
+            .update_ents(&[("dev-util/foo".into(), "dev-libs/foo".into())], &[])
+            .unwrap(),
+        1
+    );
+    store.compact().unwrap();
+
+    // Reload: the rename and dep rewrite both survive the journal.
+    let loaded = Store::load(paths).unwrap();
+    let li = loaded.interner();
+    assert!(
+        loaded
+            .records()
+            .iter()
+            .any(|r| r.cpv(li) == "dev-libs/foo-1")
+    );
+    assert!(
+        !loaded
+            .records()
+            .iter()
+            .any(|r| r.cpv(li) == "dev-util/foo-1")
+    );
+    let bar = loaded
+        .records()
+        .iter()
+        .find(|r| r.cpv(li) == "app-misc/bar-1")
+        .unwrap();
+    let rdep = bar.depends.get(DependKind::RDepend).unwrap();
+    assert_eq!(rdep.raw, ">=dev-libs/foo-1:0[ssl]");
+    // The AST was re-parsed in sync with the raw rewrite.
+    let reparsed = DepSpec::parse(&rdep.raw, moraine_eapi::features_for("8"), li).unwrap();
+    assert_eq!(format!("{:?}", rdep.ast), format!("{:?}", reparsed));
+}
+
+#[test]
+fn update_ents_skips_self_blocker() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::empty(StorePaths::in_dir(dir.path()));
+    let i = store.interner().clone();
+    // The package's own new name would be its blocker target: must not rewrite.
+    add_stamped(
+        &mut store,
+        record_with(&i, "dev-libs/foo", "1", "!dev-util/foo"),
+    );
+    store
+        .update_ents(&[("dev-util/foo".into(), "dev-libs/foo".into())], &[])
+        .unwrap();
+    let rec = &store.records()[0];
+    assert_eq!(
+        rec.depends.get(DependKind::RDepend).unwrap().raw,
+        "!dev-util/foo"
+    );
+}
+
+#[test]
+fn move_ent_skips_when_destination_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::empty(StorePaths::in_dir(dir.path()));
+    let i = store.interner().clone();
+    add_stamped(
+        &mut store,
+        record_with(&i, "dev-util/foo", "1", "dev-libs/zlib"),
+    );
+    add_stamped(
+        &mut store,
+        record_with(&i, "dev-libs/foo", "1", "dev-libs/zlib"),
+    );
+    // Destination dev-libs/foo-1 already exists: the move is skipped.
+    assert_eq!(
+        store
+            .move_ent("dev-util/foo", "dev-libs/foo", None)
+            .unwrap(),
+        0
+    );
+    assert!(
+        store
+            .records()
+            .iter()
+            .any(|r| r.cpv(&i) == "dev-util/foo-1")
+    );
+}
+
+#[test]
+fn move_slot_ent_rewrites_recorded_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::empty(StorePaths::in_dir(dir.path()));
+    let i = store.interner().clone();
+    // sample_record uses slot "0".
+    add_stamped(
+        &mut store,
+        record_with(&i, "dev-libs/bar", "1", "dev-libs/zlib"),
+    );
+    assert_eq!(
+        store.move_slot_ent("dev-libs/bar", "0", "2", None).unwrap(),
+        1
+    );
+    let rec = &store.records()[0];
+    assert_eq!(i.resolve(rec.slot.slot).as_deref(), Some("2"));
+    // The recorded sub-slot is preserved (the new slot token carries none).
+    assert_eq!(i.resolve(rec.slot.subslot.unwrap()).as_deref(), Some("2"));
 }

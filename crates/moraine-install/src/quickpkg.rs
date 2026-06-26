@@ -8,8 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use moraine_binpkg::MetadataMap;
-use moraine_binpkg::greenfield::{self, WriteOptions};
+use moraine_binpkg::greenfield::WriteOptions;
+use moraine_binpkg::{BinpkgFormat, MetadataMap};
 
 use crate::error::{InstallError, Result};
 
@@ -52,25 +52,34 @@ impl QuickpkgInput {
             .map_err(|e| InstallError::io(&self.eroot, e))
     }
 
-    /// Write the binary package to `out_path`.
-    pub fn write(&self, out_path: &Path, options: &WriteOptions) -> Result<()> {
+    /// Write the binary package to `out_path` in the selected Portage-readable
+    /// `format`, compressing a gpkg's inner tars per `options.image_compression`.
+    pub fn write(
+        &self,
+        out_path: &Path,
+        options: &WriteOptions,
+        format: BinpkgFormat,
+    ) -> Result<()> {
         let image = self.image_tar()?;
-        greenfield::write_file(out_path, &self.metadata, &image, options).map_err(|e| {
-            InstallError::Realize {
+        let bytes = format
+            .write(&self.metadata, &image, options.image_compression)
+            .map_err(|e| InstallError::Realize {
                 cpv: self.cpv.clone(),
                 reason: format!("failed to write binary package: {e}"),
-            }
-        })
+            })?;
+        write_atomic(out_path, &bytes)
     }
 }
 
-/// Write a built image directory as a binary package at `out_path`.
+/// Write a built image directory as a binary package at `out_path` in the
+/// selected Portage-readable `format`.
 pub fn package_image_dir(
     cpv: &str,
     image_dir: &Path,
     metadata: &MetadataMap,
     out_path: &Path,
     options: &WriteOptions,
+    format: BinpkgFormat,
 ) -> Result<()> {
     let mut builder = tar::Builder::new(Vec::new());
     builder
@@ -79,10 +88,22 @@ pub fn package_image_dir(
     let image = builder
         .into_inner()
         .map_err(|e| InstallError::io(image_dir, e))?;
-    greenfield::write_file(out_path, metadata, &image, options).map_err(|e| InstallError::Realize {
-        cpv: cpv.to_owned(),
-        reason: format!("failed to write binary package: {e}"),
-    })
+    let bytes = format
+        .write(metadata, &image, options.image_compression)
+        .map_err(|e| InstallError::Realize {
+            cpv: cpv.to_owned(),
+            reason: format!("failed to write binary package: {e}"),
+        })?;
+    write_atomic(out_path, &bytes)
+}
+
+/// Atomically write `bytes` to `out_path`, creating parents.
+fn write_atomic(out_path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| InstallError::io(parent, e))?;
+    }
+    moraine_common::fs::atomic_write(out_path, bytes)
+        .map_err(|e| InstallError::io(out_path, std::io::Error::other(e.to_string())))
 }
 
 #[cfg(test)]
@@ -106,7 +127,9 @@ mod tests {
         };
 
         let out = eroot.join("foo.gpkg");
-        input.write(&out, &WriteOptions::default()).unwrap();
+        input
+            .write(&out, &WriteOptions::default(), BinpkgFormat::Gpkg)
+            .unwrap();
         assert!(out.exists());
 
         let bytes = std::fs::read(&out).unwrap();
@@ -118,7 +141,9 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert!(names.iter().any(|n| n == "usr/bin/foo"));
+        // The gpkg writer stores image members under the `image/` arcname; the
+        // install path strips it when staging.
+        assert!(names.iter().any(|n| n == "image/usr/bin/foo"));
         assert!(!names.iter().any(|n| n.contains("missing")));
     }
 
@@ -136,6 +161,7 @@ mod tests {
             &MetadataMap::new(),
             &out,
             &WriteOptions::default(),
+            BinpkgFormat::Gpkg,
         )
         .unwrap();
         assert!(out.exists());

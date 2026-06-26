@@ -30,6 +30,7 @@ pub mod query;
 pub mod record;
 pub mod soname;
 pub mod store;
+pub mod vardb;
 
 pub use contents::{Contents, Entry, EntryKind};
 pub use error::VdbError;

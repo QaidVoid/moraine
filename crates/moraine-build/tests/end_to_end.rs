@@ -221,6 +221,7 @@ fn restricted_fetch_missing_fails_build() {
         err,
         Err(moraine_build::BuildError::RestrictedFetch { .. })
     ));
-    // No public fetch was attempted.
-    assert_eq!(runner.call_count(), 0);
+    // No public fetch was attempted; the single command is the pkg_nofetch phase
+    // run for the ebuild's manual-download instructions.
+    assert_eq!(runner.call_count(), 1);
 }

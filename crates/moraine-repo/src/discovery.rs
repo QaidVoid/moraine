@@ -39,6 +39,15 @@ pub struct RepoConfig {
     pub cache_formats: Vec<String>,
     /// The declared profile formats from `layout.conf`.
     pub profile_formats: Vec<String>,
+    /// The `manifest-hashes` the repository declares, uppercased; defaults to
+    /// `{BLAKE2B, SHA512}`.
+    pub manifest_hashes: Vec<String>,
+    /// The `manifest-required-hashes` a verified entry must carry, uppercased; a
+    /// subset of [`manifest_hashes`](Self::manifest_hashes).
+    pub manifest_required_hashes: Vec<String>,
+    /// Whether the repository uses thin Manifests (`DIST`-only, no `EBUILD`/`AUX`
+    /// digests in the per-package Manifest).
+    pub thin_manifests: bool,
     /// The raw `sync-*` keys read from `repos.conf`.
     pub sync: BTreeMap<String, String>,
 }
@@ -191,6 +200,9 @@ pub fn discover(repos_conf: impl AsRef<Path>) -> Result<RepoSet, DiscoveryError>
             eclass_overrides,
             cache_formats: layout.cache_formats,
             profile_formats: layout.profile_formats,
+            manifest_hashes: layout.manifest_hashes,
+            manifest_required_hashes: layout.manifest_required_hashes,
+            thin_manifests: layout.thin_manifests,
             sync,
         };
         repos.insert(canonical, cfg);
@@ -286,14 +298,16 @@ struct Layout {
     eclass_overrides: Vec<String>,
     cache_formats: Vec<String>,
     profile_formats: Vec<String>,
+    manifest_hashes: Vec<String>,
+    manifest_required_hashes: Vec<String>,
+    thin_manifests: bool,
 }
 
 /// Read and parse `metadata/layout.conf`, returning defaults when absent.
 fn read_layout_conf(location: &Path) -> Layout {
     let path = location.join("metadata/layout.conf");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Layout::default();
-    };
+    // A missing layout.conf still yields the default Manifest hash policy below.
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
     let mut layout = Layout::default();
     for line in content.lines() {
         let line = line.trim();
@@ -311,10 +325,36 @@ fn read_layout_conf(location: &Path) -> Layout {
             "eclass-overrides" => layout.eclass_overrides = value,
             "cache-formats" => layout.cache_formats = value,
             "profile-formats" => layout.profile_formats = value,
+            "manifest-hashes" => layout.manifest_hashes = upper(value),
+            "manifest-required-hashes" => layout.manifest_required_hashes = upper(value),
+            "thin-manifests" => {
+                layout.thin_manifests = value.first().map(|v| v == "true").unwrap_or(false);
+            }
             _ => {}
         }
     }
+    // Default the Manifest hash policy to the Gentoo defaults and ensure the
+    // required set is a subset of the declared set.
+    if layout.manifest_hashes.is_empty() {
+        layout.manifest_hashes = vec!["BLAKE2B".to_string(), "SHA512".to_string()];
+    }
+    if layout.manifest_required_hashes.is_empty() {
+        layout.manifest_required_hashes = layout
+            .manifest_hashes
+            .iter()
+            .filter(|h| h.as_str() == "BLAKE2B" || h.as_str() == "SHA512")
+            .cloned()
+            .collect();
+    }
     layout
+        .manifest_required_hashes
+        .retain(|h| layout.manifest_hashes.contains(h));
+    layout
+}
+
+/// Uppercase each token, so hash algorithm names compare uniformly.
+fn upper(value: Vec<String>) -> Vec<String> {
+    value.into_iter().map(|s| s.to_ascii_uppercase()).collect()
 }
 
 /// Read the canonical repository name from `profiles/repo_name`.
@@ -431,6 +471,39 @@ mod tests {
             fs::write(loc.join("metadata/layout.conf"), layout).unwrap();
         }
         loc
+    }
+
+    #[test]
+    fn layout_manifest_hashes_parsed_with_defaults_and_subset() {
+        let tmp = TempDir::new().unwrap();
+        // Declared hashes with a required subset and thin-manifests.
+        let loc = make_repo(
+            tmp.path(),
+            "r",
+            "manifest-hashes = BLAKE2B SHA512 SHA256\n\
+             manifest-required-hashes = BLAKE2B\n\
+             thin-manifests = true\n",
+        );
+        let layout = read_layout_conf(&loc);
+        assert_eq!(layout.manifest_hashes, ["BLAKE2B", "SHA512", "SHA256"]);
+        assert_eq!(layout.manifest_required_hashes, ["BLAKE2B"]);
+        assert!(layout.thin_manifests);
+
+        // No layout.conf: defaults to {BLAKE2B, SHA512}, required = same.
+        let bare = make_repo(tmp.path(), "bare", "");
+        let d = read_layout_conf(&bare);
+        assert_eq!(d.manifest_hashes, ["BLAKE2B", "SHA512"]);
+        assert_eq!(d.manifest_required_hashes, ["BLAKE2B", "SHA512"]);
+        assert!(!d.thin_manifests);
+
+        // A required hash not in the declared set is dropped (subset rule).
+        let loc2 = make_repo(
+            tmp.path(),
+            "r2",
+            "manifest-hashes = SHA512\nmanifest-required-hashes = BLAKE2B SHA512\n",
+        );
+        let l2 = read_layout_conf(&loc2);
+        assert_eq!(l2.manifest_required_hashes, ["SHA512"]);
     }
 
     #[test]

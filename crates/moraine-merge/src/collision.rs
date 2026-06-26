@@ -8,13 +8,15 @@
 //! collision aborts before mutation; with `protect-owned` only owned-by-other
 //! collisions abort; with neither, collisions are reported and overwritten.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use moraine_common::Interner;
 use moraine_vdb::record::PackageRecord;
 use moraine_vdb::store::Store;
 
 use crate::Features;
+use crate::image::{ImageItem, ImageKind};
 
 /// Why a target path is a collision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +25,12 @@ pub enum CollisionKind {
     OwnedByOther(String),
     /// The path exists on the live system but is owned by no installed package.
     Unowned,
+    /// A symlink in the image lands on an existing directory in the live root, a
+    /// hard collision banned by PMS regardless of FEATURES.
+    SymlinkOntoDir,
+    /// Two distinct image entries resolve to one real path through a symlinked
+    /// parent and carry different content. Names the colliding sibling path.
+    Internal(String),
 }
 
 /// A detected collision: the conflicting install path and why.
@@ -55,21 +63,34 @@ pub(crate) fn owner_of(
     None
 }
 
-/// Detect collisions for the file and symlink target paths of a merge.
+/// Detect collisions for the file and symlink entries of a merge.
 ///
-/// `targets` are the install-root-relative file and symlink paths (directories
-/// are never collisions). `exclude_cpv` is the prior same-slot version whose
-/// owned paths are not collisions. A path is a collision when it is owned by
-/// another package, or it exists on the live system but is owned by no package.
+/// Directories are never collisions. `exclude_cpv` is the prior same-slot version
+/// whose owned paths are not collisions. A path is a collision when it is owned
+/// by another package, when it exists on the live system but is owned by no
+/// package, when a symlink lands on an existing directory, or when two image
+/// entries resolve to one real path with differing content. Paths matching a
+/// `collision_ignore` glob are exempt.
 pub(crate) fn detect(
     store: &Store,
     interner: &Interner,
     eroot: &Path,
-    targets: &[String],
+    items: &[ImageItem],
     exclude_cpv: Option<&str>,
+    collision_ignore: &[String],
 ) -> Vec<Collision> {
     let mut out = Vec::new();
-    for path in targets {
+    // Real-path -> the first image entry that resolved to it, for internal
+    // collision detection through symlinked parents.
+    let mut real_seen: HashMap<PathBuf, ImageItem> = HashMap::new();
+    for item in items {
+        if matches!(item.kind, ImageKind::Dir) {
+            continue;
+        }
+        let path = &item.install_path;
+        if crate::path_matches_any(path, collision_ignore) {
+            continue;
+        }
         if let Some(owner) = owner_of(store, interner, path, exclude_cpv) {
             out.push(Collision {
                 path: path.clone(),
@@ -77,28 +98,81 @@ pub(crate) fn detect(
             });
             continue;
         }
-        // Not owned by any package; a collision only if a file is already there.
+        // Not owned by any package; a collision only if something is already
+        // there. A symlink onto a directory is a hard collision banned by PMS.
         let live = eroot.join(path.trim_start_matches('/'));
-        if std::fs::symlink_metadata(&live).is_ok() {
-            out.push(Collision {
-                path: path.clone(),
-                kind: CollisionKind::Unowned,
-            });
+        if let Ok(meta) = std::fs::symlink_metadata(&live) {
+            if matches!(item.kind, ImageKind::Sym { .. }) && meta.is_dir() {
+                out.push(Collision {
+                    path: path.clone(),
+                    kind: CollisionKind::SymlinkOntoDir,
+                });
+            } else {
+                out.push(Collision {
+                    path: path.clone(),
+                    kind: CollisionKind::Unowned,
+                });
+            }
+        }
+        // Internal collision: a sibling image entry resolving to the same real
+        // path with different content.
+        let real = real_target(eroot, path);
+        if let Some(prev) = real_seen.get(&real) {
+            if prev.install_path != *path && entries_differ(prev, item) {
+                out.push(Collision {
+                    path: path.clone(),
+                    kind: CollisionKind::Internal(prev.install_path.clone()),
+                });
+            }
+        } else {
+            real_seen.insert(real, item.clone());
         }
     }
     out
 }
 
+/// The real destination of `install_path`: the canonical realpath of its parent
+/// in the live root (resolving symlinked parents like `/lib64 -> lib`) joined
+/// with the basename. Falls back to the lexical path when the parent does not
+/// exist yet.
+fn real_target(eroot: &Path, install_path: &str) -> PathBuf {
+    let live = eroot.join(install_path.trim_start_matches('/'));
+    match (live.parent(), live.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(name),
+        _ => live,
+    }
+}
+
+/// Whether two image entries that map to one real path carry different content.
+/// Two regular files differ when their bytes differ; a symlink differs from a
+/// non-symlink, and two symlinks differ when their targets differ.
+fn entries_differ(a: &ImageItem, b: &ImageItem) -> bool {
+    match (&a.kind, &b.kind) {
+        (ImageKind::File, ImageKind::File) => {
+            match (std::fs::read(&a.source), std::fs::read(&b.source)) {
+                (Ok(x), Ok(y)) => x != y,
+                _ => true,
+            }
+        }
+        (ImageKind::Sym { target: x }, ImageKind::Sym { target: y }) => x != y,
+        _ => true,
+    }
+}
+
 /// Decide, given FEATURES, which detected collisions must abort the merge.
 ///
 /// `collision-protect` aborts on any collision; `protect-owned` aborts only on a
-/// collision with a file owned by another package. Returns the aborting paths.
+/// collision with a file owned by another package. A symlink-onto-directory is a
+/// hard collision banned by PMS and always aborts. Returns the aborting paths.
 pub(crate) fn aborting(features: Features, collisions: &[Collision]) -> Vec<String> {
     collisions
         .iter()
         .filter(|c| match c.kind {
             CollisionKind::OwnedByOther(_) => features.collision_protect || features.protect_owned,
-            CollisionKind::Unowned => features.collision_protect,
+            CollisionKind::Unowned | CollisionKind::Internal(_) => features.collision_protect,
+            CollisionKind::SymlinkOntoDir => true,
         })
         .map(|c| c.path.clone())
         .collect()
