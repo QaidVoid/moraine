@@ -944,3 +944,46 @@ fn deep_catches_broken_reverse_dependency() {
         other => panic!("expected a broken reverse dependency, got {other:?}"),
     }
 }
+
+#[test]
+fn slot_operator_pulls_in_installed_consumer_for_rebuild() {
+    // cat/consumer is installed with a := binding to cat/lib:2/2.1. The available
+    // cat/lib is now 2/2.2 (a sub-slot bump). Resolving just cat/lib must pull in
+    // the installed consumer and flag it for rebuild, though it is not requested.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/lib",
+        version: "2",
+        slot: "2",
+        subslot: Some("2.2"),
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "cat/consumer",
+        version: "1",
+        eapi: "8",
+        rdepend: "cat/lib:=",
+        ..Default::default()
+    });
+    f.add_installed(installed(
+        "cat/consumer",
+        "1",
+        "0",
+        None,
+        &[("cat/lib", "2", Some("2.1"))],
+    ));
+    f.add_installed(installed("cat/lib", "1", "2", Some("2.1"), &[]));
+
+    let sol = resolve(&f, &["cat/lib"]).expect("resolves");
+    assert_eq!(
+        sol.package("cat/lib").unwrap().subslot.as_deref(),
+        Some("2.2")
+    );
+    let consumer = sol
+        .package("cat/consumer")
+        .expect("the installed consumer is pulled into the solution");
+    assert!(
+        consumer.subslot_rebuild,
+        "the pulled-in consumer must be flagged for a slot-operator rebuild"
+    );
+}

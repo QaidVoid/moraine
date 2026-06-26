@@ -68,22 +68,105 @@ pub fn resolve_with<S: ResolveSource>(
         request_atoms.push(normalize_atom(&atom, &interner));
     }
 
-    let provider = GentooProvider::with_request(source, request_atoms.clone(), modifiers);
     let root_version = Version::parse("0").expect("synthetic version parses");
 
-    let (solution, stats) = solve_with_stats(&provider, REQUEST_CP.to_owned(), root_version);
-    let decisions = match solution {
-        Ok(map) => map,
-        Err(failure) => {
-            return Err(ResolveError::Unsatisfiable {
-                explanation: render_explanation(&failure.explanation),
-            });
-        }
-    };
+    // Slot-operator reverse-dependency pull-in: an installed consumer of a
+    // provider whose sub-slot changed must be rebuilt, but it is not in the
+    // request and so never enters the solution. After each solve, find such
+    // consumers, add them to the request, and re-solve, bounded by a restart cap
+    // to guarantee termination (Portage's `_slot_operator_update_backtrack` /
+    // `_need_restart`).
+    const MAX_SLOT_RESTARTS: u32 = 8;
+    let mut requested_cps: BTreeSet<String> = request_atoms.iter().map(|a| a.cp.clone()).collect();
+    let mut extra_atoms: Vec<NormAtom> = Vec::new();
+    let mut restarts = 0u32;
 
-    let mut resolved = assemble_solution(source, &decisions, modifiers)?;
-    resolved.backtracks = stats.backtracks;
-    Ok(resolved)
+    loop {
+        let mut all_atoms = request_atoms.clone();
+        all_atoms.extend(extra_atoms.iter().cloned());
+        let provider = GentooProvider::with_request(source, all_atoms, modifiers);
+
+        let (solution, stats) =
+            solve_with_stats(&provider, REQUEST_CP.to_owned(), root_version.clone());
+        let decisions = match solution {
+            Ok(map) => map,
+            Err(failure) => {
+                return Err(ResolveError::Unsatisfiable {
+                    explanation: render_explanation(&failure.explanation),
+                });
+            }
+        };
+
+        let mut resolved = assemble_solution(source, &decisions, modifiers)?;
+        resolved.backtracks = stats.backtracks + restarts;
+
+        if restarts < MAX_SLOT_RESTARTS {
+            let pulled = rebuild_consumers(source, &resolved, &requested_cps);
+            if !pulled.is_empty() {
+                for atom in pulled {
+                    requested_cps.insert(atom.cp.clone());
+                    extra_atoms.push(atom);
+                }
+                restarts += 1;
+                continue;
+            }
+        }
+        return Ok(resolved);
+    }
+}
+
+/// Find installed reverse-dependencies that must be rebuilt because a selected
+/// provider's sub-slot differs from their recorded `:=` binding, returned as bare
+/// request atoms to pull into the next re-solve. Consumers already in the request
+/// or already selected are skipped, bounding the pull-in.
+fn rebuild_consumers<S: ResolveSource>(
+    source: &S,
+    resolved: &ResolvedSolution,
+    requested: &BTreeSet<String>,
+) -> Vec<NormAtom> {
+    let mut out: Vec<NormAtom> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for provider in &resolved.packages {
+        for inst in source.installed_consumers_of(&provider.cp) {
+            if requested.contains(&inst.cp)
+                || seen.contains(&inst.cp)
+                || resolved.packages.iter().any(|p| p.cp == inst.cp)
+            {
+                continue;
+            }
+            let needs_rebuild = inst.slot_bindings.iter().any(|(dep_cp, bslot, bsub)| {
+                if dep_cp != &provider.cp || bslot.is_empty() || &provider.slot != bslot {
+                    return false;
+                }
+                // PMS 7.2: a missing sub-slot equals the slot.
+                let bound_sub = bsub.as_deref().unwrap_or(bslot.as_str());
+                let current_sub = provider
+                    .subslot
+                    .as_deref()
+                    .unwrap_or(provider.slot.as_str());
+                current_sub != bound_sub
+            });
+            if needs_rebuild {
+                seen.insert(inst.cp.clone());
+                out.push(bare_atom(&inst.cp));
+            }
+        }
+    }
+    out
+}
+
+/// A bare request atom for `cp` with no version, slot, or USE constraint, used to
+/// pull a reverse-dependency into resolution.
+fn bare_atom(cp: &str) -> NormAtom {
+    NormAtom {
+        blocker: BlockerKind::None,
+        cp: cp.to_owned(),
+        version: None,
+        slot: None,
+        subslot: None,
+        slot_op: None,
+        use_deps: Vec::new(),
+    }
 }
 
 /// Build the resolved solution from the solver's `cp:slot -> version` decisions.
@@ -143,6 +226,14 @@ fn assemble_solution<S: ResolveSource>(
             let mut subslot_rebuild = false;
             for inst in source.installed(cp) {
                 for (dep_cp, bslot, bsub) in &inst.slot_bindings {
+                    // A legacy record written before `:=` bindings were baked
+                    // carries an empty slot (unbound). Treat it as not-a-binding
+                    // rather than comparing against an empty slot, which would
+                    // mis-fire; such packages fall back to `--changed-slot`/
+                    // `@preserved-rebuild`.
+                    if bslot.is_empty() {
+                        continue;
+                    }
                     // PMS 7.2: a missing sub-slot equals the slot. The recorded
                     // binding is rewritten to `slot/subslot=` at build time, so an
                     // unspecified store sub-slot must default to the slot before

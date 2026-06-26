@@ -152,6 +152,21 @@ pub trait ResolveSource {
         Vec::new()
     }
 
+    /// The installed packages that recorded a `:=` slot-operator binding naming
+    /// `provider_cp`. Used to pull a changed provider's reverse-dependencies into
+    /// resolution for a slot-operator rebuild. The default filters
+    /// [`installed_all`](Self::installed_all).
+    fn installed_consumers_of(&self, provider_cp: &str) -> Vec<InstalledMeta> {
+        self.installed_all()
+            .into_iter()
+            .filter(|inst| {
+                inst.slot_bindings
+                    .iter()
+                    .any(|(dep_cp, _, _)| dep_cp == provider_cp)
+            })
+            .collect()
+    }
+
     /// Whether any installed package satisfies `cp` at `version` (used to mark
     /// already-installed packages and satisfied edges).
     fn installed_matches(&self, cp: &str, version: &Version, slot: &str) -> bool {

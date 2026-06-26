@@ -218,9 +218,12 @@ impl MergeGraph {
             if !nodes.contains_key(&edge.from) || !nodes.contains_key(&edge.to) {
                 continue;
             }
+            // A package flagged for a slot-operator rebuild is reinstalled even
+            // though its version is unchanged, so an edge into it is real, not a
+            // no-op satisfied edge.
             let satisfied = solution
                 .package(&edge.to)
-                .map(|p| p.already_installed)
+                .map(|p| p.already_installed && !p.subslot_rebuild)
                 .unwrap_or(false);
             let flags = EdgeFlags::for_class(edge.class, edge.slot_op, edge.optional, satisfied);
             out.entry(edge.from.clone())
