@@ -70,8 +70,10 @@ pub struct PackageSpec {
     pub defined_phases: Vec<String>,
     /// The `RESTRICT` tokens.
     pub restrict: Vec<String>,
-    /// The package `SLOT`.
+    /// The package `SLOT` (the slot part only).
     pub slot: String,
+    /// The package sub-slot, if the `SLOT` declared one (`slot/subslot`).
+    pub subslot: Option<String>,
     /// The `IUSE` tokens.
     pub iuse: Vec<String>,
     /// The `KEYWORDS` tokens.
@@ -103,6 +105,12 @@ pub struct BuildRequest {
     pub require_digest: bool,
     /// The kernel namespace support for the sandbox plan.
     pub namespace_support: NamespaceSupport,
+    /// The resolved `:=` slot bindings for this package, as
+    /// `(dependency_cp, slot, subslot)`. Used to rewrite each `:=` dependency
+    /// atom to its bound `:slot/subslot=` form before recording, so the stored
+    /// `*DEPEND` carries the linked slot like Portage's
+    /// `evaluate_slot_operator_equal_deps`.
+    pub slot_bindings: Vec<(String, String, Option<String>)>,
 }
 
 /// The result of a successful build.

@@ -239,12 +239,18 @@ fn state_from_request(task: &InstallTask, request: &BuildRequest) -> PackageStat
     let mut use_flags: Vec<String> = request.use_flags.iter().cloned().collect();
     use_flags.sort();
 
+    // Bake each `:=` binding into the recorded `*DEPEND` against the provider it
+    // linked against, so the stored dependency carries the bound slot/subslot
+    // like Portage's `evaluate_slot_operator_equal_deps`.
+    let interner = moraine_common::Interner::new();
     let mut depends = std::collections::BTreeMap::new();
     for key in ["DEPEND", "RDEPEND", "BDEPEND", "PDEPEND", "IDEPEND"] {
         if let Some(value) = pkg.reduced_meta.get(key)
             && !value.trim().is_empty()
         {
-            depends.insert(key.to_owned(), value.clone());
+            let rewritten =
+                moraine_merge::rewrite_slot_operators(value, &request.slot_bindings, &interner);
+            depends.insert(key.to_owned(), rewritten);
         }
     }
     let meta = |key: &str| pkg.reduced_meta.get(key).cloned().unwrap_or_default();
@@ -256,7 +262,7 @@ fn state_from_request(task: &InstallTask, request: &BuildRequest) -> PackageStat
         version,
         eapi: pkg.ident.eapi.clone(),
         slot: pkg.slot.clone(),
-        subslot: None,
+        subslot: pkg.subslot.clone(),
         use_flags,
         iuse: pkg.iuse.clone(),
         depends,

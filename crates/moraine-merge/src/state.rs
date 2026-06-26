@@ -1,22 +1,72 @@
 //! Installed-state recording and post-merge actions.
 //!
-//! The installed record carries the recorded USE, the resolved slot and sub-slot
-//! including any `:=` bindings, the dependency variables, the saved build
-//! environment, the soname `PROVIDES`/`REQUIRES`, and a counter drawn from a
-//! global monotonic counter. The record becomes visible only after CONTENTS and
-//! all files are durable, which is the commit point. After completion the engine
-//! triggers elog dispatch, news-item marking, and config-update notices as
-//! recorded outcomes.
+//! The installed record carries the recorded USE, the resolved slot and sub-slot,
+//! the dependency variables (with each `:=` binding rewritten to `:slot/subslot=`
+//! against the provider it linked against), the saved build environment, the
+//! soname `PROVIDES`/`REQUIRES`, and a counter drawn from a global monotonic
+//! counter. The record becomes visible only after CONTENTS and all files are
+//! durable, which is the commit point. After completion the engine triggers elog
+//! dispatch, news-item marking, and config-update notices as recorded outcomes.
 
 use std::collections::BTreeMap;
 
+use moraine_atom::{Atom, SlotOp};
 use moraine_common::Interner;
+use moraine_eapi::PERMISSIVE;
 use moraine_vdb::contents::{Contents, Entry};
 use moraine_vdb::record::{Depend, DependKind, DependSet, EnvironmentRef, PackageRecord, Slot};
 use moraine_vdb::soname::{Provides, Requires, SonameEntry};
 use moraine_version::Version;
 
 use crate::error::MergeError;
+
+/// Rewrite every `:=` slot-operator atom in a USE-reduced `*DEPEND` string to its
+/// bound `:slot/subslot=` form, using the providers this package linked against.
+///
+/// `bindings` maps a dependency `cp` to the `(slot, subslot)` of its selected
+/// provider, as `(dependency_cp, slot, subslot)`. This mirrors Portage's
+/// `evaluate_slot_operator_equal_deps`, baking the linked slot into the recorded
+/// dependency so a later sub-slot change is detectable. Structural tokens (`||`,
+/// `(`, `)`) and atoms with no matching `:=` binding are left unchanged.
+pub fn rewrite_slot_operators(
+    dep_string: &str,
+    bindings: &[(String, String, Option<String>)],
+    interner: &Interner,
+) -> String {
+    dep_string
+        .split_whitespace()
+        .map(|token| rewrite_atom_token(token, bindings, interner))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Rewrite a single `*DEPEND` token if it is a `:=` atom with a known binding.
+fn rewrite_atom_token(
+    token: &str,
+    bindings: &[(String, String, Option<String>)],
+    interner: &Interner,
+) -> String {
+    let Ok(atom) = Atom::parse(token, PERMISSIVE, interner) else {
+        return token.to_owned();
+    };
+    // Only an `=` binding whose sub-slot is not yet baked is rewritten.
+    if atom.slot_op() != Some(SlotOp::Equal) || atom.subslot().is_some() {
+        return token.to_owned();
+    }
+    let cp = {
+        let category = interner.resolve(atom.category()).unwrap_or_default();
+        let package = interner.resolve(atom.package()).unwrap_or_default();
+        format!("{category}/{package}")
+    };
+    let Some((_, slot, subslot)) = bindings.iter().find(|(dep_cp, _, _)| dep_cp == &cp) else {
+        return token.to_owned();
+    };
+    // A bare `:=` takes the binding's slot; an explicit `:slot=` keeps its slot
+    // and only gains the bound sub-slot.
+    let slot_sym = atom.slot().unwrap_or_else(|| interner.intern(slot));
+    let subslot_sym = subslot.as_ref().map(|s| interner.intern(s));
+    atom.with_bound_slot(slot_sym, subslot_sym).render(interner)
+}
 
 /// A soname tagged with its ABI bucket, as plain strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,8 +81,9 @@ pub struct Soname {
 ///
 /// This mirrors [`PackageRecord`] but holds strings rather than interned
 /// [`Symbol`](moraine_common::Symbol)s so the caller does not need a shared
-/// interner; the engine interns into the store at commit. Slot and sub-slot,
-/// including any `:=` binding, are preserved verbatim in the `*DEPEND` strings.
+/// interner; the engine interns into the store at commit. Each `:=` binding in
+/// the `*DEPEND` strings is rewritten to `:slot/subslot=` against the linked
+/// provider before recording (see [`rewrite_slot_operators`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageState {
     /// The `category/package-version`, used as the operation label.
@@ -54,7 +105,7 @@ pub struct PackageState {
     /// The recorded IUSE tokens.
     pub iuse: Vec<String>,
     /// The `*DEPEND` strings keyed by family name (`DEPEND`, `RDEPEND`, ...),
-    /// preserved verbatim including any `:=` binding.
+    /// with each `:=` binding rewritten to its linked `:slot/subslot=` form.
     pub depends: BTreeMap<String, String>,
     /// The recorded `KEYWORDS`.
     pub keywords: Vec<String>,
@@ -191,4 +242,70 @@ impl PostMergeReport {
 /// Helper for building the explicit CONTENTS entries of a merged package.
 pub(crate) fn contents_from(entries: Vec<Entry>) -> Contents {
     Contents::from_entries(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_slot_operators;
+    use moraine_common::Interner;
+
+    fn binding(cp: &str, slot: &str, subslot: Option<&str>) -> (String, String, Option<String>) {
+        (
+            cp.to_owned(),
+            slot.to_owned(),
+            subslot.map(|s| s.to_owned()),
+        )
+    }
+
+    #[test]
+    fn rewrites_equal_binding_to_bound_slot() {
+        let i = Interner::new();
+        let b = vec![binding("dev-libs/foo", "2", Some("2.1"))];
+        assert_eq!(
+            rewrite_slot_operators("dev-libs/foo:=", &b, &i),
+            "dev-libs/foo:2/2.1="
+        );
+    }
+
+    #[test]
+    fn rewrites_equal_binding_without_subslot() {
+        let i = Interner::new();
+        let b = vec![binding("dev-libs/foo", "2", None)];
+        assert_eq!(
+            rewrite_slot_operators("dev-libs/foo:=", &b, &i),
+            "dev-libs/foo:2="
+        );
+    }
+
+    #[test]
+    fn bakes_subslot_onto_explicit_slot() {
+        let i = Interner::new();
+        let b = vec![binding("dev-libs/foo", "2", Some("2.1"))];
+        assert_eq!(
+            rewrite_slot_operators("dev-libs/foo:2=", &b, &i),
+            "dev-libs/foo:2/2.1="
+        );
+    }
+
+    #[test]
+    fn leaves_unbound_and_structural_tokens() {
+        let i = Interner::new();
+        let b = vec![binding("dev-libs/foo", "2", Some("2.1"))];
+        // foo is rewritten; bar has no binding; ||, (, ) are preserved.
+        assert_eq!(
+            rewrite_slot_operators("|| ( dev-libs/foo:= dev-libs/bar )", &b, &i),
+            "|| ( dev-libs/foo:2/2.1= dev-libs/bar )"
+        );
+    }
+
+    #[test]
+    fn leaves_non_slot_operator_atoms() {
+        let i = Interner::new();
+        let b = vec![binding("dev-libs/foo", "2", Some("2.1"))];
+        // A plain slot dep (no `=`) and a star op are untouched.
+        assert_eq!(
+            rewrite_slot_operators("dev-libs/foo:2 dev-libs/foo:*", &b, &i),
+            "dev-libs/foo:2 dev-libs/foo:*"
+        );
+    }
 }

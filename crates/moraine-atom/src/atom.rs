@@ -166,6 +166,16 @@ impl Atom {
         &self.use_deps
     }
 
+    /// Return a copy of this atom with its slot operator bound to a concrete
+    /// `slot` and optional `subslot`, leaving the operator in place. Used to bake
+    /// a resolved `:=` binding into a recorded dependency (`:slot/subslot=`).
+    pub fn with_bound_slot(&self, slot: Symbol, subslot: Option<Symbol>) -> Atom {
+        let mut atom = self.clone();
+        atom.slot = Some(slot);
+        atom.subslot = subslot;
+        atom
+    }
+
     /// Parse an atom under the given EAPI features, interning tokens.
     pub fn parse(
         input: &str,

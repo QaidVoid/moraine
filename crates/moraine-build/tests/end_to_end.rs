@@ -85,6 +85,7 @@ fn builds_fixture_and_writes_image_and_build_info() {
         defined_phases: vec!["compile".into(), "install".into()],
         restrict: vec![],
         slot: "0".into(),
+        subslot: None,
         iuse: vec!["ssl".into()],
         keywords: vec!["amd64".into()],
         inherited: vec!["eutils".into()],
@@ -103,6 +104,7 @@ fn builds_fixture_and_writes_image_and_build_info() {
         run_tests: false,
         require_digest: true,
         namespace_support: NamespaceSupport::default(),
+        slot_bindings: Vec::new(),
     };
 
     let runner = FakeRunner::always_ok();
@@ -191,6 +193,7 @@ fn restricted_fetch_missing_fails_build() {
         defined_phases: vec!["compile".into()],
         restrict: vec!["fetch".into()],
         slot: "0".into(),
+        subslot: None,
         iuse: vec![],
         keywords: vec![],
         inherited: vec![],
@@ -209,6 +212,7 @@ fn restricted_fetch_missing_fails_build() {
         run_tests: false,
         require_digest: true,
         namespace_support: NamespaceSupport::default(),
+        slot_bindings: Vec::new(),
     };
 
     let runner = FakeRunner::always_ok();

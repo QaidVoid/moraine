@@ -231,6 +231,18 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
 
     // Drive the orchestrator with a runner that dispatches source vs binary.
     ensure_dirs(&wr)?;
+    let slot_bindings: HashMap<String, Vec<(String, String, Option<String>)>> = solution
+        .packages
+        .iter()
+        .map(|p| {
+            let bindings = p
+                .slot_bindings
+                .iter()
+                .map(|b| (b.dependency.clone(), b.slot.clone(), b.subslot.clone()))
+                .collect();
+            (p.cpv(), bindings)
+        })
+        .collect();
     let planner = CliPlanner {
         repo_set: &repo_set,
         store_dir: store_dir.clone(),
@@ -239,6 +251,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         eroot: wr.eroot.clone(),
         interner: Arc::clone(&interner),
         cache: RefCell::new(HashMap::new()),
+        slot_bindings,
     };
     let command_runner = SystemRunner;
     let options = BuildOptions {
@@ -302,6 +315,10 @@ struct CliPlanner<'a> {
     eroot: PathBuf,
     interner: Arc<Interner>,
     cache: RefCell<HashMap<String, Arc<Vec<StoredEntry>>>>,
+    /// Resolved `:=` slot bindings per `cpv`, as `(dependency_cp, slot,
+    /// subslot)`, so each merge bakes its linked slot into the recorded
+    /// `*DEPEND`.
+    slot_bindings: HashMap<String, Vec<(String, String, Option<String>)>>,
 }
 
 impl BuildPlanner for CliPlanner<'_> {
@@ -347,6 +364,7 @@ impl BuildPlanner for CliPlanner<'_> {
             defined_phases: entry.defined_phases.clone(),
             restrict: entry.restrict.clone(),
             slot: entry.slot.clone(),
+            subslot: entry.subslot.clone(),
             iuse: entry.iuse.clone(),
             keywords: entry.keywords.clone(),
             inherited: entry.inherited.clone(),
@@ -366,6 +384,11 @@ impl BuildPlanner for CliPlanner<'_> {
             run_tests,
             require_digest: true,
             namespace_support: NamespaceSupport::default(),
+            slot_bindings: self
+                .slot_bindings
+                .get(&task.cpv)
+                .cloned()
+                .unwrap_or_default(),
         })
     }
 }
@@ -1150,6 +1173,7 @@ mod tests {
             eroot: dir.path().to_path_buf(),
             interner: Arc::clone(&interner),
             cache: RefCell::new(HashMap::new()),
+            slot_bindings: HashMap::new(),
         };
         let task = InstallTask::merge("dev-libs/absent-1", "dev-libs/absent", "0");
         let err = planner.plan(&task).unwrap_err();
