@@ -105,17 +105,17 @@ pub fn import_repo(
         })
     })?;
 
-    let cache_dir = cfg.md5_cache_dir();
-    if !cache_dir.is_dir() {
-        // A synced tree without a committed `metadata/md5-cache` yields no
-        // metadata gracefully rather than failing the whole repository, matching
-        // Portage's `_sync_callback` (a missing cache is not regenerated here).
+    // Select the cache directory and format (md5-dict or PMS flat_list) per the
+    // repository's `cache-formats`. A synced tree without any committed cache
+    // yields no metadata gracefully rather than failing the whole repository,
+    // matching Portage's `_sync_callback` (a missing cache is not regenerated).
+    let Some((cache_dir, format)) = cfg.selected_cache() else {
         let mut report = ImportReport::default();
-        report
-            .issues
-            .push(ImportIssue::NoMetadataCache { path: cache_dir });
+        report.issues.push(ImportIssue::NoMetadataCache {
+            path: cfg.md5_cache_dir(),
+        });
         return Ok(report);
-    }
+    };
 
     // Resolve on-disk eclass md5s once, through the masters search path.
     let eclass_md5 = resolve_eclass_md5(repo_set, repo);
@@ -141,7 +141,7 @@ pub fn import_repo(
     // only the raw strings are stored on disk.
     let results: Vec<EntryOutcome> = work
         .par_iter()
-        .map(|(category, file)| import_one(cfg, category, file, &eclass_md5, previous))
+        .map(|(category, file)| import_one(cfg, category, file, format, &eclass_md5, previous))
         .collect();
 
     let mut report = ImportReport::default();
@@ -169,9 +169,11 @@ fn import_one(
     cfg: &RepoConfig,
     category: &str,
     file: &Path,
+    format: crate::flatlist::CacheFormat,
     eclass_md5: &HashMap<String, String>,
     previous: &HashMap<(String, String, String), StoredEntry>,
 ) -> EntryOutcome {
+    use crate::flatlist::CacheFormat;
     let pv = file
         .file_name()
         .and_then(|n| n.to_str())
@@ -186,20 +188,31 @@ fn import_one(
         }
     };
 
-    // Parse KEY=VALUE, split on the first `=`. A line without `=` is corrupt.
-    let mut fields: HashMap<&str, &str> = HashMap::new();
-    for line in content.lines() {
-        if line.is_empty() {
-            continue;
+    // Parse the cache file by format. The md5-dict form is `KEY=VALUE` with a
+    // corrupt-line guard; the PMS flat_list form is positional or hashed.
+    let owned_fields: HashMap<String, String> = match format {
+        CacheFormat::Pms => crate::flatlist::parse(&content),
+        CacheFormat::Md5Dict => {
+            let mut map = HashMap::new();
+            for line in content.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                let Some((key, value)) = line.split_once('=') else {
+                    return EntryOutcome::Rejected(ImportIssue::CorruptCacheLine {
+                        cpv,
+                        line: line.to_owned(),
+                    });
+                };
+                map.insert(key.to_owned(), value.to_owned());
+            }
+            map
         }
-        let Some((key, value)) = line.split_once('=') else {
-            return EntryOutcome::Rejected(ImportIssue::CorruptCacheLine {
-                cpv,
-                line: line.to_owned(),
-            });
-        };
-        fields.insert(key, value);
-    }
+    };
+    let fields: HashMap<&str, &str> = owned_fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     let mtime = fields
         .get("_mtime_")
@@ -235,7 +248,18 @@ fn import_one(
         return EntryOutcome::Rejected(ImportIssue::StaleEclass { cpv, eclass: stale });
     }
 
-    let eapi = fields.get("EAPI").copied().unwrap_or("0").trim().to_owned();
+    // Use the repository default EAPI when the entry declares none.
+    let eapi = match fields.get("EAPI").map(|s| s.trim()) {
+        Some(e) if !e.is_empty() => e.to_owned(),
+        _ => cfg.default_eapi.clone(),
+    };
+    // Reject a banned EAPI; warn on a deprecated one but keep the entry.
+    if cfg.eapis_banned.iter().any(|b| b == &eapi) {
+        return EntryOutcome::Rejected(ImportIssue::BannedEapi { cpv, eapi });
+    }
+    if cfg.eapis_deprecated.iter().any(|d| d == &eapi) {
+        tracing::warn!(cpv = %cpv, eapi = %eapi, "entry uses a deprecated EAPI");
+    }
     let features = features_for(&eapi);
 
     // Parse dependency variables, gated by EAPI. A failure rejects the entry.
@@ -631,6 +655,132 @@ mod tests {
         assert_eq!(
             second.entries[0].rdepend, "dev-libs/REUSED-MARKER",
             "unchanged entry must be reused, not re-read"
+        );
+    }
+
+    #[test]
+    fn md5_only_reuse_without_mtime() {
+        // Real gentoo md5-cache entries carry `_md5_` but no `_mtime_`; the fast
+        // path must still fire on a matching `_md5_`.
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "gentoo");
+        r.cache(
+            "dev-libs",
+            "a-1",
+            "EAPI=8\nSLOT=0\nRDEPEND=dev-libs/zlib\n_md5_=h1\n",
+        );
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[gentoo]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        let first = import_repo(&set, "gentoo", &HashMap::new()).unwrap();
+
+        let mut prev = first.entries[0].clone();
+        prev.rdepend = "dev-libs/REUSED".to_owned();
+        let mut previous = HashMap::new();
+        previous.insert(
+            (
+                prev.category.clone(),
+                prev.package.clone(),
+                prev.version.clone(),
+            ),
+            prev,
+        );
+        let second = import_repo(&set, "gentoo", &previous).unwrap();
+        assert_eq!(second.entries[0].rdepend, "dev-libs/REUSED");
+    }
+
+    #[test]
+    fn banned_eapi_rejected_and_default_eapi_applied() {
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "gentoo");
+        fs::write(r.loc.join("metadata/layout.conf"), "eapis-banned = 4\n").unwrap();
+        fs::write(r.loc.join("profiles/eapi"), "8\n").unwrap();
+        r.cache("dev-libs", "banned-1", "EAPI=4\nSLOT=0\n");
+        // No EAPI line: the repository default EAPI (8) applies.
+        r.cache(
+            "dev-libs",
+            "def-1",
+            "SLOT=0\nRDEPEND=dev-libs/zlib\n_md5_=x\n",
+        );
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[gentoo]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        assert_eq!(set.get("gentoo").unwrap().default_eapi, "8");
+        let report = import_repo(&set, "gentoo", &HashMap::new()).unwrap();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| matches!(i, ImportIssue::BannedEapi { eapi, .. } if eapi == "4"))
+        );
+        let def = report.entries.iter().find(|e| e.package == "def").unwrap();
+        assert_eq!(def.eapi, "8");
+    }
+
+    #[test]
+    fn pms_flat_list_cache_imported() {
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "overlay");
+        // A pms-only overlay: no md5-cache, a positional metadata/cache entry.
+        fs::remove_dir_all(r.loc.join("metadata/md5-cache")).unwrap();
+        fs::write(r.loc.join("metadata/layout.conf"), "cache-formats = pms\n").unwrap();
+        let cache = r.loc.join("metadata/cache/dev-libs");
+        fs::create_dir_all(&cache).unwrap();
+        // Positional auxdbkey order: DEPEND, RDEPEND, SLOT, ... EAPI at line 15.
+        let lines = [
+            "",              // DEPEND
+            "dev-libs/zlib", // RDEPEND
+            "0/3",           // SLOT
+            "",              // SRC_URI
+            "",              // RESTRICT
+            "",              // HOMEPAGE
+            "GPL-2",         // LICENSE
+            "",              // DESCRIPTION
+            "amd64",         // KEYWORDS
+            "",              // INHERITED
+            "ssl",           // IUSE
+            "",              // REQUIRED_USE
+            "",              // PDEPEND
+            "",              // BDEPEND
+            "8",             // EAPI
+        ];
+        fs::write(cache.join("foo-1.2"), lines.join("\n")).unwrap();
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[overlay]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        let report = import_repo(&set, "overlay", &HashMap::new()).unwrap();
+        let e = report.entries.iter().find(|e| e.package == "foo").unwrap();
+        assert_eq!(e.version, "1.2");
+        assert_eq!(e.slot, "0");
+        assert_eq!(e.subslot.as_deref(), Some("3"));
+        assert_eq!(e.rdepend, "dev-libs/zlib");
+        assert_eq!(e.eapi, "8");
+    }
+
+    #[test]
+    fn missing_md5_cache_skips_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "overlay");
+        // Remove the md5-cache directory the builder created.
+        fs::remove_dir_all(r.loc.join("metadata/md5-cache")).unwrap();
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[overlay]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        let report = import_repo(&set, "overlay", &HashMap::new()).unwrap();
+        assert!(report.entries.is_empty());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| matches!(i, ImportIssue::NoMetadataCache { .. }))
         );
     }
 

@@ -48,6 +48,19 @@ pub struct RepoConfig {
     /// Whether the repository uses thin Manifests (`DIST`-only, no `EBUILD`/`AUX`
     /// digests in the per-package Manifest).
     pub thin_manifests: bool,
+    /// Whether the repository signs its Manifests.
+    pub sign_manifests: bool,
+    /// Whether the repository uses Manifests at all (`use-manifests`).
+    pub use_manifests: bool,
+    /// EAPIs banned by the repository's `eapis-banned`; an entry using one is
+    /// rejected on import.
+    pub eapis_banned: Vec<String>,
+    /// EAPIs deprecated by the repository's `eapis-deprecated`; an entry using one
+    /// is warned about but kept.
+    pub eapis_deprecated: Vec<String>,
+    /// The repository default EAPI from `profiles/eapi` (else `profile-default-eapi`,
+    /// else `0`), used for entries lacking an explicit `EAPI`.
+    pub default_eapi: String,
     /// The raw `sync-*` keys read from `repos.conf`.
     pub sync: BTreeMap<String, String>,
 }
@@ -56,6 +69,30 @@ impl RepoConfig {
     /// The repository's `metadata/md5-cache` directory.
     pub fn md5_cache_dir(&self) -> PathBuf {
         self.location.join("metadata/md5-cache")
+    }
+
+    /// The repository's PMS `metadata/cache` (flat_list) directory.
+    pub fn pms_cache_dir(&self) -> PathBuf {
+        self.location.join("metadata/cache")
+    }
+
+    /// The metadata cache directory and format to import from, selected by
+    /// `cache-formats` left to right (the first declared format whose directory
+    /// exists). Returns `None` when no declared cache directory is present.
+    pub fn selected_cache(&self) -> Option<(PathBuf, crate::flatlist::CacheFormat)> {
+        use crate::flatlist::CacheFormat;
+        for fmt in &self.cache_formats {
+            match fmt.as_str() {
+                "md5-dict" if self.md5_cache_dir().is_dir() => {
+                    return Some((self.md5_cache_dir(), CacheFormat::Md5Dict));
+                }
+                "pms" if self.pms_cache_dir().is_dir() => {
+                    return Some((self.pms_cache_dir(), CacheFormat::Pms));
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// The repository's `eclass` directory.
@@ -97,6 +134,45 @@ impl RepoSet {
     /// Whether no repositories were discovered.
     pub fn is_empty(&self) -> bool {
         self.repos.is_empty()
+    }
+
+    /// The categories valid for `repo`, stacked from `profiles/categories` across
+    /// the repository and its masters (PMS 5.2.1). A category prefixed with `-`
+    /// removes one inherited from a master. Empty when no `profiles/categories`
+    /// file exists anywhere in the search path.
+    pub fn categories(&self, repo: &str) -> std::collections::BTreeSet<String> {
+        let mut cats: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let Some(cfg) = self.repos.get(repo) else {
+            return cats;
+        };
+        // Masters first (so the repo's own file stacks on top), then the repo.
+        let mut chain: Vec<&str> = self
+            .order
+            .iter()
+            .filter(|n| cfg.masters.iter().any(|m| m == *n))
+            .map(String::as_str)
+            .collect();
+        chain.push(repo);
+        for name in chain {
+            let Some(c) = self.repos.get(name) else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(c.location.join("profiles/categories")) else {
+                continue;
+            };
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some(removed) = line.strip_prefix('-') {
+                    cats.remove(removed);
+                } else {
+                    cats.insert(line.to_string());
+                }
+            }
+        }
+        cats
     }
 
     /// Build the eclass search path for `repo`: the ordered list of repository
@@ -193,6 +269,7 @@ pub fn discover(repos_conf: impl AsRef<Path>) -> Result<RepoSet, DiscoveryError>
 
         // Canonical name from profiles/repo_name when present.
         let canonical = read_repo_name(&location).unwrap_or_else(|| name.clone());
+        let default_eapi = read_default_eapi(&location, layout.profile_default_eapi.clone());
 
         let cfg = RepoConfig {
             name: canonical.clone(),
@@ -207,6 +284,11 @@ pub fn discover(repos_conf: impl AsRef<Path>) -> Result<RepoSet, DiscoveryError>
             manifest_hashes: layout.manifest_hashes,
             manifest_required_hashes: layout.manifest_required_hashes,
             thin_manifests: layout.thin_manifests,
+            sign_manifests: layout.sign_manifests,
+            use_manifests: layout.use_manifests,
+            eapis_banned: layout.eapis_banned,
+            eapis_deprecated: layout.eapis_deprecated,
+            default_eapi,
             sync,
         };
         masters_unset.insert(canonical.clone(), masters_opt);
@@ -344,6 +426,11 @@ struct Layout {
     manifest_hashes: Vec<String>,
     manifest_required_hashes: Vec<String>,
     thin_manifests: bool,
+    sign_manifests: bool,
+    use_manifests: bool,
+    eapis_banned: Vec<String>,
+    eapis_deprecated: Vec<String>,
+    profile_default_eapi: Option<String>,
 }
 
 /// Read and parse `metadata/layout.conf`, returning defaults when absent.
@@ -351,7 +438,11 @@ fn read_layout_conf(location: &Path) -> Layout {
     let path = location.join("metadata/layout.conf");
     // A missing layout.conf still yields the default Manifest hash policy below.
     let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut layout = Layout::default();
+    // Portage's default unless `use-manifests = false`.
+    let mut layout = Layout {
+        use_manifests: true,
+        ..Layout::default()
+    };
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -373,6 +464,18 @@ fn read_layout_conf(location: &Path) -> Layout {
             "thin-manifests" => {
                 layout.thin_manifests = value.first().map(|v| v == "true").unwrap_or(false);
             }
+            "sign-manifests" => {
+                layout.sign_manifests = value.first().map(|v| v == "true").unwrap_or(false);
+            }
+            "use-manifests" => {
+                // `true`/`false`/`strict`; anything but `false` enables manifests.
+                layout.use_manifests = value.first().map(|v| v != "false").unwrap_or(true);
+            }
+            "eapis-banned" => layout.eapis_banned = value,
+            "eapis-deprecated" => layout.eapis_deprecated = value,
+            "profile-default-eapi" | "profile_eapi_when_unspecified" => {
+                layout.profile_default_eapi = value.into_iter().next();
+            }
             _ => {}
         }
     }
@@ -392,12 +495,43 @@ fn read_layout_conf(location: &Path) -> Layout {
     layout
         .manifest_required_hashes
         .retain(|h| layout.manifest_hashes.contains(h));
+    // Auto-detect cache-formats when unset, left to right: prefer md5-dict, then
+    // pms, by which cache directory exists (matching Portage).
+    if layout.cache_formats.is_empty() {
+        if location.join("metadata/md5-cache").is_dir() {
+            layout.cache_formats.push("md5-dict".to_string());
+        }
+        if location.join("metadata/cache").is_dir() {
+            layout.cache_formats.push("pms".to_string());
+        }
+        // Default to md5-dict so a freshly synced tree (cache not yet present)
+        // still selects the modern format.
+        if layout.cache_formats.is_empty() {
+            layout.cache_formats.push("md5-dict".to_string());
+        }
+    }
     layout
 }
 
 /// Uppercase each token, so hash algorithm names compare uniformly.
 fn upper(value: Vec<String>) -> Vec<String> {
     value.into_iter().map(|s| s.to_ascii_uppercase()).collect()
+}
+
+/// The repository's default EAPI: the first non-comment line of `profiles/eapi`,
+/// else the `profile-default-eapi` layout key, else `0` (PMS).
+fn read_default_eapi(location: &Path, layout_default: Option<String>) -> String {
+    if let Ok(text) = std::fs::read_to_string(location.join("profiles/eapi")) {
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                return line.to_string();
+            }
+        }
+    }
+    layout_default
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0".to_string())
 }
 
 /// Read the canonical repository name from `profiles/repo_name`.

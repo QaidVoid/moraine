@@ -29,6 +29,7 @@
 
 pub mod discovery;
 pub mod error;
+pub mod flatlist;
 pub mod import;
 pub mod query;
 pub mod store;
