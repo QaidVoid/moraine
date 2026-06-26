@@ -90,8 +90,12 @@ pub fn serialize(solution: &ResolvedSolution) -> Result<Vec<Task>, MergeOrderErr
     }
 
     let merges: Vec<Task> = order.iter().map(|cp| build_task(solution, cp)).collect();
-    Ok(schedule_blockers(solution, merges))
+    schedule_blockers(solution, merges)
 }
+
+/// The package manager's own `category/package`, which a blocker uninstall may
+/// never remove.
+const PACKAGE_MANAGER: &str = "sys-apps/portage";
 
 /// Schedule uninstall tasks for the solution's blockers around the merges.
 ///
@@ -99,9 +103,17 @@ pub fn serialize(solution: &ResolvedSolution) -> Result<Vec<Task>, MergeOrderErr
 /// by version and slot when the victims were computed), so an uninstall removes
 /// only those entries, never the whole cp. A strong blocker (`!!`) forbids file
 /// overlap, so its victims are removed before the replacement merges; a weak
-/// blocker (`!`) permits merge-over, so its victims are removed after. The
-/// package-manager refusal is enforced earlier, at victim computation.
-fn schedule_blockers(solution: &ResolvedSolution, merges: Vec<Task>) -> Vec<Task> {
+/// blocker (`!`) permits merge-over, so its victims are removed after.
+///
+/// Before scheduling a removal, two safety rules apply: the package manager
+/// (`sys-apps/portage`) is never removed, and a victim that is the sole provider
+/// of a `cp` a surviving package still depends on is refused. Either refusal
+/// returns a structured [`MergeOrderError::UnsafeOperation`] rather than emitting
+/// a destructive uninstall.
+fn schedule_blockers(
+    solution: &ResolvedSolution,
+    merges: Vec<Task>,
+) -> Result<Vec<Task>, MergeOrderError> {
     let mut pre: Vec<Task> = Vec::new();
     let mut post: Vec<Task> = Vec::new();
     let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
@@ -110,6 +122,26 @@ fn schedule_blockers(solution: &ResolvedSolution, merges: Vec<Task>) -> Vec<Task
         // Uninstall only the specific installed entries the blocker's atom
         // matches, by version and slot, never the whole cp.
         for victim in &blocker.victims {
+            // Safety: never remove the package manager itself.
+            if victim.cp == PACKAGE_MANAGER {
+                return Err(MergeOrderError::UnsafeOperation(format!(
+                    "blocker {} would uninstall the package manager {}",
+                    blocker.blocker, victim.cp
+                )));
+            }
+            // Safety: refuse to remove the sole provider of a cp a surviving
+            // package in the solution still depends on. A surviving instance of
+            // the same cp (another slot kept in the solution) makes the removal
+            // safe; otherwise a dependent would be left unsatisfied.
+            let has_surviving_provider = solution.packages.iter().any(|p| p.cp == victim.cp);
+            let has_dependent = solution.edges.iter().any(|e| e.to == victim.cp);
+            if has_dependent && !has_surviving_provider {
+                return Err(MergeOrderError::UnsafeOperation(format!(
+                    "blocker {} would uninstall {}, the sole provider a surviving package depends on",
+                    blocker.blocker, victim.cp
+                )));
+            }
+
             let key = (
                 victim.cp.clone(),
                 victim.version.as_str().to_owned(),
@@ -140,7 +172,7 @@ fn schedule_blockers(solution: &ResolvedSolution, merges: Vec<Task>) -> Vec<Task
     out.extend(pre);
     out.extend(merges);
     out.extend(post);
-    out
+    Ok(out)
 }
 
 /// The range a stage searches under.
@@ -325,3 +357,85 @@ fn build_task(solution: &ResolvedSolution, cp: &str) -> Task {
 
 // Keep NodeKind referenced for downstream uninstall scheduling.
 const _: NodeKind = NodeKind::Merge;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::solution::{BlockVictim, DepClass, DepEdge, RecordedBlocker, ResolvedPackage, Root};
+    use moraine_version::Version;
+
+    fn pkg(cp: &str, version: &str) -> ResolvedPackage {
+        ResolvedPackage {
+            cp: cp.to_owned(),
+            version: Version::parse(version).unwrap(),
+            slot: "0".to_owned(),
+            subslot: None,
+            use_enabled: Default::default(),
+            slot_bindings: Vec::new(),
+            already_installed: false,
+            subslot_rebuild: false,
+        }
+    }
+
+    #[test]
+    fn refuses_removing_sole_provider_of_a_surviving_dependent() {
+        // cat/m survives and depends on cat/x, but a blocker would remove the
+        // only cat/x. The removal is refused as unsafe.
+        let solution = ResolvedSolution {
+            packages: vec![pkg("cat/m", "1")],
+            edges: vec![DepEdge {
+                from: "cat/m".to_owned(),
+                to: "cat/x".to_owned(),
+                class: DepClass::Rdepend,
+                root: Root::Target,
+                build_time: false,
+                slot_op: false,
+                optional: false,
+            }],
+            blockers: vec![RecordedBlocker {
+                blocker: "cat/other".to_owned(),
+                blocked_atom: "cat/x".to_owned(),
+                strong: false,
+                victims: vec![BlockVictim {
+                    cp: "cat/x".to_owned(),
+                    version: Version::parse("1").unwrap(),
+                    slot: "0".to_owned(),
+                }],
+            }],
+            backtracks: 0,
+            autounmask: Vec::new(),
+        };
+
+        let err = serialize(&solution).expect_err("the unsafe removal is refused");
+        assert!(matches!(err, MergeOrderError::UnsafeOperation(_)));
+    }
+
+    #[test]
+    fn allows_removal_when_no_surviving_dependent() {
+        // No edge points at cat/x, so removing it is safe.
+        let solution = ResolvedSolution {
+            packages: vec![pkg("cat/m", "1")],
+            edges: Vec::new(),
+            blockers: vec![RecordedBlocker {
+                blocker: "cat/m".to_owned(),
+                blocked_atom: "cat/x".to_owned(),
+                strong: true,
+                victims: vec![BlockVictim {
+                    cp: "cat/x".to_owned(),
+                    version: Version::parse("1").unwrap(),
+                    slot: "0".to_owned(),
+                }],
+            }],
+            backtracks: 0,
+            autounmask: Vec::new(),
+        };
+
+        let tasks = serialize(&solution).expect("safe removal scheduled");
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.kind == TaskKind::Uninstall && t.cp == "cat/x"),
+            "cat/x is scheduled for uninstall: {tasks:?}"
+        );
+    }
+}

@@ -145,6 +145,13 @@ pub trait ResolveSource {
     /// The installed packages for `cp`, if any.
     fn installed(&self, cp: &str) -> Vec<InstalledMeta>;
 
+    /// Every installed package across all `cp`s. Used by the installed-package
+    /// blocker scan to read installed packages' blocker atoms. The default is
+    /// empty for sources that do not expose a full installed store.
+    fn installed_all(&self) -> Vec<InstalledMeta> {
+        Vec::new()
+    }
+
     /// Whether any installed package satisfies `cp` at `version` (used to mark
     /// already-installed packages and satisfied edges).
     fn installed_matches(&self, cp: &str, version: &Version, slot: &str) -> bool {

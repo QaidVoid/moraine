@@ -867,3 +867,28 @@ fn newuse_reinstalls_on_use_change() {
     .expect("resolves");
     assert!(!sol.package("cat/a").unwrap().already_installed);
 }
+
+#[test]
+fn installed_package_blocker_blocks_new_install() {
+    // An installed Y declares `!cat/x` in RDEPEND. Installing cat/x while Y
+    // stays installed is an unresolvable blocker.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/y",
+        version: "1",
+        rdepend: "!cat/x",
+        ..Default::default()
+    });
+    f.add(pkg("cat/x", "1"));
+    f.add_installed(installed("cat/y", "1", "0", None, &[]));
+
+    match resolve(&f, &["cat/x"]) {
+        Err(ResolveError::UnresolvableBlocker {
+            blocker, victim, ..
+        }) => {
+            assert_eq!(blocker, "cat/y");
+            assert_eq!(victim, "cat/x");
+        }
+        other => panic!("expected an installed-package blocker, got {other:?}"),
+    }
+}

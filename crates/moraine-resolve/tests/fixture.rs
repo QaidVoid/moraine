@@ -157,6 +157,10 @@ impl ResolveSource for Fixture {
             .cloned()
             .collect()
     }
+
+    fn installed_all(&self) -> Vec<InstalledMeta> {
+        self.installed.clone()
+    }
 }
 
 /// Build an `InstalledMeta` tersely.

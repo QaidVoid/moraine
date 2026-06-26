@@ -61,6 +61,62 @@ impl<'a> RealSource<'a> {
     fn split_cp(cp: &str) -> Option<(&str, &str)> {
         cp.split_once('/')
     }
+
+    /// Convert a vdb record (with its already-resolved `cp`) into an
+    /// [`InstalledMeta`], resolving slot, USE, IUSE, and `:=` bindings.
+    fn record_to_installed(
+        &self,
+        cp: String,
+        record: &moraine_vdb::PackageRecord,
+    ) -> InstalledMeta {
+        let interner = self.vdb.interner();
+        let (slot_sym, subslot_sym) = self.vdb.recorded_slot(record);
+        let slot = interner
+            .resolve(slot_sym)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let subslot = subslot_sym
+            .and_then(|s| interner.resolve(s))
+            .map(|s| s.to_string());
+        let use_enabled = self
+            .vdb
+            .recorded_use(record)
+            .iter()
+            .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
+            .collect();
+        let iuse = record
+            .iuse
+            .iter()
+            .map(|f| f.trim_start_matches(['+', '-']).to_owned())
+            .collect();
+        let slot_bindings = self
+            .vdb
+            .slot_operator_bindings(record)
+            .into_iter()
+            .filter_map(|b| {
+                let c = interner.resolve(b.category)?;
+                let p = interner.resolve(b.package)?;
+                let bslot = b
+                    .slot
+                    .and_then(|s| interner.resolve(s))
+                    .map(|s| s.to_string());
+                let bsub = b
+                    .subslot
+                    .and_then(|s| interner.resolve(s))
+                    .map(|s| s.to_string());
+                Some((format!("{c}/{p}"), bslot.unwrap_or_default(), bsub))
+            })
+            .collect();
+        InstalledMeta {
+            cp,
+            version: record.version.clone(),
+            slot,
+            subslot,
+            use_enabled,
+            iuse,
+            slot_bindings,
+        }
+    }
 }
 
 impl ResolveSource for RealSource<'_> {
@@ -310,58 +366,25 @@ impl ResolveSource for RealSource<'_> {
         let interner = self.vdb.interner();
         let cat_sym = interner.intern(category);
         let pkg_sym = interner.intern(package);
-        let mut out = Vec::new();
-        for record in self.vdb.records() {
-            if record.category != cat_sym || record.package != pkg_sym {
-                continue;
-            }
-            let (slot_sym, subslot_sym) = self.vdb.recorded_slot(record);
-            let slot = interner
-                .resolve(slot_sym)
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let subslot = subslot_sym
-                .and_then(|s| interner.resolve(s))
-                .map(|s| s.to_string());
-            let use_enabled = self
-                .vdb
-                .recorded_use(record)
-                .iter()
-                .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
-                .collect();
-            let iuse = record
-                .iuse
-                .iter()
-                .map(|f| f.trim_start_matches(['+', '-']).to_owned())
-                .collect();
-            let slot_bindings = self
-                .vdb
-                .slot_operator_bindings(record)
-                .into_iter()
-                .filter_map(|b| {
-                    let c = interner.resolve(b.category)?;
-                    let p = interner.resolve(b.package)?;
-                    let bslot = b
-                        .slot
-                        .and_then(|s| interner.resolve(s))
-                        .map(|s| s.to_string());
-                    let bsub = b
-                        .subslot
-                        .and_then(|s| interner.resolve(s))
-                        .map(|s| s.to_string());
-                    Some((format!("{c}/{p}"), bslot.unwrap_or_default(), bsub))
-                })
-                .collect();
-            out.push(InstalledMeta {
-                cp: cp.to_owned(),
-                version: record.version.clone(),
-                slot,
-                subslot,
-                use_enabled,
-                iuse,
-                slot_bindings,
-            });
-        }
-        out
+        self.vdb
+            .records()
+            .iter()
+            .filter(|record| record.category == cat_sym && record.package == pkg_sym)
+            .map(|record| self.record_to_installed(cp.to_owned(), record))
+            .collect()
+    }
+
+    fn installed_all(&self) -> Vec<InstalledMeta> {
+        let interner = self.vdb.interner();
+        self.vdb
+            .records()
+            .iter()
+            .filter_map(|record| {
+                let category = interner.resolve(record.category)?;
+                let package = interner.resolve(record.package)?;
+                let cp = format!("{category}/{package}");
+                Some(self.record_to_installed(cp, record))
+            })
+            .collect()
     }
 }

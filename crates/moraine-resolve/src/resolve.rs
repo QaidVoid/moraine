@@ -213,6 +213,11 @@ fn assemble_solution<S: ResolveSource>(
         }
     }
 
+    // Enforce blockers declared by packages that stay installed against the
+    // newly-merged set: an installed `Y` declaring `!cat/x` blocks installing
+    // cat/x when Y is not itself being removed or replaced.
+    enforce_installed_blockers(source, &packages)?;
+
     edges.sort_by(|a, b| {
         a.from
             .cmp(&b.from)
@@ -251,6 +256,76 @@ fn use_changed<S: ResolveSource>(
         .into_iter()
         .find(|i| i.slot == slot)
         .is_some_and(|inst| &inst.use_enabled != resolved_use)
+}
+
+/// Enforce blockers declared by packages that remain installed against the
+/// newly-merged set.
+///
+/// For each installed package not being replaced at its slot, its RDEPEND and
+/// PDEPEND blocker atoms are matched against the packages being newly installed.
+/// A match (a newly-merged package the installed package blocks, where the
+/// installed package is not itself being removed) is an unresolvable blocker,
+/// mirroring Portage reading installed packages' blocker atoms in
+/// `_validate_blockers`.
+fn enforce_installed_blockers<S: ResolveSource>(
+    source: &S,
+    packages: &[ResolvedPackage],
+) -> Result<(), ResolveError> {
+    for inst in source.installed_all() {
+        // A package being replaced at its own slot no longer governs: its
+        // replacement's blockers are emitted through the normal encoding path.
+        if packages
+            .iter()
+            .any(|p| p.cp == inst.cp && p.slot == inst.slot)
+        {
+            continue;
+        }
+        // The installed package's blocker atoms come from its repository ebuild,
+        // reduced against its recorded USE. Without a repository entry its deps
+        // are unknown, so it contributes no enforceable blocker.
+        let Some(imeta) = source
+            .versions_of(&inst.cp)
+            .into_iter()
+            .find(|m| m.version == inst.version && m.slot == inst.slot)
+        else {
+            continue;
+        };
+        let features = features_for(&imeta.eapi);
+        let mut atoms: Vec<(&NormAtom, bool)> = Vec::new();
+        collect_atoms(&imeta.rdepend, &inst.use_enabled, false, &mut atoms);
+        collect_atoms(&imeta.pdepend, &inst.use_enabled, false, &mut atoms);
+        for (atom, _) in atoms {
+            if atom.blocker == BlockerKind::None {
+                continue;
+            }
+            for p in packages {
+                // Only a genuinely new merge can violate the block; an unchanged
+                // already-installed package coexisted before this run.
+                if p.already_installed || p.cp != atom.cp {
+                    continue;
+                }
+                let slot_ok = atom.slot.as_ref().is_none_or(|s| &p.slot == s);
+                if slot_ok
+                    && version_satisfies(atom, &p.version)
+                    && use_deps_satisfied(
+                        atom,
+                        &p.use_enabled,
+                        &p.use_enabled,
+                        &inst.use_enabled,
+                        features,
+                    )
+                {
+                    return Err(ResolveError::UnresolvableBlocker {
+                        blocker: inst.cp.clone(),
+                        victim: p.cp.clone(),
+                        reason: "an installed package blocks it and is not being removed"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Collect the live atoms of a dependency node against the parent's USE,
