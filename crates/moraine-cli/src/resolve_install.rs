@@ -459,9 +459,24 @@ impl BuildPlanner for CliPlanner<'_> {
         let run_tests = self.ctx.features.iter().any(|f| f == "test")
             && !entry.restrict.iter().any(|r| r == "test");
 
+        // The per-package environment overlay and bashrc selection are keyed by
+        // the package, so build its reference for the config lookup.
+        let version = Version::parse(&entry.version).map_err(|_| InstallError::Realize {
+            cpv: task.cpv.clone(),
+            reason: format!("invalid version `{}`", entry.version),
+        })?;
+        let pref = moraine_atom::PackageRef {
+            category: self.interner.intern(&entry.category),
+            package: self.interner.intern(&entry.package),
+            version: &version,
+            slot: Some(self.interner.intern(&entry.slot)),
+            subslot: entry.subslot.as_deref().map(|s| self.interner.intern(s)),
+            repo: Some(self.interner.intern(&entry.repository)),
+        };
+
         // The eclass search path is per-repository, so it is set on the config
         // for this package rather than in the shared config_env.
-        let mut config = self.config_env();
+        let mut config = self.config_env(&pref);
         config.eclass_locations = self.eclass_locations(&entry.repository);
 
         Ok(BuildRequest {
@@ -527,37 +542,71 @@ impl CliPlanner<'_> {
             subslot: entry.subslot.as_deref().map(|s| self.interner.intern(s)),
             repo: Some(self.interner.intern(&entry.repository)),
         };
+        let restrict_test = entry.restrict.iter().any(|r| r == "test");
         self.config
-            .effective_use(&pref, &entry.iuse, false)
+            .effective_use(&pref, &entry.iuse, false, restrict_test)
             .enabled
             .into_iter()
             .collect()
     }
 
-    /// The build-environment configuration from `make.conf`.
-    fn config_env(&self) -> ConfigEnv {
+    /// The build-environment configuration from `make.conf`, with the per-package
+    /// `package.env` overlay applied: for an incremental variable the overlay
+    /// appends to the global value, for any other variable it replaces it, and
+    /// `FEATURES` is recomputed when the overlay changes it. The package's
+    /// bashrc files are carried through for the phase driver to source.
+    fn config_env(&self, pref: &moraine_atom::PackageRef) -> ConfigEnv {
+        // Apply the per-package overlay onto a copy of the global vars, using the
+        // make.conf merge semantics (append for incrementals, replace otherwise).
+        let overlay = self.config.package_env_overlay(pref);
+        let mut merged = self.ctx.vars.clone();
+        let mut overlay_changes_features = false;
+        for (key, value) in &overlay {
+            if key == "FEATURES" {
+                overlay_changes_features = true;
+            }
+            merged.merge_var(key, value);
+        }
+
         let mut vars = std::collections::BTreeMap::new();
-        for (key, value) in self.ctx.vars.iter() {
+        for (key, value) in merged.iter() {
             vars.insert(key.clone(), value.clone());
         }
-        let mirrors = self
-            .ctx
-            .vars
+        let mirrors = merged
             .get("GENTOO_MIRRORS")
             .unwrap_or_default()
             .split_whitespace()
             .map(str::to_owned)
             .collect();
+        // When the overlay changed FEATURES, recompute the effective features
+        // from the merged value; otherwise reuse the global features.
+        let features = if overlay_changes_features {
+            merged
+                .get("FEATURES")
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect()
+        } else {
+            self.ctx.features.clone()
+        };
+        let bashrc_files = self
+            .config
+            .bashrc_files(pref)
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         let root = self.eroot.to_string_lossy().into_owned();
         ConfigEnv {
             vars,
-            features: self.ctx.features.clone(),
+            features,
             mirrors,
             root: root.clone(),
             sysroot: root,
             eprefix: String::new(),
             config_root: self.eroot.to_string_lossy().into_owned(),
             eclass_locations: Vec::new(),
+            bashrc_files,
         }
     }
 
@@ -862,7 +911,7 @@ fn binary_target(
         subslot: None,
         repo: None,
     };
-    let eu = config.effective_use(&pref, &[], false);
+    let eu = config.effective_use(&pref, &[], false, false);
     let forced_use: BTreeSet<String> = eu.forced.intersection(&eu.enabled).cloned().collect();
     let masked_use: BTreeSet<String> = eu.forced.difference(&eu.enabled).cloned().collect();
     let selected_use = eu.enabled;
@@ -1105,7 +1154,10 @@ fn enrich_plan(
                 subslot: stored.subslot.as_deref().map(|s| interner.intern(s)),
                 repo: Some(interner.intern(&stored.repository)),
             };
-            let forced = config.effective_use(&pref, &stored.iuse, false).forced;
+            let restrict_test = stored.restrict.iter().any(|r| r == "test");
+            let forced = config
+                .effective_use(&pref, &stored.iuse, false, restrict_test)
+                .forced;
             for flag in &mut entry.use_flags {
                 flag.forced = forced.contains(&flag.name);
             }
@@ -1171,8 +1223,9 @@ fn source_size(
         subslot: stored.subslot.as_deref().map(|s| interner.intern(s)),
         repo: Some(interner.intern(&stored.repository)),
     };
+    let restrict_test = stored.restrict.iter().any(|r| r == "test");
     let use_flags: HashSet<String> = config
-        .effective_use(&pref, &stored.iuse, false)
+        .effective_use(&pref, &stored.iuse, false, restrict_test)
         .enabled
         .into_iter()
         .collect();
@@ -1612,5 +1665,94 @@ mod tests {
         let task = InstallTask::merge("dev-libs/absent-1", "dev-libs/absent", "0");
         let err = planner.plan(&task).unwrap_err();
         assert!(matches!(err, InstallError::Realize { .. }));
+    }
+
+    #[test]
+    fn config_env_applies_package_env_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let portage = dir.path().join("etc/portage");
+        std::fs::create_dir_all(portage.join("env")).unwrap();
+        std::fs::write(
+            portage.join("repos.conf"),
+            format!(
+                "[gentoo]\nlocation = {}\n",
+                dir.path().join("repo").display()
+            ),
+        )
+        .unwrap();
+        // package.env sets a per-package CFLAGS (replace) and FEATURES (append).
+        std::fs::write(
+            portage.join("package.env"),
+            "dev-libs/foo lowopt.conf splitfeat.conf\n",
+        )
+        .unwrap();
+        std::fs::write(portage.join("env/lowopt.conf"), "CFLAGS=\"-O1\"\n").unwrap();
+        std::fs::write(
+            portage.join("env/splitfeat.conf"),
+            "FEATURES=\"splitdebug\"\n",
+        )
+        .unwrap();
+
+        let repo_set = discover(portage.join("repos.conf")).unwrap();
+        let interner = Arc::new(Interner::new());
+        let config = resolve_config(
+            &Default::default(),
+            &Default::default(),
+            dir.path(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+            &interner,
+        );
+        let mut vars = moraine_config::makeconf::VarMap::new();
+        vars.set("CFLAGS".to_owned(), "-O2".to_owned());
+        vars.set("FEATURES".to_owned(), "sandbox".to_owned());
+        let ctx = ConfigContext {
+            profile: Default::default(),
+            vars,
+            arch: String::new(),
+            features: vec!["sandbox".to_owned()],
+            config_protect: Vec::new(),
+            config_protect_mask: Vec::new(),
+            system: Vec::new(),
+            selected: Vec::new(),
+            profile_set: Vec::new(),
+            world: Vec::new(),
+            preserved_rebuild: Vec::new(),
+            set_search_dirs: Vec::new(),
+        };
+        let planner = CliPlanner {
+            repo_set: &repo_set,
+            store_dir: dir.path().join("empty-store"),
+            config: &config,
+            ctx: &ctx,
+            eroot: dir.path().to_path_buf(),
+            interner: Arc::clone(&interner),
+            cache: RefCell::new(HashMap::new()),
+            slot_bindings: HashMap::new(),
+        };
+        let version = Version::parse("1.0").unwrap();
+        let pref = moraine_atom::PackageRef {
+            category: interner.intern("dev-libs"),
+            package: interner.intern("foo"),
+            version: &version,
+            slot: Some(interner.intern("0")),
+            subslot: None,
+            repo: Some(interner.intern("gentoo")),
+        };
+        let cfg = planner.config_env(&pref);
+        // CFLAGS is non-incremental, so the overlay replaces the global value.
+        assert_eq!(cfg.vars.get("CFLAGS").map(String::as_str), Some("-O1"));
+        // FEATURES is incremental, so the overlay appends and is recomputed.
+        assert!(cfg.features.iter().any(|f| f == "splitdebug"));
+        assert!(cfg.features.iter().any(|f| f == "sandbox"));
+
+        // A non-matching package keeps the global environment unchanged.
+        let other = moraine_atom::PackageRef {
+            package: interner.intern("bar"),
+            ..pref
+        };
+        let cfg = planner.config_env(&other);
+        assert_eq!(cfg.vars.get("CFLAGS").map(String::as_str), Some("-O2"));
     }
 }

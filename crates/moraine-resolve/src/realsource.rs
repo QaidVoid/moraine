@@ -269,7 +269,14 @@ impl ResolveSource for RealSource<'_> {
                     .iter()
                     .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
                     .collect();
-                let use_set = self.config.effective_use(&pref, &iuse, self.stable).enabled;
+                let restrict_test = entry
+                    .restrict
+                    .iter()
+                    .any(|r| interner.resolve(*r).as_deref() == Some("test"));
+                let use_set = self
+                    .config
+                    .effective_use(&pref, &iuse, self.stable, restrict_test)
+                    .enabled;
                 let reduced = crate::license::reduce_license(&meta.license, &use_set);
                 if !self.config.missing_licenses(&reduced, &pref).is_empty() {
                     return false;
@@ -331,7 +338,14 @@ impl ResolveSource for RealSource<'_> {
                     .iter()
                     .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
                     .collect();
-                let use_set = self.config.effective_use(&pref, &iuse, self.stable).enabled;
+                let restrict_test = entry
+                    .restrict
+                    .iter()
+                    .any(|r| interner.resolve(*r).as_deref() == Some("test"));
+                let use_set = self
+                    .config
+                    .effective_use(&pref, &iuse, self.stable, restrict_test)
+                    .enabled;
                 let reduced = crate::license::reduce_license(&meta.license, &use_set);
                 let missing = self.config.missing_licenses(&reduced, &pref);
                 if !missing.is_empty() {
@@ -373,7 +387,16 @@ impl ResolveSource for RealSource<'_> {
                 .iter()
                 .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
                 .collect();
-            return self.config.effective_use(&pref, &iuse, self.stable).enabled;
+            // FEATURES=test injects `test`, re-disabled when RESTRICT contains
+            // `test`, so the test phase and the USE share one source of truth.
+            let restrict_test = entry
+                .restrict
+                .iter()
+                .any(|r| interner.resolve(*r).as_deref() == Some("test"));
+            return self
+                .config
+                .effective_use(&pref, &iuse, self.stable, restrict_test)
+                .enabled;
         }
         BTreeSet::new()
     }

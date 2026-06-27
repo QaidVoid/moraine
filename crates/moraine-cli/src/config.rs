@@ -294,10 +294,34 @@ impl ConfigContext {
                 env.merge_var(key, value);
             }
         }
+        // The profile fixes PROFILE_ONLY_VARIABLES (for example `ARCH`); a user
+        // `make.conf` or the inherited environment must not override them. The
+        // stacked set is known after make.globals and the profile make.defaults.
+        let profile_only: Vec<String> = env
+            .get("PROFILE_ONLY_VARIABLES")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
         let make_conf = config_dir.join("etc/portage/make.conf");
         if make_conf.exists() {
+            // Capture the profile-fixed values, merge make.conf (so `$VAR`
+            // expansion still sees the profile values), then restore the
+            // profile-only variables, dropping any make.conf override.
+            let saved: Vec<(String, Option<String>)> = profile_only
+                .iter()
+                .map(|key| (key.clone(), env.get(key).map(str::to_owned)))
+                .collect();
             env.merge_path(&make_conf)
                 .map_err(ConfigLoadError::MakeConf)?;
+            for (key, value) in saved {
+                match value {
+                    Some(value) => env.set(key, value),
+                    None => {
+                        env.remove(&key);
+                    }
+                }
+            }
         }
         // The known architecture keywords come from each repository's
         // `profiles/arch.list`, exported as PORTAGE_ARCHLIST.
@@ -724,6 +748,34 @@ mod tests {
         assert_eq!(ctx.members("selected").unwrap(), ctx.selected);
         assert_eq!(ctx.members("world").unwrap(), ctx.world);
         assert!(ctx.members("nope").is_none());
+    }
+
+    #[test]
+    fn make_conf_cannot_override_profile_only_arch() {
+        let dir = tempfile::tempdir().unwrap();
+        // A single-node profile fixes ARCH via PROFILE_ONLY_VARIABLES.
+        let prof = dir.path().join("prof");
+        std::fs::create_dir_all(&prof).unwrap();
+        std::fs::write(prof.join("eapi"), "8\n").unwrap();
+        std::fs::write(
+            prof.join("make.defaults"),
+            "PROFILE_ONLY_VARIABLES=\"ARCH\"\nARCH=\"amd64\"\n",
+        )
+        .unwrap();
+        let portage = dir.path().join("etc/portage");
+        std::fs::create_dir_all(&portage).unwrap();
+        std::os::unix::fs::symlink(&prof, portage.join("make.profile")).unwrap();
+        // make.conf tries to override the profile-fixed ARCH.
+        std::fs::write(portage.join("make.conf"), "ARCH=\"x86\"\n").unwrap();
+        let roots = Roots {
+            root: Some(dir.path().to_path_buf()),
+            config_root: Some(dir.path().to_path_buf()),
+            profile: None,
+        };
+        let ctx = ConfigContext::load(&roots).unwrap();
+        // The profile value wins; the make.conf assignment is dropped.
+        assert_eq!(ctx.vars.get("ARCH"), Some("amd64"));
+        assert_eq!(ctx.arch, "amd64");
     }
 
     #[test]

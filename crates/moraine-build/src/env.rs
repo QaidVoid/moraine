@@ -46,6 +46,12 @@ pub struct ConfigEnv {
     /// the order `inherit` walks them (closest repository first). The
     /// orchestrator fills this from `moraine-repo`'s `eclass_search_path`.
     pub eclass_locations: Vec<String>,
+    /// The bashrc files to source before each non-`depend` phase, in Portage
+    /// order: each profile node's `profile.bashrc`, then the user
+    /// `PORTAGE_BASHRC` (`/etc/portage/bashrc`), then `package.bashrc`-selected
+    /// files. Exported as `PORTAGE_BASHRC` for diagnostics and sourced by the
+    /// phase driver.
+    pub bashrc_files: Vec<String>,
 }
 
 impl ConfigEnv {
@@ -60,6 +66,7 @@ impl ConfigEnv {
             eprefix: String::new(),
             config_root: "/".to_string(),
             eclass_locations: Vec::new(),
+            bashrc_files: Vec::new(),
         }
     }
 
@@ -200,6 +207,13 @@ impl EnvBuilder {
         base.insert(
             "PORTAGE_ECLASS_LOCATIONS".to_string(),
             shell_quote_join(&config.eclass_locations),
+        );
+
+        // The bashrc files sourced before each non-`depend` phase, exported as a
+        // shell-quoted list so the phase driver and any hook can see them.
+        base.insert(
+            "PORTAGE_BASHRC".to_string(),
+            shell_quote_join(&config.bashrc_files),
         );
 
         // Root and prefix variables, EAPI-gated.
@@ -388,6 +402,7 @@ const READONLY_VARS: &[&str] = &[
     "PORTAGE_ECLASS_LOCATIONS",
     "PORTAGE_INTERNAL_CALLER",
     "PORTAGE_CONFIGROOT",
+    "PORTAGE_BASHRC",
 ];
 
 /// Bash-internal variables that must be dropped from a saved environment.

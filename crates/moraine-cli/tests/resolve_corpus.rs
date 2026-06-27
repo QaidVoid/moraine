@@ -94,3 +94,85 @@ fn resolves_an_atom_with_dependencies_from_corpus() {
         );
     }
 }
+
+/// Proves that an extended-wildcard `package.accept_keywords` line and a
+/// `package.env` override take effect when the configuration is loaded against
+/// real corpus profile data. The repository tree and profile come from the
+/// corpus; the `/etc/portage` overrides are written into a temporary config root
+/// layered over it. Skips cleanly when `MORAINE_CORPUS` is unset.
+#[test]
+fn extended_wildcard_acceptance_and_package_env_take_effect() {
+    let Some(corpus) = std::env::var_os("MORAINE_CORPUS").filter(|v| !v.is_empty()) else {
+        eprintln!("MORAINE_CORPUS unset; skipping extended-wildcard corpus harness");
+        return;
+    };
+    let corpus = PathBuf::from(corpus);
+    let make_profile = corpus.join("etc/portage/make.profile");
+    if !corpus.join("etc/portage/repos.conf").exists() || !make_profile.exists() {
+        eprintln!("corpus missing repos.conf or a resolved make.profile; skipping");
+        return;
+    }
+
+    // A temporary config root that layers the wildcard acceptance and per-package
+    // env over the corpus, reusing the corpus profile and repositories.
+    let config_root = tempfile::tempdir().expect("temp config root");
+    let portage = config_root.path().join("etc/portage");
+    std::fs::create_dir_all(portage.join("env")).unwrap();
+    // The corpus make.profile and repos.conf are symlinked so the real profile
+    // stack and repositories resolve. repos.conf may be a single file or a
+    // repos.conf.d directory, and a symlink handles both.
+    std::os::unix::fs::symlink(&make_profile, portage.join("make.profile")).unwrap();
+    std::os::unix::fs::symlink(
+        corpus.join("etc/portage/repos.conf"),
+        portage.join("repos.conf"),
+    )
+    .unwrap();
+    std::fs::write(portage.join("package.accept_keywords"), "*/* ~amd64\n").unwrap();
+    std::fs::write(portage.join("package.env"), "*/* lowopt.conf\n").unwrap();
+    std::fs::write(portage.join("env/lowopt.conf"), "CFLAGS=\"-O1\"\n").unwrap();
+
+    let interner = Arc::new(Interner::new());
+    let roots = Roots {
+        root: Some(corpus.clone()),
+        config_root: Some(config_root.path().to_path_buf()),
+        profile: None,
+    };
+    let ctx = ConfigContext::load(&roots).expect("corpus config loads");
+    let repo_set = discover(portage.join("repos.conf")).expect("discover repositories");
+    let repo_masks = moraine_cli::config::repo_mask_inputs(&repo_set);
+    let config = resolve_config(
+        &ctx.profile,
+        &ctx.vars,
+        config_root.path(),
+        &repo_masks,
+        ctx.system.clone(),
+        ctx.world.clone(),
+        &interner,
+    );
+
+    // The `*/*` lines match any candidate, so an arbitrary package reference
+    // built against the shared interner exercises both overrides.
+    let version = moraine_version::Version::parse("1.0").unwrap();
+    let pref = moraine_atom::PackageRef {
+        category: interner.intern("dev-libs"),
+        package: interner.intern("anything"),
+        version: &version,
+        slot: Some(interner.intern("0")),
+        subslot: None,
+        repo: None,
+    };
+
+    // The extended-wildcard accept_keywords line grants the testing keyword.
+    let extra = config.package_keywords(&pref);
+    assert!(
+        extra.iter().any(|k| k == "~amd64"),
+        "`*/* ~amd64` should grant ~amd64 to every candidate, got {extra:?}"
+    );
+
+    // The extended-wildcard package.env line supplies the per-package CFLAGS.
+    let overlay = config.package_env_overlay(&pref);
+    assert!(
+        overlay.contains(&("CFLAGS".to_owned(), "-O1".to_owned())),
+        "`*/* lowopt.conf` should set CFLAGS=-O1, got {overlay:?}"
+    );
+}

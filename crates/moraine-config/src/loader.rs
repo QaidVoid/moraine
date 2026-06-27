@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use moraine_atom::Atom;
 use moraine_common::Interner;
@@ -23,9 +24,9 @@ use crate::keywords::KeywordsManager;
 use crate::license::LicenseManager;
 use crate::makeconf::VarMap;
 use crate::profile::ProfileStack;
-use crate::snapshot::ResolvedConfig;
-use crate::use_resolution::{PkgUseEntry, UseManager, global_use, iuse_effective};
-use crate::visibility::{MaskBuilder, ProvidedManager, parse_mask_pattern};
+use crate::snapshot::{PkgBashrcEntry, PkgEnvEntry, ResolvedConfig};
+use crate::use_resolution::{PkgUseEntry, UseLayer, UseManager, global_use, iuse_effective};
+use crate::visibility::{MaskBuilder, MaskPattern, ProvidedManager, parse_mask_pattern};
 
 /// A repository's masking input: its name (for `::repo` scoping), its default
 /// profile EAPI (for parsing its mask atoms), and the ordered `profiles`
@@ -58,10 +59,11 @@ pub fn resolve_config(
     repo_masks: &[RepoMaskInput],
     system: Vec<String>,
     world: Vec<String>,
-    interner: &Interner,
+    interner: &Arc<Interner>,
 ) -> ResolvedConfig {
     let arch = env.get("ARCH").unwrap_or_default().to_owned();
     let global = global_use(env);
+    let features_test = features_contains(env, "test");
 
     // USE masking/forcing fold across the profile stack.
     let mut use_mask = StackSet::default();
@@ -81,25 +83,34 @@ pub fn resolve_config(
         .with_mask(use_mask.into_sorted())
         .with_force(use_force.into_sorted())
         .with_stable_mask(use_stable_mask.into_sorted(), true)
+        .with_features_test(features_test)
         .with_iuse_effective(iuse_effective(env));
 
-    // package.use across the profile stack then /etc/portage.
+    // Repository-level USE configuration from each repository's `profiles/`
+    // root, applied beneath the profile cascade and scoped to candidates from
+    // the owning repository (its flag stack already folds in its masters).
+    load_repo_use_config(&mut use_manager, repo_masks, interner);
+
+    // package.use across the profile stack (profile layer) then /etc/portage
+    // (user layer), kept as distinct ordered layers so a user entry overrides a
+    // more specific profile entry.
     for node in &profile.nodes {
         for line in read_lines(&node.path.join("package.use")) {
             if let Some(entry) = parse_pkg_use(&line, interner) {
-                use_manager.add_pkg_use(entry);
+                use_manager.add_pkg_use(entry, UseLayer::Profile);
             }
         }
     }
     for line in read_lines(&config_root.join("etc/portage/package.use")) {
         if let Some(entry) = parse_pkg_use(&line, interner) {
-            use_manager.add_pkg_use(entry);
+            use_manager.add_pkg_use(entry, UseLayer::User);
         }
     }
 
-    // Per-package USE masking and forcing across the profile stack then
-    // /etc/portage. Each file shares the `atom flag -flag` syntax of package.use.
-    type AddFn = fn(&mut UseManager, PkgUseEntry);
+    // Per-package USE masking and forcing across the profile stack (profile
+    // layer) then /etc/portage (user layer). Each file shares the
+    // `atom flag -flag` syntax of package.use.
+    type AddFn = fn(&mut UseManager, PkgUseEntry, UseLayer);
     let pkg_use_files: [(&str, AddFn); 4] = [
         ("package.use.mask", UseManager::add_pkg_mask),
         ("package.use.force", UseManager::add_pkg_force),
@@ -110,13 +121,13 @@ pub fn resolve_config(
         for node in &profile.nodes {
             for line in read_lines(&node.path.join(name)) {
                 if let Some(entry) = parse_pkg_use(&line, interner) {
-                    add(&mut use_manager, entry);
+                    add(&mut use_manager, entry, UseLayer::Profile);
                 }
             }
         }
         for line in read_lines(&config_root.join("etc/portage").join(name)) {
             if let Some(entry) = parse_pkg_use(&line, interner) {
-                add(&mut use_manager, entry);
+                add(&mut use_manager, entry, UseLayer::User);
             }
         }
     }
@@ -228,17 +239,19 @@ pub fn resolve_config(
         accept_license = vec!["*".to_owned(), "-@EULA".to_owned()];
     }
 
-    let mut pkg_license: Vec<(Atom, Vec<String>)> = Vec::new();
+    let mut pkg_license: Vec<(MaskPattern, Vec<String>)> = Vec::new();
     for node in &profile.nodes {
         read_pkg_license(
             &node.path.join("package.license"),
             interner,
+            features_for(&node.eapi),
             &mut pkg_license,
         );
     }
     read_pkg_license(
         &config_root.join("etc/portage/package.license"),
         interner,
+        PERMISSIVE,
         &mut pkg_license,
     );
 
@@ -249,20 +262,27 @@ pub fn resolve_config(
     // user `package.keywords`) grant per-package acceptance.
     let mut keywords_manager = KeywordsManager::new();
     for node in &profile.nodes {
-        for (atom, tokens) in read_pkg_keyword_file(&node.path.join("package.keywords"), interner) {
-            keywords_manager.add_profile_keywords(atom, tokens);
-        }
-        for (atom, tokens) in
-            read_pkg_keyword_file(&node.path.join("package.accept_keywords"), interner)
+        let features = features_for(&node.eapi);
+        for (pattern, tokens) in
+            read_pkg_keyword_file(&node.path.join("package.keywords"), interner, features)
         {
-            keywords_manager.add_pkeywords(atom, tokens);
+            keywords_manager.add_profile_keywords(pattern, tokens);
+        }
+        for (pattern, tokens) in read_pkg_keyword_file(
+            &node.path.join("package.accept_keywords"),
+            interner,
+            features,
+        ) {
+            keywords_manager.add_pkeywords(pattern, tokens);
         }
     }
     for name in ["package.accept_keywords", "package.keywords"] {
-        for (atom, tokens) in
-            read_pkg_keyword_file(&config_root.join("etc/portage").join(name), interner)
-        {
-            keywords_manager.add_pkeywords(atom, tokens);
+        for (pattern, tokens) in read_pkg_keyword_file(
+            &config_root.join("etc/portage").join(name),
+            interner,
+            PERMISSIVE,
+        ) {
+            keywords_manager.add_pkeywords(pattern, tokens);
         }
     }
 
@@ -276,6 +296,13 @@ pub fn resolve_config(
         accepted.insert(arch.clone());
     }
 
+    // Per-package environment overlay (`package.env` + `/etc/portage/env/`) and
+    // the bashrc sourcing inputs (`profile.bashrc`, `PORTAGE_BASHRC`,
+    // `package.bashrc`).
+    let pkg_env = load_pkg_env(config_root, interner);
+    let (profile_bashrcs, user_bashrc, package_bashrc) =
+        load_bashrcs(profile, config_root, interner);
+
     ResolvedConfig::new(
         profile.clone(),
         arch,
@@ -287,20 +314,28 @@ pub fn resolve_config(
         provided,
         system,
         world,
+        Arc::clone(interner),
     )
+    .with_pkg_env(pkg_env)
+    .with_bashrcs(profile_bashrcs, user_bashrc, package_bashrc)
 }
 
 /// Read a per-package keyword file (`package.keywords` /
-/// `package.accept_keywords`): each line is `atom keyword1 keyword2 ...`, where
-/// a bare atom with no keyword yields an empty token list.
-fn read_pkg_keyword_file(path: &Path, interner: &Interner) -> Vec<(Atom, Vec<String>)> {
+/// `package.accept_keywords`): each line is `cp keyword1 keyword2 ...`, where the
+/// left token is a concrete atom or an extended cp wildcard, and a bare entry
+/// with no keyword yields an empty token list.
+fn read_pkg_keyword_file(
+    path: &Path,
+    interner: &Interner,
+    features: EapiFeatures,
+) -> Vec<(MaskPattern, Vec<String>)> {
     let mut out = Vec::new();
     for line in read_lines(path) {
         let mut parts = line.split_whitespace();
         if let Some(atom_text) = parts.next()
-            && let Some(atom) = parse_atom(atom_text, interner)
+            && let Some(pattern) = parse_mask_pattern(atom_text, interner, features)
         {
-            out.push((atom, parts.map(str::to_owned).collect()));
+            out.push((pattern, parts.map(str::to_owned).collect()));
         }
     }
     out
@@ -322,14 +357,20 @@ fn read_license_groups(path: &Path, groups: &mut BTreeMap<String, Vec<String>>) 
     }
 }
 
-/// Read a `package.license` file: each line is `atom token1 token2 ...`.
-fn read_pkg_license(path: &Path, interner: &Interner, out: &mut Vec<(Atom, Vec<String>)>) {
+/// Read a `package.license` file: each line is `cp token1 token2 ...`, where the
+/// left token is a concrete atom or an extended cp wildcard.
+fn read_pkg_license(
+    path: &Path,
+    interner: &Interner,
+    features: EapiFeatures,
+    out: &mut Vec<(MaskPattern, Vec<String>)>,
+) {
     for line in read_lines(path) {
         let mut parts = line.split_whitespace();
         if let Some(atom_text) = parts.next()
-            && let Some(atom) = parse_atom(atom_text, interner)
+            && let Some(pattern) = parse_mask_pattern(atom_text, interner, features)
         {
-            out.push((atom, parts.map(str::to_owned).collect()));
+            out.push((pattern, parts.map(str::to_owned).collect()));
         }
     }
 }
@@ -475,6 +516,162 @@ fn parse_atom(text: &str, interner: &Interner) -> Option<Atom> {
     Atom::parse(text, PERMISSIVE, interner).ok()
 }
 
+/// Whether the incremental `FEATURES` variable enables `name`, honoring a later
+/// `-name` negation (the final occurrence wins).
+fn features_contains(env: &VarMap, name: &str) -> bool {
+    let mut on = false;
+    for token in env.get("FEATURES").unwrap_or_default().split_whitespace() {
+        if token == name {
+            on = true;
+        } else if token.strip_prefix('-') == Some(name) {
+            on = false;
+        }
+    }
+    on
+}
+
+/// Incrementally stack a flag file (`use.mask` / `use.force` / ...) across
+/// `dirs` (masters first), where a `-flag` removes a prior entry.
+fn stack_flag_files(dirs: &[PathBuf], filename: &str) -> Vec<String> {
+    let mut set = StackSet::default();
+    for dir in dirs {
+        set.apply(&read_flag_file(&dir.join(filename)));
+    }
+    set.into_sorted()
+}
+
+/// Read each repository's top-level `profiles/` USE configuration into the USE
+/// manager, scoped to candidates from the owning repository (the flag stack over
+/// `profiles_dirs` already folds in the masters), mirroring
+/// `UseManager._parse_repository_files_*`.
+fn load_repo_use_config(
+    use_manager: &mut UseManager,
+    repo_masks: &[RepoMaskInput],
+    interner: &Interner,
+) {
+    for repo in repo_masks {
+        let repo_sym = interner.intern(&repo.name);
+        let dirs = &repo.profiles_dirs;
+
+        let mask = stack_flag_files(dirs, "use.mask");
+        if !mask.is_empty() {
+            use_manager.add_repo_use_mask(repo_sym, mask);
+        }
+        let force = stack_flag_files(dirs, "use.force");
+        if !force.is_empty() {
+            use_manager.add_repo_use_force(repo_sym, force);
+        }
+        let stable_mask = stack_flag_files(dirs, "use.stable.mask");
+        if !stable_mask.is_empty() {
+            use_manager.add_repo_use_stable_mask(repo_sym, stable_mask);
+        }
+
+        type RepoAddFn = fn(&mut UseManager, moraine_common::Symbol, PkgUseEntry);
+        let pkg_files: [(&str, RepoAddFn); 5] = [
+            ("package.use", UseManager::add_repo_pkg_use),
+            ("package.use.mask", UseManager::add_repo_pkg_mask),
+            ("package.use.force", UseManager::add_repo_pkg_force),
+            (
+                "package.use.stable.mask",
+                UseManager::add_repo_pkg_stable_mask,
+            ),
+            (
+                "package.use.stable.force",
+                UseManager::add_repo_pkg_stable_force,
+            ),
+        ];
+        for (name, add) in pkg_files {
+            for dir in dirs {
+                for line in read_lines(&dir.join(name)) {
+                    if let Some(entry) = parse_pkg_use(&line, interner) {
+                        add(use_manager, repo_sym, entry);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read `/etc/portage/package.env` into per-package environment overlays. Each
+/// line maps a cp pattern to one or more env-file names under
+/// `/etc/portage/env/`; each referenced file is parsed into ordered variable
+/// assignments. A missing env file contributes no overlay, mirroring
+/// `config._grab_pkg_env`.
+fn load_pkg_env(config_root: &Path, interner: &Interner) -> Vec<PkgEnvEntry> {
+    let env_dir = config_root.join("etc/portage/env");
+    let mut out = Vec::new();
+    for line in read_lines(&config_root.join("etc/portage/package.env")) {
+        let mut parts = line.split_whitespace();
+        let Some(atom_text) = parts.next() else {
+            continue;
+        };
+        let Some(pattern) = parse_mask_pattern(atom_text, interner, PERMISSIVE) else {
+            continue;
+        };
+        let mut vars: Vec<(String, String)> = Vec::new();
+        for file in parts {
+            let path = env_dir.join(file);
+            if !path.is_file() {
+                // A missing env file leaves no overlay rather than failing.
+                continue;
+            }
+            let mut map = VarMap::new();
+            if map.merge_path(&path).is_ok() {
+                for (key, value) in map.iter() {
+                    vars.push((key.clone(), value.clone()));
+                }
+            }
+        }
+        if !vars.is_empty() {
+            out.push(PkgEnvEntry { pattern, vars });
+        }
+    }
+    out
+}
+
+/// Read the bashrc sourcing inputs: each profile node's `profile.bashrc` (in
+/// stack order), the user `PORTAGE_BASHRC` (`/etc/portage/bashrc`), and the
+/// `package.bashrc`-selected files from profiles declaring the `profile-bashrcs`
+/// format, mirroring `config`'s `_profile_bashrc` / `_pbashrcdict`.
+fn load_bashrcs(
+    profile: &ProfileStack,
+    config_root: &Path,
+    interner: &Interner,
+) -> (Vec<PathBuf>, Option<PathBuf>, Vec<PkgBashrcEntry>) {
+    let mut profile_bashrcs = Vec::new();
+    let mut package_bashrc = Vec::new();
+    for node in &profile.nodes {
+        let pb = node.path.join("profile.bashrc");
+        if pb.is_file() {
+            profile_bashrcs.push(pb);
+        }
+        // package.bashrc is only honored from profiles declaring the
+        // `profile-bashrcs` format.
+        if !node.formats.iter().any(|f| f == "profile-bashrcs") {
+            continue;
+        }
+        let features = features_for(&node.eapi);
+        for line in read_lines(&node.path.join("package.bashrc")) {
+            let mut parts = line.split_whitespace();
+            let Some(atom_text) = parts.next() else {
+                continue;
+            };
+            let Some(pattern) = parse_mask_pattern(atom_text, interner, features) else {
+                continue;
+            };
+            let files: Vec<PathBuf> = parts
+                .map(|name| node.path.join("bashrc").join(name))
+                .collect();
+            if !files.is_empty() {
+                package_bashrc.push(PkgBashrcEntry { pattern, files });
+            }
+        }
+    }
+    let user = config_root.join("etc/portage/bashrc");
+    let user_bashrc = user.is_file().then_some(user);
+    (profile_bashrcs, user_bashrc, package_bashrc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,11 +683,16 @@ mod tests {
     }
 
     fn profile_with_eapi(dir: &Path, eapi: &str) -> ProfileStack {
+        profile_with_formats(dir, eapi, Vec::new())
+    }
+
+    fn profile_with_formats(dir: &Path, eapi: &str, formats: Vec<String>) -> ProfileStack {
         ProfileStack {
             nodes: vec![crate::profile::ProfileNode {
                 path: dir.to_path_buf(),
                 eapi: eapi.to_owned(),
                 is_user: false,
+                formats,
             }],
         }
     }
@@ -506,11 +708,188 @@ mod tests {
         }
     }
 
+    fn pref_in<'a>(
+        interner: &Interner,
+        cat: &str,
+        pkg: &str,
+        version: &'a Version,
+        repo: &str,
+    ) -> PackageRef<'a> {
+        PackageRef {
+            category: interner.intern(cat),
+            package: interner.intern(pkg),
+            version,
+            slot: None,
+            subslot: None,
+            repo: Some(interner.intern(repo)),
+        }
+    }
+
+    #[test]
+    fn repo_package_use_mask_scoped_to_owning_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("repo/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        // A repository profiles-root package.use.mask masks `doc` for textual.
+        std::fs::write(
+            profiles.join("package.use.mask"),
+            "dev-python/textual doc\n",
+        )
+        .unwrap();
+        let mut env = VarMap::new();
+        env.set("USE".to_owned(), "doc".to_owned());
+        let interner = Arc::new(Interner::new());
+        let repo_masks = vec![RepoMaskInput {
+            name: "gentoo".to_owned(),
+            eapi: Some("8".to_owned()),
+            profiles_dirs: vec![profiles],
+        }];
+        let cfg = resolve_config(
+            &ProfileStack::default(),
+            &env,
+            dir.path(),
+            &repo_masks,
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("1.0").unwrap();
+        // A candidate from the owning repository has `doc` masked.
+        let from_gentoo = pref_in(&interner, "dev-python", "textual", &version, "gentoo");
+        assert!(
+            !cfg.effective_use(&from_gentoo, &[], false, false)
+                .enabled
+                .contains("doc")
+        );
+        // The same cp from another repository keeps `doc`.
+        let from_overlay = pref_in(&interner, "dev-python", "textual", &version, "overlay");
+        assert!(
+            cfg.effective_use(&from_overlay, &[], false, false)
+                .enabled
+                .contains("doc")
+        );
+    }
+
+    #[test]
+    fn package_env_overlay_is_exposed() {
+        let dir = tempfile::tempdir().unwrap();
+        let portage = dir.path().join("etc/portage");
+        std::fs::create_dir_all(portage.join("env")).unwrap();
+        std::fs::write(portage.join("package.env"), "dev-libs/foo lowopt.conf\n").unwrap();
+        std::fs::write(portage.join("env/lowopt.conf"), "CFLAGS=\"-O1\"\n").unwrap();
+        let interner = Arc::new(Interner::new());
+        let cfg = resolve_config(
+            &ProfileStack::default(),
+            &VarMap::new(),
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("1.0").unwrap();
+        let overlay = cfg.package_env_overlay(&pref(&interner, "dev-libs", "foo", &version));
+        assert!(overlay.contains(&("CFLAGS".to_owned(), "-O1".to_owned())));
+        // A non-matching package gets no overlay.
+        assert!(
+            cfg.package_env_overlay(&pref(&interner, "dev-libs", "bar", &version))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_env_file_leaves_no_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let portage = dir.path().join("etc/portage");
+        std::fs::create_dir_all(&portage).unwrap();
+        // The referenced env file does not exist under env/.
+        std::fs::write(portage.join("package.env"), "dev-libs/foo absent.conf\n").unwrap();
+        let interner = Arc::new(Interner::new());
+        let cfg = resolve_config(
+            &ProfileStack::default(),
+            &VarMap::new(),
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("1.0").unwrap();
+        assert!(
+            cfg.package_env_overlay(&pref(&interner, "dev-libs", "foo", &version))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn profile_bashrc_collected_for_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("profile.bashrc"), "true\n").unwrap();
+        let interner = Arc::new(Interner::new());
+        let cfg = resolve_config(
+            &profile_with(dir.path()),
+            &VarMap::new(),
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("1.0").unwrap();
+        let files = cfg.bashrc_files(&pref(&interner, "dev-libs", "foo", &version));
+        assert!(files.iter().any(|p| p.ends_with("profile.bashrc")));
+    }
+
+    #[test]
+    fn package_bashrc_gated_on_profile_bashrcs_format() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bashrc")).unwrap();
+        std::fs::write(dir.path().join("package.bashrc"), "dev-libs/foo hook.sh\n").unwrap();
+        std::fs::write(dir.path().join("bashrc/hook.sh"), "true\n").unwrap();
+        let interner = Arc::new(Interner::new());
+        let version = Version::parse("1.0").unwrap();
+        let foo = pref(&interner, "dev-libs", "foo", &version);
+
+        // Without the profile-bashrcs format, package.bashrc is not sourced.
+        let plain = resolve_config(
+            &profile_with_formats(dir.path(), "8", Vec::new()),
+            &VarMap::new(),
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        assert!(
+            !plain
+                .bashrc_files(&foo)
+                .iter()
+                .any(|p| p.ends_with("hook.sh"))
+        );
+
+        // With the format declared, the selected file is included.
+        let gated = resolve_config(
+            &profile_with_formats(dir.path(), "8", vec!["profile-bashrcs".to_owned()]),
+            &VarMap::new(),
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        assert!(
+            gated
+                .bashrc_files(&foo)
+                .iter()
+                .any(|p| p.ends_with("hook.sh"))
+        );
+    }
+
     #[test]
     fn mask_and_unmask_layer() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.mask"), "dev-libs/broken\n").unwrap();
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         let cfg = resolve_config(
             &profile_with(dir.path()),
             &VarMap::new(),
@@ -535,7 +914,7 @@ mod tests {
             "dev-libs/x\n",
         )
         .unwrap();
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         let cfg = resolve_config(
             &profile_with(dir.path()),
             &VarMap::new(),
@@ -555,7 +934,7 @@ mod tests {
         let profiles = dir.path().join("repo/profiles");
         std::fs::create_dir_all(&profiles).unwrap();
         std::fs::write(profiles.join("package.mask"), "dev-libs/foo\n").unwrap();
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         let repo_masks = vec![RepoMaskInput {
             name: "gentoo".to_owned(),
             eapi: Some("8".to_owned()),
@@ -596,7 +975,7 @@ mod tests {
         std::fs::create_dir_all(&profiles).unwrap();
         // license_groups lives at the repository profiles root.
         std::fs::write(profiles.join("license_groups"), "EULA skype-eula\n").unwrap();
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         let repo_masks = vec![RepoMaskInput {
             name: "gentoo".to_owned(),
             eapi: Some("8".to_owned()),
@@ -636,7 +1015,7 @@ mod tests {
         .unwrap();
         let mut env = VarMap::new();
         env.set("ARCH".to_owned(), "amd64".to_owned());
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         let cfg = resolve_config(
             &ProfileStack::default(),
             &env,
@@ -671,7 +1050,7 @@ mod tests {
         std::fs::create_dir_all(&pkguse).unwrap();
         std::fs::write(pkguse.join("active"), "dev-libs/openssl ssl\n").unwrap();
         std::fs::write(pkguse.join("._mrg0000_active"), "dev-libs/openssl -ssl\n").unwrap();
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         let cfg = resolve_config(
             &ProfileStack::default(),
             &VarMap::new(),
@@ -686,6 +1065,7 @@ mod tests {
             &pref(&interner, "dev-libs", "openssl", &version),
             &[],
             false,
+            false,
         );
         // The active file enables ssl; the dotfile's `-ssl` is ignored.
         assert!(eff.enabled.contains("ssl"));
@@ -695,7 +1075,7 @@ mod tests {
     fn package_use_enables_flag() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.use"), "dev-libs/openssl ssl\n").unwrap();
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         let cfg = resolve_config(
             &profile_with(dir.path()),
             &VarMap::new(),
@@ -710,6 +1090,7 @@ mod tests {
             &pref(&interner, "dev-libs", "openssl", &version),
             &[],
             false,
+            false,
         );
         assert!(eff.enabled.contains("ssl"));
     }
@@ -722,7 +1103,7 @@ mod tests {
             "sys-kernel/gentoo-sources-6.6\n",
         )
         .unwrap();
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         // `package.provided` is honored in pre-7 EAPI profiles.
         let cfg = resolve_config(
             &profile_with_eapi(dir.path(), "6"),
@@ -745,7 +1126,7 @@ mod tests {
             "sys-kernel/gentoo-sources-6.6\n",
         )
         .unwrap();
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         let cfg = resolve_config(
             &profile_with_eapi(dir.path(), "7"),
             &VarMap::new(),
@@ -763,7 +1144,7 @@ mod tests {
     fn use_stable_mask_gated_by_eapi() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("use.stable.mask"), "exp\n").unwrap();
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         let version = Version::parse("1.0").unwrap();
 
         // EAPI 4 node: use.stable.mask is ignored, so a stable build keeps `exp`.
@@ -780,6 +1161,7 @@ mod tests {
             &pref(&interner, "a", "b", &version),
             &["+exp".to_owned()],
             true,
+            false,
         );
         assert!(eff.enabled.contains("exp"));
 
@@ -797,6 +1179,7 @@ mod tests {
             &pref(&interner, "a", "b", &version),
             &["+exp".to_owned()],
             true,
+            false,
         );
         assert!(!eff.enabled.contains("exp"));
     }
@@ -806,7 +1189,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut env = VarMap::new();
         env.set("ARCH".to_owned(), "amd64".to_owned());
-        let interner = Interner::new();
+        let interner = Arc::new(Interner::new());
         let cfg = resolve_config(
             &profile_with(dir.path()),
             &env,

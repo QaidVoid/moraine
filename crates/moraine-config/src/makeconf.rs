@@ -37,6 +37,11 @@ impl VarMap {
         self.vars.insert(key.into(), value.into());
     }
 
+    /// Remove a variable, returning its previous value if it was set.
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        self.vars.remove(key)
+    }
+
     /// Merge a single assignment, stacking incremental variables onto the current
     /// value and replacing non-incremental ones, as parsing a line would.
     pub fn merge_var(&mut self, key: &str, value: &str) {
@@ -102,6 +107,7 @@ impl VarMap {
             "ACCEPT_LICENSE",
             "ACCEPT_PROPERTIES",
             "ACCEPT_RESTRICT",
+            "PROFILE_ONLY_VARIABLES",
             "ENV_UNSET",
         ];
         CORE.contains(&key)

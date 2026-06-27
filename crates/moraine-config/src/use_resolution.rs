@@ -1,9 +1,10 @@
 //! Effective USE computation: USE_EXPAND flattening, masking and forcing,
 //! `package.use` overrides, and `IUSE_EFFECTIVE` derivation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use moraine_atom::{Atom, PackageRef};
+use moraine_common::Symbol;
 
 use crate::makeconf::VarMap;
 use crate::stacking::stack_layers_signed;
@@ -85,19 +86,49 @@ pub fn use_expand_groups(env: &VarMap) -> Vec<UseExpandGroup> {
     groups
 }
 
-/// Derive `IUSE_EFFECTIVE` for EAPI 5+ from `IUSE_IMPLICIT` and the implicit
-/// USE_EXPAND values.
+/// The full valid-value set for a USE_EXPAND_IMPLICIT variable, read from its
+/// profile-stacked `USE_EXPAND_VALUES_<VAR>` set (`config.py:2337,2344`). When
+/// that set is unset the loader's `PORTAGE_ARCHLIST` is used for `ARCH`, and as a
+/// last resort the variable's own current value, so a single configured value
+/// still contributes.
+fn use_expand_values<'a>(env: &'a VarMap, var: &str) -> Vec<&'a str> {
+    let key = format!("USE_EXPAND_VALUES_{var}");
+    let direct = tokens(env, &key);
+    if !direct.is_empty() {
+        return direct;
+    }
+    if var == "ARCH" {
+        let archlist = tokens(env, "PORTAGE_ARCHLIST");
+        if !archlist.is_empty() {
+            return archlist;
+        }
+    }
+    tokens(env, var)
+}
+
+/// Derive `IUSE_EFFECTIVE` for EAPI 5+ from `IUSE_IMPLICIT` and, for each
+/// USE_EXPAND_IMPLICIT variable, every value in its `USE_EXPAND_VALUES_*` set, so
+/// implicit flags for all valid values (not only the selected one) are
+/// recognized as valid, mirroring `config._calc_iuse_effective`.
 pub fn iuse_effective(env: &VarMap) -> BTreeSet<String> {
     let mut out: BTreeSet<String> = tokens(env, "IUSE_IMPLICIT")
         .into_iter()
         .map(str::to_owned)
         .collect();
-    let unprefixed: BTreeSet<&str> = tokens(env, "USE_EXPAND_UNPREFIXED").into_iter().collect();
-    for var in tokens(env, "USE_EXPAND_IMPLICIT") {
-        for value in tokens(env, var) {
-            if unprefixed.contains(var) {
+    let implicit: BTreeSet<&str> = tokens(env, "USE_EXPAND_IMPLICIT").into_iter().collect();
+    // Unprefixed implicit variables (at least ARCH) contribute bare values.
+    for var in tokens(env, "USE_EXPAND_UNPREFIXED") {
+        if implicit.contains(var) {
+            for value in use_expand_values(env, var) {
                 out.insert(value.to_owned());
-            } else {
+            }
+        }
+    }
+    // Prefixed implicit variables contribute `var_value` flags.
+    let use_expand: BTreeSet<&str> = tokens(env, "USE_EXPAND").into_iter().collect();
+    for var in &implicit {
+        if use_expand.contains(var) {
+            for value in use_expand_values(env, var) {
                 out.insert(format!("{}_{}", var.to_lowercase(), value));
             }
         }
@@ -145,6 +176,45 @@ pub struct PkgUseEntry {
     pub mods: Vec<(String, bool)>,
 }
 
+/// Which configuration layer a per-package entry comes from. The profile layer
+/// is always applied before the user (`/etc/portage`) layer, regardless of
+/// cross-layer specificity, mirroring Portage's `defaults` then `pkg` config
+/// layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UseLayer {
+    /// A profile-node entry (applied first).
+    Profile,
+    /// A user `/etc/portage` entry (applied last).
+    User,
+}
+
+/// Per-package entries split into a profile layer and a user layer, each ordered
+/// by atom specificity within itself. The profile layer is applied before the
+/// user layer so a less specific user entry still overrides a more specific
+/// profile entry.
+#[derive(Debug, Clone, Default)]
+struct LayeredPkgEntries {
+    profile: Vec<PkgUseEntry>,
+    user: Vec<PkgUseEntry>,
+}
+
+impl LayeredPkgEntries {
+    fn add(&mut self, entry: PkgUseEntry, layer: UseLayer) {
+        let bucket = match layer {
+            UseLayer::Profile => &mut self.profile,
+            UseLayer::User => &mut self.user,
+        };
+        bucket.push(entry);
+        bucket.sort_by_key(|e| specificity(&e.atom));
+    }
+
+    /// The entries to apply, profile layer first (specificity-ordered), then the
+    /// user layer (specificity-ordered).
+    fn applied(&self) -> impl Iterator<Item = &PkgUseEntry> {
+        self.profile.iter().chain(self.user.iter())
+    }
+}
+
 /// Resolves effective USE per package from the global set, `package.use`
 /// entries, and USE masking and forcing.
 #[derive(Debug, Clone, Default)]
@@ -156,11 +226,23 @@ pub struct UseManager {
     force: BTreeSet<String>,
     stable_mask: BTreeSet<String>,
     stable_masks_enabled: bool,
-    pkg_use: Vec<PkgUseEntry>,
-    pkg_mask: Vec<PkgUseEntry>,
-    pkg_force: Vec<PkgUseEntry>,
-    pkg_stable_mask: Vec<PkgUseEntry>,
-    pkg_stable_force: Vec<PkgUseEntry>,
+    features_test: bool,
+    pkg_use: LayeredPkgEntries,
+    pkg_mask: LayeredPkgEntries,
+    pkg_force: LayeredPkgEntries,
+    pkg_stable_mask: LayeredPkgEntries,
+    pkg_stable_force: LayeredPkgEntries,
+    // Repository-level USE configuration, keyed by the owning repository symbol
+    // (its flag stack already folds in the masters). Applied beneath the profile
+    // cascade, scoped to candidates from the owning repository.
+    repo_mask: HashMap<Symbol, BTreeSet<String>>,
+    repo_force: HashMap<Symbol, BTreeSet<String>>,
+    repo_stable_mask: HashMap<Symbol, BTreeSet<String>>,
+    repo_pkg_use: Vec<(Symbol, PkgUseEntry)>,
+    repo_pkg_mask: Vec<(Symbol, PkgUseEntry)>,
+    repo_pkg_force: Vec<(Symbol, PkgUseEntry)>,
+    repo_pkg_stable_mask: Vec<(Symbol, PkgUseEntry)>,
+    repo_pkg_stable_force: Vec<(Symbol, PkgUseEntry)>,
     iuse_effective: BTreeSet<String>,
 }
 
@@ -210,34 +292,83 @@ impl UseManager {
         self
     }
 
-    /// Add a `package.use` entry. Entries are applied in specificity order.
-    pub fn add_pkg_use(&mut self, entry: PkgUseEntry) {
-        self.pkg_use.push(entry);
-        self.pkg_use.sort_by_key(|e| specificity(&e.atom));
+    /// Record whether `FEATURES` contains `test`, so the `test` USE flag is
+    /// injected for packages that do not restrict testing.
+    pub fn with_features_test(mut self, enabled: bool) -> Self {
+        self.features_test = enabled;
+        self
     }
 
-    /// Add a `package.use.mask` entry. Entries are applied in specificity order.
-    pub fn add_pkg_mask(&mut self, entry: PkgUseEntry) {
-        self.pkg_mask.push(entry);
-        self.pkg_mask.sort_by_key(|e| specificity(&e.atom));
+    /// Add a `package.use` entry from the given layer. Entries within a layer are
+    /// applied in specificity order; the profile layer is applied before the user
+    /// layer.
+    pub fn add_pkg_use(&mut self, entry: PkgUseEntry, layer: UseLayer) {
+        self.pkg_use.add(entry, layer);
     }
 
-    /// Add a `package.use.force` entry. Entries are applied in specificity order.
-    pub fn add_pkg_force(&mut self, entry: PkgUseEntry) {
-        self.pkg_force.push(entry);
-        self.pkg_force.sort_by_key(|e| specificity(&e.atom));
+    /// Add a `package.use.mask` entry from the given layer.
+    pub fn add_pkg_mask(&mut self, entry: PkgUseEntry, layer: UseLayer) {
+        self.pkg_mask.add(entry, layer);
+    }
+
+    /// Add a `package.use.force` entry from the given layer.
+    pub fn add_pkg_force(&mut self, entry: PkgUseEntry, layer: UseLayer) {
+        self.pkg_force.add(entry, layer);
     }
 
     /// Add a `package.use.stable.mask` entry, honored only for stable packages.
-    pub fn add_pkg_stable_mask(&mut self, entry: PkgUseEntry) {
-        self.pkg_stable_mask.push(entry);
-        self.pkg_stable_mask.sort_by_key(|e| specificity(&e.atom));
+    pub fn add_pkg_stable_mask(&mut self, entry: PkgUseEntry, layer: UseLayer) {
+        self.pkg_stable_mask.add(entry, layer);
     }
 
     /// Add a `package.use.stable.force` entry, honored only for stable packages.
-    pub fn add_pkg_stable_force(&mut self, entry: PkgUseEntry) {
-        self.pkg_stable_force.push(entry);
-        self.pkg_stable_force.sort_by_key(|e| specificity(&e.atom));
+    pub fn add_pkg_stable_force(&mut self, entry: PkgUseEntry, layer: UseLayer) {
+        self.pkg_stable_force.add(entry, layer);
+    }
+
+    /// Set the repository-level `use.mask` flags for `repo` (applied to that
+    /// repository's candidates).
+    pub fn add_repo_use_mask(&mut self, repo: Symbol, flags: impl IntoIterator<Item = String>) {
+        self.repo_mask.entry(repo).or_default().extend(flags);
+    }
+
+    /// Set the repository-level `use.force` flags for `repo`.
+    pub fn add_repo_use_force(&mut self, repo: Symbol, flags: impl IntoIterator<Item = String>) {
+        self.repo_force.entry(repo).or_default().extend(flags);
+    }
+
+    /// Set the repository-level `use.stable.mask` flags for `repo`.
+    pub fn add_repo_use_stable_mask(
+        &mut self,
+        repo: Symbol,
+        flags: impl IntoIterator<Item = String>,
+    ) {
+        self.repo_stable_mask.entry(repo).or_default().extend(flags);
+    }
+
+    /// Add a repository-level `package.use` entry scoped to `repo`.
+    pub fn add_repo_pkg_use(&mut self, repo: Symbol, entry: PkgUseEntry) {
+        self.repo_pkg_use.push((repo, entry));
+    }
+
+    /// Add a repository-level `package.use.mask` entry scoped to `repo`.
+    pub fn add_repo_pkg_mask(&mut self, repo: Symbol, entry: PkgUseEntry) {
+        self.repo_pkg_mask.push((repo, entry));
+    }
+
+    /// Add a repository-level `package.use.force` entry scoped to `repo`.
+    pub fn add_repo_pkg_force(&mut self, repo: Symbol, entry: PkgUseEntry) {
+        self.repo_pkg_force.push((repo, entry));
+    }
+
+    /// Add a repository-level `package.use.stable.mask` entry scoped to `repo`.
+    pub fn add_repo_pkg_stable_mask(&mut self, repo: Symbol, entry: PkgUseEntry) {
+        self.repo_pkg_stable_mask.push((repo, entry));
+    }
+
+    /// Add a repository-level `package.use.stable.force` entry scoped to `repo`.
+    pub fn add_repo_pkg_stable_force(&mut self, repo: Symbol, entry: PkgUseEntry) {
+        self.repo_pkg_stable_force.push((repo, entry));
     }
 
     /// Whether `flag` is in `IUSE_EFFECTIVE`.
@@ -246,12 +377,15 @@ impl UseManager {
     }
 
     /// Compute the effective USE for a package. `stable` selects whether
-    /// stable-only masks apply.
+    /// stable-only masks apply. `restrict_test` is whether the package's
+    /// `RESTRICT` contains `test`, which suppresses the `FEATURES=test`
+    /// injection.
     pub fn effective_use(
         &self,
         pkg: &PackageRef<'_>,
         iuse: &[String],
         stable: bool,
+        restrict_test: bool,
     ) -> EffectiveUse {
         // IUSE `+`-prefixed flags are the lowest-priority defaults; global and
         // per-package settings layer on top.
@@ -266,7 +400,10 @@ impl UseManager {
         }
         enabled.extend(self.global.iter().cloned());
 
-        for entry in &self.pkg_use {
+        // Repository-level `package.use` is applied beneath the profile cascade,
+        // scoped to candidates from the owning repository.
+        apply_repo_pkg(&self.repo_pkg_use, pkg, &mut enabled);
+        for entry in self.pkg_use.applied() {
             if entry.atom.matches(pkg) {
                 for (flag, enable) in &entry.mods {
                     if *enable {
@@ -278,20 +415,44 @@ impl UseManager {
             }
         }
 
+        // FEATURES=test injects `test` (independent of IUSE) before mask/force,
+        // re-disabled when the package RESTRICT contains `test`, mirroring
+        // `config._setcpv`.
+        if self.features_test && !restrict_test {
+            enabled.insert("test".to_owned());
+        }
+
         // Resolve the effective force and mask sets for this package, layering
-        // the per-package entries over the global sets.
-        let mut force = resolve_pkg_set(&self.force, &self.pkg_force, pkg);
-        let mut mask = resolve_pkg_set(&self.mask, &self.pkg_mask, pkg);
+        // the repository-level config beneath the global sets, then the
+        // per-package profile and user entries.
+        let mut force = self.resolve_force_mask(
+            pkg,
+            &self.force,
+            &self.repo_force,
+            &self.repo_pkg_force,
+            &self.pkg_force,
+        );
+        let mut mask = self.resolve_force_mask(
+            pkg,
+            &self.mask,
+            &self.repo_mask,
+            &self.repo_pkg_mask,
+            &self.pkg_mask,
+        );
         if stable && self.stable_masks_enabled {
-            mask.extend(resolve_pkg_set(
+            mask.extend(self.resolve_force_mask(
+                pkg,
                 &self.stable_mask,
+                &self.repo_stable_mask,
+                &self.repo_pkg_stable_mask,
                 &self.pkg_stable_mask,
-                pkg,
             ));
-            force.extend(resolve_pkg_set(
-                &BTreeSet::new(),
-                &self.pkg_stable_force,
+            force.extend(self.resolve_force_mask(
                 pkg,
+                &BTreeSet::new(),
+                &HashMap::new(),
+                &self.repo_pkg_stable_force,
+                &self.pkg_stable_force,
             ));
         }
 
@@ -312,17 +473,46 @@ impl UseManager {
     }
 }
 
-/// Resolve a per-package mask/force set: start from the global `base` set and
-/// apply the matching per-package entries in specificity order, where an active
-/// modification adds the flag and an inactive one (`-flag`) removes it.
-fn resolve_pkg_set(
-    base: &BTreeSet<String>,
-    entries: &[PkgUseEntry],
+/// Apply repository-level `package.use` entries scoped to the candidate's
+/// repository onto the enabled set.
+fn apply_repo_pkg(
+    entries: &[(Symbol, PkgUseEntry)],
     pkg: &PackageRef<'_>,
-) -> BTreeSet<String> {
-    let mut set = base.clone();
-    for entry in entries {
-        if entry.atom.matches(pkg) {
+    enabled: &mut BTreeSet<String>,
+) {
+    for (repo, entry) in entries {
+        if pkg.repo == Some(*repo) && entry.atom.matches(pkg) {
+            for (flag, enable) in &entry.mods {
+                if *enable {
+                    enabled.insert(flag.clone());
+                } else {
+                    enabled.remove(flag);
+                }
+            }
+        }
+    }
+}
+
+impl UseManager {
+    /// Resolve a per-package mask or force set: start from the global `base` set,
+    /// fold in the repository-level flags and entries scoped to the candidate's
+    /// repository (beneath the profile cascade), then apply the per-package
+    /// profile and user entries (each specificity-ordered).
+    fn resolve_force_mask(
+        &self,
+        pkg: &PackageRef<'_>,
+        base: &BTreeSet<String>,
+        repo_flags: &HashMap<Symbol, BTreeSet<String>>,
+        repo_entries: &[(Symbol, PkgUseEntry)],
+        layered: &LayeredPkgEntries,
+    ) -> BTreeSet<String> {
+        let mut set = base.clone();
+        if let Some(r) = pkg.repo
+            && let Some(flags) = repo_flags.get(&r)
+        {
+            set.extend(flags.iter().cloned());
+        }
+        let mut apply = |entry: &PkgUseEntry| {
             for (flag, active) in &entry.mods {
                 if *active {
                     set.insert(flag.clone());
@@ -330,9 +520,19 @@ fn resolve_pkg_set(
                     set.remove(flag);
                 }
             }
+        };
+        for (repo, entry) in repo_entries {
+            if pkg.repo == Some(*repo) && entry.atom.matches(pkg) {
+                apply(entry);
+            }
         }
+        for entry in layered.applied() {
+            if entry.atom.matches(pkg) {
+                apply(entry);
+            }
+        }
+        set
     }
-    set
 }
 
 /// A specificity score for ordering `package.use` entries (more specific last).
@@ -392,12 +592,33 @@ mod tests {
 
     #[test]
     fn iuse_effective_includes_implicit_arch() {
+        // IUSE_EFFECTIVE is derived from USE_EXPAND_VALUES_ARCH, so every valid
+        // arch value is included, not only the selected one.
         let e = env(&[
             ("USE_EXPAND_IMPLICIT", "ARCH"),
             ("USE_EXPAND_UNPREFIXED", "ARCH"),
             ("ARCH", "amd64"),
+            ("USE_EXPAND_VALUES_ARCH", "amd64 x86 arm64"),
         ]);
-        assert!(iuse_effective(&e).contains("amd64"));
+        let eff = iuse_effective(&e);
+        assert!(eff.contains("amd64"));
+        // Non-selected arch values are part of IUSE_EFFECTIVE.
+        assert!(eff.contains("x86"));
+        assert!(eff.contains("arm64"));
+    }
+
+    #[test]
+    fn iuse_effective_arch_falls_back_to_archlist() {
+        // With no explicit USE_EXPAND_VALUES_ARCH, the loader's PORTAGE_ARCHLIST
+        // supplies the full arch value set.
+        let e = env(&[
+            ("USE_EXPAND_IMPLICIT", "ARCH"),
+            ("USE_EXPAND_UNPREFIXED", "ARCH"),
+            ("ARCH", "amd64"),
+            ("PORTAGE_ARCHLIST", "amd64 x86 ppc"),
+        ]);
+        let eff = iuse_effective(&e);
+        assert!(eff.contains("amd64") && eff.contains("x86") && eff.contains("ppc"));
     }
 
     fn pkg<'a>(i: &Interner, cat: &str, p: &str, v: &'a Version) -> PackageRef<'a> {
@@ -417,7 +638,7 @@ mod tests {
         let v = Version::parse("1.0").unwrap();
         let mgr = UseManager::new(vec![], BTreeSet::new());
         let iuse = vec!["+native-symlinks".to_owned(), "test".to_owned()];
-        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &iuse, false);
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &iuse, false, false);
         // `+`-prefixed IUSE flags default to enabled; bare ones do not.
         assert!(eff.enabled.contains("native-symlinks"));
         assert!(!eff.enabled.contains("test"));
@@ -430,7 +651,7 @@ mod tests {
         let mgr =
             UseManager::new(vec![], BTreeSet::new()).with_disabled(["native-symlinks".to_owned()]);
         let iuse = vec!["+native-symlinks".to_owned()];
-        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &iuse, false);
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &iuse, false, false);
         // A `-flag` in global USE wins over an IUSE `+` default.
         assert!(!eff.enabled.contains("native-symlinks"));
     }
@@ -448,12 +669,15 @@ mod tests {
         let i = Interner::new();
         let v = Version::parse("1.0").unwrap();
         let mut mgr = UseManager::new(vec![], BTreeSet::new());
-        mgr.add_pkg_use(PkgUseEntry {
-            atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
-            mods: vec![("native-symlinks".to_owned(), false)],
-        });
+        mgr.add_pkg_use(
+            PkgUseEntry {
+                atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
+                mods: vec![("native-symlinks".to_owned(), false)],
+            },
+            UseLayer::User,
+        );
         let iuse = vec!["+native-symlinks".to_owned()];
-        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &iuse, false);
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &iuse, false, false);
         assert!(!eff.enabled.contains("native-symlinks"));
     }
 
@@ -464,7 +688,7 @@ mod tests {
         let mgr = UseManager::new(vec!["ssl".into()], BTreeSet::new())
             .with_mask(["ssl".to_owned()])
             .with_force(["forced".to_owned()]);
-        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &[], true);
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &[], true, false);
         assert!(!eff.enabled.contains("ssl"));
         assert!(eff.enabled.contains("forced"));
     }
@@ -476,12 +700,12 @@ mod tests {
         let mgr = UseManager::new(vec!["exp".into()], BTreeSet::new())
             .with_stable_mask(["exp".to_owned()], true);
         assert!(
-            !mgr.effective_use(&pkg(&i, "a", "b", &v), &[], true)
+            !mgr.effective_use(&pkg(&i, "a", "b", &v), &[], true, false)
                 .enabled
                 .contains("exp")
         );
         assert!(
-            mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false)
+            mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false, false)
                 .enabled
                 .contains("exp")
         );
@@ -490,7 +714,7 @@ mod tests {
             .with_stable_mask(["exp".to_owned()], false);
         assert!(
             ungated
-                .effective_use(&pkg(&i, "a", "b", &v), &[], true)
+                .effective_use(&pkg(&i, "a", "b", &v), &[], true, false)
                 .enabled
                 .contains("exp")
         );
@@ -501,18 +725,21 @@ mod tests {
         let i = Interner::new();
         let v = Version::parse("1.0").unwrap();
         let mut mgr = UseManager::new(vec!["ssl".into()], BTreeSet::new());
-        mgr.add_pkg_mask(PkgUseEntry {
-            atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
-            mods: vec![("ssl".into(), true)],
-        });
+        mgr.add_pkg_mask(
+            PkgUseEntry {
+                atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
+                mods: vec![("ssl".into(), true)],
+            },
+            UseLayer::User,
+        );
         // Masked for a/b, still enabled elsewhere.
         assert!(
-            !mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false)
+            !mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false, false)
                 .enabled
                 .contains("ssl")
         );
         assert!(
-            mgr.effective_use(&pkg(&i, "a", "c", &v), &[], false)
+            mgr.effective_use(&pkg(&i, "a", "c", &v), &[], false, false)
                 .enabled
                 .contains("ssl")
         );
@@ -523,17 +750,20 @@ mod tests {
         let i = Interner::new();
         let v = Version::parse("1.0").unwrap();
         let mut mgr = UseManager::new(vec![], BTreeSet::new());
-        mgr.add_pkg_force(PkgUseEntry {
-            atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
-            mods: vec![("forced".into(), true)],
-        });
+        mgr.add_pkg_force(
+            PkgUseEntry {
+                atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
+                mods: vec![("forced".into(), true)],
+            },
+            UseLayer::User,
+        );
         assert!(
-            mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false)
+            mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false, false)
                 .enabled
                 .contains("forced")
         );
         assert!(
-            !mgr.effective_use(&pkg(&i, "a", "c", &v), &[], false)
+            !mgr.effective_use(&pkg(&i, "a", "c", &v), &[], false, false)
                 .enabled
                 .contains("forced")
         );
@@ -545,17 +775,20 @@ mod tests {
         let v = Version::parse("1.0").unwrap();
         let mut mgr = UseManager::new(vec!["exp".into()], BTreeSet::new())
             .with_stable_mask(Vec::<String>::new(), true);
-        mgr.add_pkg_stable_mask(PkgUseEntry {
-            atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
-            mods: vec![("exp".into(), true)],
-        });
+        mgr.add_pkg_stable_mask(
+            PkgUseEntry {
+                atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
+                mods: vec![("exp".into(), true)],
+            },
+            UseLayer::User,
+        );
         assert!(
-            !mgr.effective_use(&pkg(&i, "a", "b", &v), &[], true)
+            !mgr.effective_use(&pkg(&i, "a", "b", &v), &[], true, false)
                 .enabled
                 .contains("exp")
         );
         assert!(
-            mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false)
+            mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false, false)
                 .enabled
                 .contains("exp")
         );
@@ -566,17 +799,64 @@ mod tests {
         let i = Interner::new();
         let f = features_for_level(8);
         let mut mgr = UseManager::new(vec![], BTreeSet::new());
-        mgr.add_pkg_use(PkgUseEntry {
-            atom: Atom::parse("dev-libs/foo", f, &i).unwrap(),
-            mods: vec![("ssl".into(), true)],
-        });
-        mgr.add_pkg_use(PkgUseEntry {
-            atom: Atom::parse(">=dev-libs/foo-2", f, &i).unwrap(),
-            mods: vec![("ssl".into(), false)],
-        });
+        mgr.add_pkg_use(
+            PkgUseEntry {
+                atom: Atom::parse("dev-libs/foo", f, &i).unwrap(),
+                mods: vec![("ssl".into(), true)],
+            },
+            UseLayer::User,
+        );
+        mgr.add_pkg_use(
+            PkgUseEntry {
+                atom: Atom::parse(">=dev-libs/foo-2", f, &i).unwrap(),
+                mods: vec![("ssl".into(), false)],
+            },
+            UseLayer::User,
+        );
         let v = Version::parse("2.0").unwrap();
-        let eff = mgr.effective_use(&pkg(&i, "dev-libs", "foo", &v), &[], true);
+        let eff = mgr.effective_use(&pkg(&i, "dev-libs", "foo", &v), &[], true, false);
         // The more specific versioned entry (applied last) disables ssl.
         assert!(!eff.enabled.contains("ssl"));
+    }
+
+    #[test]
+    fn user_layer_overrides_more_specific_profile_entry() {
+        let i = Interner::new();
+        let f = features_for_level(8);
+        let mut mgr = UseManager::new(vec![], BTreeSet::new());
+        // A more specific profile entry enables foo.
+        mgr.add_pkg_use(
+            PkgUseEntry {
+                atom: Atom::parse("=cat/pkg-1.0", f, &i).unwrap(),
+                mods: vec![("foo".into(), true)],
+            },
+            UseLayer::Profile,
+        );
+        // A less specific user entry disables it.
+        mgr.add_pkg_use(
+            PkgUseEntry {
+                atom: Atom::parse("cat/pkg", f, &i).unwrap(),
+                mods: vec![("foo".into(), false)],
+            },
+            UseLayer::User,
+        );
+        let v = Version::parse("1.0").unwrap();
+        let eff = mgr.effective_use(&pkg(&i, "cat", "pkg", &v), &[], false, false);
+        // The user layer is applied after the profile layer, so foo is disabled
+        // even though the profile entry's atom is more specific.
+        assert!(!eff.enabled.contains("foo"));
+    }
+
+    #[test]
+    fn features_test_injects_test_flag() {
+        let i = Interner::new();
+        let v = Version::parse("1.0").unwrap();
+        let mgr = UseManager::new(vec![], BTreeSet::new()).with_features_test(true);
+        // FEATURES=test injects `test` independently of IUSE.
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false, false);
+        assert!(eff.enabled.contains("test"));
+        // RESTRICT=test re-disables the injected flag.
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false, true);
+        assert!(!eff.enabled.contains("test"));
     }
 }

@@ -74,6 +74,7 @@ fn builds_fixture_and_writes_image_and_build_info() {
         eprefix: String::new(),
         config_root: "/".into(),
         eclass_locations: vec![],
+        bashrc_files: vec![],
     };
 
     let mut reduced = BTreeMap::new();

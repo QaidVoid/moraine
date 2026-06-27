@@ -6,12 +6,36 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use moraine_atom::PackageRef;
+use moraine_common::Interner;
 
 use crate::keywords::KeywordsManager;
 use crate::license::{LicenseManager, LicenseReq};
 use crate::profile::ProfileStack;
 use crate::use_resolution::{EffectiveUse, UseManager};
-use crate::visibility::{KeywordResult, MaskManager, MaskReason, ProvidedManager, accept_keywords};
+use crate::visibility::{
+    KeywordResult, MaskManager, MaskPattern, MaskReason, ProvidedManager, accept_keywords,
+};
+
+/// A `package.env` overlay entry: a cp pattern and the ordered `(key, value)`
+/// assignments from every referenced `/etc/portage/env/` file, applied when the
+/// pattern matches a package.
+#[derive(Debug, Clone)]
+pub struct PkgEnvEntry {
+    /// The cp pattern (concrete atom or extended wildcard) the entry applies to.
+    pub pattern: MaskPattern,
+    /// The ordered variable assignments contributed by the matched env files.
+    pub vars: Vec<(String, String)>,
+}
+
+/// A `package.bashrc` overlay entry: a cp pattern and the bashrc files selected
+/// for matching packages.
+#[derive(Debug, Clone)]
+pub struct PkgBashrcEntry {
+    /// The cp pattern the entry applies to.
+    pub pattern: MaskPattern,
+    /// The bashrc files to source for matching packages.
+    pub files: Vec<PathBuf>,
+}
 
 /// The combined visibility verdict for a package: masking, then keywords.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +66,13 @@ pub struct ResolvedConfig {
     provided: ProvidedManager,
     system: Vec<String>,
     world: Vec<String>,
+    /// The shared interner, used to resolve candidate symbols for extended-cp
+    /// (partial glob) matching at query time.
+    interner: Arc<Interner>,
+    pkg_env: Vec<PkgEnvEntry>,
+    profile_bashrcs: Vec<PathBuf>,
+    user_bashrc: Option<PathBuf>,
+    package_bashrc: Vec<PkgBashrcEntry>,
 }
 
 impl ResolvedConfig {
@@ -58,6 +89,7 @@ impl ResolvedConfig {
         provided: ProvidedManager,
         system: Vec<String>,
         world: Vec<String>,
+        interner: Arc<Interner>,
     ) -> Self {
         ResolvedConfig {
             profile,
@@ -70,7 +102,62 @@ impl ResolvedConfig {
             provided,
             system,
             world,
+            interner,
+            pkg_env: Vec::new(),
+            profile_bashrcs: Vec::new(),
+            user_bashrc: None,
+            package_bashrc: Vec::new(),
         }
+    }
+
+    /// Attach the per-package `package.env` overlay entries.
+    pub fn with_pkg_env(mut self, pkg_env: Vec<PkgEnvEntry>) -> Self {
+        self.pkg_env = pkg_env;
+        self
+    }
+
+    /// Attach the bashrc sourcing inputs: the profile-node `profile.bashrc`
+    /// files (stack order), the user `PORTAGE_BASHRC` (`/etc/portage/bashrc`),
+    /// and the `package.bashrc` per-package selections.
+    pub fn with_bashrcs(
+        mut self,
+        profile_bashrcs: Vec<PathBuf>,
+        user_bashrc: Option<PathBuf>,
+        package_bashrc: Vec<PkgBashrcEntry>,
+    ) -> Self {
+        self.profile_bashrcs = profile_bashrcs;
+        self.user_bashrc = user_bashrc;
+        self.package_bashrc = package_bashrc;
+        self
+    }
+
+    /// The ordered `(key, value)` `package.env` overlay for a package, the
+    /// concatenation of every matching entry's variables (profile/user order,
+    /// least specific first).
+    pub fn package_env_overlay(&self, pkg: &PackageRef<'_>) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for entry in &self.pkg_env {
+            if entry.pattern.matches(pkg, &self.interner) {
+                out.extend(entry.vars.iter().cloned());
+            }
+        }
+        out
+    }
+
+    /// The bashrc files to source for a package, in Portage order: each profile
+    /// node's `profile.bashrc`, then the user `PORTAGE_BASHRC`, then the matching
+    /// `package.bashrc`-selected files.
+    pub fn bashrc_files(&self, pkg: &PackageRef<'_>) -> Vec<PathBuf> {
+        let mut out = self.profile_bashrcs.clone();
+        if let Some(user) = &self.user_bashrc {
+            out.push(user.clone());
+        }
+        for entry in &self.package_bashrc {
+            if entry.pattern.matches(pkg, &self.interner) {
+                out.extend(entry.files.iter().cloned());
+            }
+        }
+        out
     }
 
     /// The package's effective `KEYWORDS` after applying profile
@@ -80,41 +167,47 @@ impl ResolvedConfig {
         pkg: &PackageRef<'_>,
         ebuild_keywords: &[String],
     ) -> Vec<String> {
-        self.keywords_manager.stacked_keywords(pkg, ebuild_keywords)
+        self.keywords_manager
+            .stacked_keywords(pkg, ebuild_keywords, &self.interner)
     }
 
     /// The per-package accepted keywords matching `pkg` from
     /// `package.accept_keywords` (and the deprecated `package.keywords`).
     pub fn package_keywords(&self, pkg: &PackageRef<'_>) -> Vec<String> {
-        self.keywords_manager.pkeywords(pkg)
+        self.keywords_manager.pkeywords(pkg, &self.interner)
     }
 
     /// The licenses of `reduced` (a USE-reduced `LICENSE`) that are not accepted
     /// for `pkg`. An empty result means the license is acceptable.
     pub fn missing_licenses(&self, reduced: &LicenseReq, pkg: &PackageRef<'_>) -> BTreeSet<String> {
-        self.license_manager.missing_licenses(reduced, pkg)
+        self.license_manager
+            .missing_licenses(reduced, pkg, &self.interner)
     }
 
     /// The effective USE for a package, given its raw `IUSE` tokens (with `+`/`-`
-    /// default prefixes) so defaults are applied.
+    /// default prefixes) so defaults are applied. `restrict_test` is whether the
+    /// package's `RESTRICT` contains `test`, suppressing the `FEATURES=test`
+    /// injection.
     pub fn effective_use(
         &self,
         pkg: &PackageRef<'_>,
         iuse: &[String],
         stable: bool,
+        restrict_test: bool,
     ) -> EffectiveUse {
-        self.use_manager.effective_use(pkg, iuse, stable)
+        self.use_manager
+            .effective_use(pkg, iuse, stable, restrict_test)
     }
 
     /// Whether a package is masked.
     pub fn is_masked(&self, pkg: &PackageRef<'_>) -> bool {
-        self.mask_manager.is_masked(pkg)
+        self.mask_manager.is_masked(pkg, &self.interner)
     }
 
     /// The structured masking reason for a package, naming the responsible mask
     /// token when hard-masked.
     pub fn mask_reason(&self, pkg: &PackageRef<'_>) -> MaskReason {
-        self.mask_manager.reason(pkg)
+        self.mask_manager.reason(pkg, &self.interner)
     }
 
     /// The combined visibility verdict, keeping hard-mask and keyword reasons
@@ -125,7 +218,7 @@ impl ResolvedConfig {
         keywords: &[String],
         extra: &[String],
     ) -> Visibility {
-        if let MaskReason::HardMasked(atom) = self.mask_manager.reason(pkg) {
+        if let MaskReason::HardMasked(atom) = self.mask_manager.reason(pkg, &self.interner) {
             return Visibility::HardMasked(atom);
         }
         match self.keyword_result(keywords, extra) {
@@ -240,6 +333,7 @@ mod tests {
             ProvidedManager::new(),
             Vec::new(),
             Vec::new(),
+            Arc::new(Interner::new()),
         )
     }
 
@@ -256,6 +350,7 @@ mod tests {
             ProvidedManager::new(),
             Vec::new(),
             Vec::new(),
+            Arc::new(Interner::new()),
         );
         // A bare per-package atom (empty extra) accepts ~amd64.
         assert_eq!(

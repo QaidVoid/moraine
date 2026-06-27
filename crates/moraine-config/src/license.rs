@@ -9,7 +9,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use moraine_atom::{Atom, PackageRef};
+use moraine_atom::PackageRef;
+use moraine_common::Interner;
+
+use crate::visibility::{MaskPattern, pattern_specificity};
 
 /// A USE-reduced `LICENSE` requirement tree: all conditional groups have been
 /// resolved against the package's USE, leaving only all-of and any-of structure
@@ -72,11 +75,12 @@ impl AcceptState {
     }
 }
 
-/// A `package.license` entry: an atom and its already-expanded license tokens.
+/// A `package.license` entry: a cp pattern (concrete atom or extended wildcard)
+/// and its already-expanded license tokens.
 #[derive(Debug, Clone)]
 pub struct PkgLicenseEntry {
-    /// The atom the entry applies to.
-    pub atom: Atom,
+    /// The cp pattern the entry applies to.
+    pub pattern: MaskPattern,
     /// The license tokens (`token`, `-token`, `*`, `-*`), `@group` pre-expanded.
     pub tokens: Vec<String>,
 }
@@ -97,7 +101,7 @@ impl LicenseManager {
     pub fn new(
         groups: BTreeMap<String, Vec<String>>,
         accept_license: &[String],
-        pkg_license: Vec<(Atom, Vec<String>)>,
+        pkg_license: Vec<(MaskPattern, Vec<String>)>,
     ) -> Self {
         let mut mgr = LicenseManager {
             groups,
@@ -112,12 +116,13 @@ impl LicenseManager {
         // Expand and store the per-package entries, most specific last.
         mgr.pkg_license = pkg_license
             .into_iter()
-            .map(|(atom, tokens)| PkgLicenseEntry {
+            .map(|(pattern, tokens)| PkgLicenseEntry {
                 tokens: mgr.expand_license_tokens(&tokens),
-                atom,
+                pattern,
             })
             .collect();
-        mgr.pkg_license.sort_by_key(|e| specificity(&e.atom));
+        mgr.pkg_license
+            .sort_by_key(|e| pattern_specificity(&e.pattern));
         mgr
     }
 
@@ -167,16 +172,22 @@ impl LicenseManager {
     }
 
     /// The licenses of `reduced` that are not accepted for `pkg`. An empty result
-    /// means the package's license is acceptable.
-    pub fn missing_licenses(&self, reduced: &LicenseReq, pkg: &PackageRef<'_>) -> BTreeSet<String> {
-        let state = self.accept_state_for(pkg);
+    /// means the package's license is acceptable. `interner` resolves candidate
+    /// symbols for extended-wildcard `package.license` matching.
+    pub fn missing_licenses(
+        &self,
+        reduced: &LicenseReq,
+        pkg: &PackageRef<'_>,
+        interner: &Interner,
+    ) -> BTreeSet<String> {
+        let state = self.accept_state_for(pkg, interner);
         missing(reduced, &state)
     }
 
-    fn accept_state_for(&self, pkg: &PackageRef<'_>) -> AcceptState {
+    fn accept_state_for(&self, pkg: &PackageRef<'_>, interner: &Interner) -> AcceptState {
         let mut state = self.global.clone();
         for entry in &self.pkg_license {
-            if entry.atom.matches(pkg) {
+            if entry.pattern.matches(pkg, interner) {
                 for token in &entry.tokens {
                     state.apply(token);
                 }
@@ -207,27 +218,16 @@ fn missing(req: &LicenseReq, state: &AcceptState) -> BTreeSet<String> {
     }
 }
 
-/// A specificity score for ordering `package.license` entries (more specific
-/// applied last).
-fn specificity(atom: &Atom) -> u32 {
-    let mut score = 0;
-    if atom.version().is_some() {
-        score += 4;
-    }
-    if atom.slot().is_some() {
-        score += 2;
-    }
-    if atom.repo().is_some() {
-        score += 1;
-    }
-    score
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::visibility::parse_mask_pattern;
     use moraine_common::Interner;
     use moraine_version::Version;
+
+    fn pat(i: &Interner, text: &str) -> MaskPattern {
+        parse_mask_pattern(text, i, moraine_eapi::PERMISSIVE).unwrap()
+    }
 
     fn groups() -> BTreeMap<String, Vec<String>> {
         let mut g = BTreeMap::new();
@@ -295,11 +295,15 @@ mod tests {
         let i = Interner::new();
         let v = Version::parse("1.0").unwrap();
         assert!(
-            mgr.missing_licenses(&LicenseReq::Token("GPL-2".to_owned()), &pkg(&i, &v))
+            mgr.missing_licenses(&LicenseReq::Token("GPL-2".to_owned()), &pkg(&i, &v), &i)
                 .is_empty()
         );
         assert_eq!(
-            mgr.missing_licenses(&LicenseReq::Token("skype-eula".to_owned()), &pkg(&i, &v)),
+            mgr.missing_licenses(
+                &LicenseReq::Token("skype-eula".to_owned()),
+                &pkg(&i, &v),
+                &i
+            ),
             BTreeSet::from(["skype-eula".to_owned()])
         );
     }
@@ -313,25 +317,52 @@ mod tests {
             LicenseReq::Token("GPL-2".to_owned()),
             LicenseReq::Token("commercial".to_owned()),
         ]);
-        assert!(mgr.missing_licenses(&req, &pkg(&i, &v)).is_empty());
+        assert!(mgr.missing_licenses(&req, &pkg(&i, &v), &i).is_empty());
         // Neither branch accepted: the group is missing.
         let mgr2 = LicenseManager::new(BTreeMap::new(), &["BSD".to_owned()], Vec::new());
-        assert!(!mgr2.missing_licenses(&req, &pkg(&i, &v)).is_empty());
+        assert!(!mgr2.missing_licenses(&req, &pkg(&i, &v), &i).is_empty());
     }
 
     #[test]
     fn package_license_adds_acceptance() {
         let i = Interner::new();
-        let atom = Atom::parse("dev-libs/foo", moraine_eapi::PERMISSIVE, &i).unwrap();
         let mgr = LicenseManager::new(
             groups(),
             &["*".to_owned(), "-@EULA".to_owned()],
-            vec![(atom, vec!["skype-eula".to_owned()])],
+            vec![(pat(&i, "dev-libs/foo"), vec!["skype-eula".to_owned()])],
         );
         let v = Version::parse("1.0").unwrap();
         // package.license re-accepts the EULA token for this package.
         assert!(
-            mgr.missing_licenses(&LicenseReq::Token("skype-eula".to_owned()), &pkg(&i, &v))
+            mgr.missing_licenses(
+                &LicenseReq::Token("skype-eula".to_owned()),
+                &pkg(&i, &v),
+                &i
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn extended_wildcard_package_license_blocks_eula_across_categories() {
+        let i = Interner::new();
+        // `*/* -@EULA` over an accept-all policy blocks every EULA package.
+        let mgr = LicenseManager::new(
+            groups(),
+            &["*".to_owned()],
+            vec![(pat(&i, "*/*"), vec!["-@EULA".to_owned()])],
+        );
+        let v = Version::parse("1.0").unwrap();
+        let games = PackageRef {
+            category: i.intern("games-rpg"),
+            package: i.intern("nethack"),
+            version: &v,
+            slot: None,
+            subslot: None,
+            repo: None,
+        };
+        assert!(
+            !mgr.missing_licenses(&LicenseReq::Token("skype-eula".to_owned()), &games, &i)
                 .is_empty()
         );
     }

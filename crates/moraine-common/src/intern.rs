@@ -19,12 +19,12 @@ impl Symbol {
 }
 
 /// Interns strings, returning a stable [`Symbol`] for each distinct string.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Interner {
     inner: RwLock<Inner>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Inner {
     lookup: HashMap<Arc<str>, Symbol>,
     strings: Vec<Arc<str>>,

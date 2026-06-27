@@ -406,6 +406,15 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
             bind = bashlib::BIND_FUNC,
             func = phase.func_name(),
         ));
+        // Source the profile.bashrc / PORTAGE_BASHRC / package.bashrc files after
+        // the ebuild and before the phase function, mirroring
+        // `__source_all_bashrcs`. This runs before every non-`depend` phase.
+        for bashrc in &self.env.config().bashrc_files {
+            script.push_str(&format!(
+                "[ -f {f} ] && {{ . {f} || die \"error sourcing bashrc\"; }}\n",
+                f = shquote(bashrc),
+            ));
+        }
         // The source phases run in the unpacked source directory; the pkg_*
         // phases and src_unpack stay in WORKDIR (the process cwd).
         if cd_to_source(phase) {
@@ -833,6 +842,46 @@ mod tests {
         // Sandbox wrapper is the program.
         assert_eq!(compile.program, "sandbox");
         assert!(compile.env.contains_key("SANDBOX_WRITE"));
+    }
+
+    #[test]
+    fn bashrc_sourced_before_phase() {
+        let fx = fixture();
+        let mut cfg = ConfigEnv::rooted([]);
+        cfg.bashrc_files = vec!["/etc/portage/bashrc".to_string()];
+        let env = EnvBuilder::new(ident("8"), cfg, &fx.layout).unwrap();
+        let sel = selector(&[]);
+        let runner = FakeRunner::always_ok();
+        let driver = PhaseDriver::new(
+            &runner,
+            &env,
+            &fx.layout,
+            &fx.library,
+            &sel,
+            &fx.ebuild,
+            vec!["compile".into()],
+            false,
+            Vec::new(),
+            None,
+        );
+        driver.run_all().unwrap();
+        let calls = runner.calls();
+        let compile = calls
+            .iter()
+            .find(|c| c.args.iter().any(|a| a.contains("src_compile")))
+            .expect("compile call");
+        let script = compile.args.last().unwrap();
+        // The bashrc is sourced, and before the phase function dispatch.
+        let bashrc_at = script
+            .find("/etc/portage/bashrc")
+            .expect("bashrc sourced in the phase script");
+        let dispatch_at = script
+            .find("__ebuild_phase_with_hooks src_compile")
+            .expect("phase dispatched");
+        assert!(
+            bashrc_at < dispatch_at,
+            "bashrc must be sourced before the phase function runs"
+        );
     }
 
     #[test]

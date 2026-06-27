@@ -256,6 +256,7 @@ mod tests {
             eprefix: String::new(),
             config_root: "/".into(),
             eclass_locations: Vec::new(),
+            bashrc_files: Vec::new(),
         }
     }
 

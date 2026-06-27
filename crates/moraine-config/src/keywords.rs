@@ -3,12 +3,17 @@
 //! user `package.accept_keywords` (plus the deprecated user `package.keywords`),
 //! mirroring Portage's `KeywordsManager`.
 
-use moraine_atom::{Atom, PackageRef};
+use moraine_atom::PackageRef;
+use moraine_common::Interner;
 
-/// An atom-keyed list of keyword tokens.
+use crate::visibility::{MaskPattern, pattern_specificity};
+
+/// A pattern-keyed list of keyword tokens. The pattern is either a concrete atom
+/// or an extended cp wildcard (`*/*`, `games-*/*`), so a wildcard line such as
+/// `*/* ~amd64` applies to every matching candidate.
 #[derive(Debug, Clone)]
 struct KeywordEntry {
-    atom: Atom,
+    pattern: MaskPattern,
     tokens: Vec<String>,
 }
 
@@ -29,15 +34,17 @@ impl KeywordsManager {
     }
 
     /// Add a profile `package.keywords` entry (a `KEYWORDS` modification).
-    pub fn add_profile_keywords(&mut self, atom: Atom, tokens: Vec<String>) {
-        self.profile_keywords.push(KeywordEntry { atom, tokens });
-        self.profile_keywords.sort_by_key(|e| specificity(&e.atom));
+    pub fn add_profile_keywords(&mut self, pattern: MaskPattern, tokens: Vec<String>) {
+        self.profile_keywords.push(KeywordEntry { pattern, tokens });
+        self.profile_keywords
+            .sort_by_key(|e| pattern_specificity(&e.pattern));
     }
 
     /// Add a per-package accepted-keywords entry.
-    pub fn add_pkeywords(&mut self, atom: Atom, tokens: Vec<String>) {
-        self.pkeywords.push(KeywordEntry { atom, tokens });
-        self.pkeywords.sort_by_key(|e| specificity(&e.atom));
+    pub fn add_pkeywords(&mut self, pattern: MaskPattern, tokens: Vec<String>) {
+        self.pkeywords.push(KeywordEntry { pattern, tokens });
+        self.pkeywords
+            .sort_by_key(|e| pattern_specificity(&e.pattern));
     }
 
     /// The package's effective `KEYWORDS`: the ebuild keywords (with a leading
@@ -47,6 +54,7 @@ impl KeywordsManager {
         &self,
         pkg: &PackageRef<'_>,
         ebuild_keywords: &[String],
+        interner: &Interner,
     ) -> Vec<String> {
         let mut acc: Vec<String> = ebuild_keywords
             .iter()
@@ -54,7 +62,7 @@ impl KeywordsManager {
             .cloned()
             .collect();
         for entry in &self.profile_keywords {
-            if entry.atom.matches(pkg) {
+            if entry.pattern.matches(pkg, interner) {
                 for token in &entry.tokens {
                     if token == "-*" {
                         acc.clear();
@@ -72,10 +80,10 @@ impl KeywordsManager {
     /// The per-package accepted keywords matching `pkg`, in atom-specificity
     /// order. A bare entry (no explicit keyword) contributes one empty token,
     /// which the keyword acceptor expands to the per-arch testing default.
-    pub fn pkeywords(&self, pkg: &PackageRef<'_>) -> Vec<String> {
+    pub fn pkeywords(&self, pkg: &PackageRef<'_>, interner: &Interner) -> Vec<String> {
         let mut out = Vec::new();
         for entry in &self.pkeywords {
-            if entry.atom.matches(pkg) {
+            if entry.pattern.matches(pkg, interner) {
                 if entry.tokens.is_empty() {
                     out.push(String::new());
                 } else {
@@ -87,24 +95,10 @@ impl KeywordsManager {
     }
 }
 
-/// A specificity score for ordering per-package entries (more specific last).
-fn specificity(atom: &Atom) -> u32 {
-    let mut score = 0;
-    if atom.version().is_some() {
-        score += 4;
-    }
-    if atom.slot().is_some() {
-        score += 2;
-    }
-    if atom.repo().is_some() {
-        score += 1;
-    }
-    score
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::visibility::parse_mask_pattern;
     use moraine_common::Interner;
     use moraine_version::Version;
 
@@ -119,8 +113,8 @@ mod tests {
         }
     }
 
-    fn atom(i: &Interner, text: &str) -> Atom {
-        Atom::parse(text, moraine_eapi::PERMISSIVE, i).unwrap()
+    fn pat(i: &Interner, text: &str) -> MaskPattern {
+        parse_mask_pattern(text, i, moraine_eapi::PERMISSIVE).unwrap()
     }
 
     #[test]
@@ -128,14 +122,14 @@ mod tests {
         let i = Interner::new();
         let v = Version::parse("1.0").unwrap();
         let mut m = KeywordsManager::new();
-        m.add_profile_keywords(atom(&i, "dev-libs/foo"), vec!["~arm64".to_owned()]);
-        let kw = m.stacked_keywords(&pkg(&i, &v), &["amd64".to_owned()]);
+        m.add_profile_keywords(pat(&i, "dev-libs/foo"), vec!["~arm64".to_owned()]);
+        let kw = m.stacked_keywords(&pkg(&i, &v), &["amd64".to_owned()], &i);
         assert!(kw.contains(&"amd64".to_owned()) && kw.contains(&"~arm64".to_owned()));
 
         // A `-kw` removes and `-*` clears.
         let mut m2 = KeywordsManager::new();
-        m2.add_profile_keywords(atom(&i, "dev-libs/foo"), vec!["-amd64".to_owned()]);
-        let kw2 = m2.stacked_keywords(&pkg(&i, &v), &["amd64".to_owned(), "~amd64".to_owned()]);
+        m2.add_profile_keywords(pat(&i, "dev-libs/foo"), vec!["-amd64".to_owned()]);
+        let kw2 = m2.stacked_keywords(&pkg(&i, &v), &["amd64".to_owned(), "~amd64".to_owned()], &i);
         assert_eq!(kw2, vec!["~amd64".to_owned()]);
     }
 
@@ -144,7 +138,7 @@ mod tests {
         let i = Interner::new();
         let v = Version::parse("1.0").unwrap();
         let m = KeywordsManager::new();
-        let kw = m.stacked_keywords(&pkg(&i, &v), &["-*".to_owned(), "~amd64".to_owned()]);
+        let kw = m.stacked_keywords(&pkg(&i, &v), &["-*".to_owned(), "~amd64".to_owned()], &i);
         assert_eq!(kw, vec!["~amd64".to_owned()]);
     }
 
@@ -153,14 +147,30 @@ mod tests {
         let i = Interner::new();
         let v = Version::parse("1.0").unwrap();
         let mut m = KeywordsManager::new();
-        m.add_pkeywords(atom(&i, "dev-libs/foo"), vec!["~amd64".to_owned()]);
-        m.add_pkeywords(atom(&i, "dev-libs/bare"), Vec::new());
-        assert_eq!(m.pkeywords(&pkg(&i, &v)), vec!["~amd64".to_owned()]);
+        m.add_pkeywords(pat(&i, "dev-libs/foo"), vec!["~amd64".to_owned()]);
+        m.add_pkeywords(pat(&i, "dev-libs/bare"), Vec::new());
+        assert_eq!(m.pkeywords(&pkg(&i, &v), &i), vec!["~amd64".to_owned()]);
 
         let bare = PackageRef {
             package: i.intern("bare"),
             ..pkg(&i, &v)
         };
-        assert_eq!(m.pkeywords(&bare), vec![String::new()]);
+        assert_eq!(m.pkeywords(&bare, &i), vec![String::new()]);
+    }
+
+    #[test]
+    fn extended_wildcard_pkeywords_match_across_categories() {
+        let i = Interner::new();
+        let v = Version::parse("1.0").unwrap();
+        let mut m = KeywordsManager::new();
+        // `*/* ~amd64` accepts the testing keyword for every candidate.
+        m.add_pkeywords(pat(&i, "*/*"), vec!["~amd64".to_owned()]);
+        assert_eq!(m.pkeywords(&pkg(&i, &v), &i), vec!["~amd64".to_owned()]);
+        let other = PackageRef {
+            category: i.intern("games-rpg"),
+            package: i.intern("nethack"),
+            ..pkg(&i, &v)
+        };
+        assert_eq!(m.pkeywords(&other, &i), vec!["~amd64".to_owned()]);
     }
 }

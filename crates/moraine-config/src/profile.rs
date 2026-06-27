@@ -21,6 +21,9 @@ pub struct ProfileNode {
     pub eapi: String,
     /// Whether this is the user-config node (`/etc/portage/profile`).
     pub is_user: bool,
+    /// The owning repository's `profile-formats`, used to gate format-dependent
+    /// features such as `package.bashrc` (the `profile-bashrcs` format).
+    pub formats: Vec<String>,
 }
 
 /// The owning repository's profile metadata for one profile node.
@@ -96,10 +99,12 @@ impl ProfileStack {
 
         let user = config_root.join("etc/portage/profile");
         if user.is_dir() {
+            let formats = (ctx.node_repo)(&user).formats;
             stack.nodes.push(ProfileNode {
                 eapi: read_eapi(&user),
                 path: user,
                 is_user: true,
+                formats,
             });
         }
         Ok(stack)
@@ -182,10 +187,12 @@ fn add_node(
             eapi,
         });
     }
+    let formats = (ctx.node_repo)(dir).formats;
     nodes.push(ProfileNode {
         path: dir.to_path_buf(),
         eapi,
         is_user,
+        formats,
     });
     Ok(())
 }
