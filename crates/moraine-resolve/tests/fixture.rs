@@ -42,6 +42,9 @@ pub struct PkgSpec {
     /// Flags pinned by `use.mask`/`use.force`, which USE autounmask must not
     /// propose to toggle.
     pub locked_use: &'static [&'static str],
+    /// Flags the profile forces or masks for this package, subtracted from the
+    /// `--newuse` IUSE symmetric difference (`forced_use`).
+    pub forced_use: &'static [&'static str],
 }
 
 impl Default for PkgSpec {
@@ -64,6 +67,7 @@ impl Default for PkgSpec {
             accept_keyword: None,
             accept_licenses: &[],
             locked_use: &[],
+            forced_use: &[],
         }
     }
 }
@@ -78,6 +82,8 @@ struct Entry {
     accept: Option<AcceptChange>,
     /// Flags pinned by `use.mask`/`use.force`.
     locked_use: BTreeSet<String>,
+    /// Flags the profile forces or masks, returned from `forced_use`.
+    forced_use: BTreeSet<String>,
 }
 
 /// An in-memory test source.
@@ -87,6 +93,7 @@ pub struct Fixture {
     entries: Vec<Entry>,
     installed: Vec<InstalledMeta>,
     provided: Vec<(String, String)>,
+    libc_providers: BTreeSet<String>,
 }
 
 fn parse_node(interner: &Interner, s: &str) -> DepNode {
@@ -138,6 +145,7 @@ impl Fixture {
             provided: false,
             accept,
             locked_use: spec.locked_use.iter().map(|s| (*s).to_owned()).collect(),
+            forced_use: spec.forced_use.iter().map(|s| (*s).to_owned()).collect(),
         });
         self
     }
@@ -149,6 +157,13 @@ impl Fixture {
 
     pub fn add_provided(&mut self, cp: &str, version: &str) -> &mut Self {
         self.provided.push((cp.to_owned(), version.to_owned()));
+        self
+    }
+
+    /// Set the `category/package` keys returned from `libc_providers`, the libc
+    /// atoms stripped before the `--changed-deps` comparison.
+    pub fn set_libc_providers(&mut self, cps: &[&str]) -> &mut Self {
+        self.libc_providers = cps.iter().map(|s| (*s).to_owned()).collect();
         self
     }
 }
@@ -187,6 +202,18 @@ impl ResolveSource for Fixture {
             .find(|e| e.meta.cp == meta.cp && e.meta.version == meta.version)
             .map(|e| e.locked_use.clone())
             .unwrap_or_default()
+    }
+
+    fn forced_use(&self, meta: &PackageMeta) -> BTreeSet<String> {
+        self.entries
+            .iter()
+            .find(|e| e.meta.cp == meta.cp && e.meta.version == meta.version)
+            .map(|e| e.forced_use.clone())
+            .unwrap_or_default()
+    }
+
+    fn libc_providers(&self) -> BTreeSet<String> {
+        self.libc_providers.clone()
     }
 
     fn acceptability(&self, meta: &PackageMeta) -> Acceptability {

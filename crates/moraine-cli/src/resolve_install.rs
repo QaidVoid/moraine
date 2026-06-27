@@ -176,6 +176,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         deep: request.deep,
         deep_depth: request.deep_depth,
         newuse: request.newuse,
+        changed_use: cli.changed_use,
         changed_deps: cli.changed_deps,
         changed_slot: cli.changed_slot,
         autounmask: Default::default(),

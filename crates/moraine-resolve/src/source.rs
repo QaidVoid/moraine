@@ -155,6 +155,26 @@ pub trait ResolveSource {
     /// The resolved enabled USE flags for the given package version.
     fn resolved_use(&self, meta: &PackageMeta) -> BTreeSet<String>;
 
+    /// The USE flags whose state the profile fixes through `use.force`,
+    /// `use.mask`, and their per-package variants for the given package version,
+    /// returned separately from the enabled USE set. The `--newuse` reinstall
+    /// trigger subtracts this set from the IUSE symmetric difference so a forced
+    /// or masked flag does not by itself force a reinstall, mirroring the
+    /// `forced_flags` argument to Portage's `_reinstall_for_flags`. The default
+    /// is empty for sources without a force/mask configuration.
+    fn forced_use(&self, _meta: &PackageMeta) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    /// The `category/package` keys of installed providers of `virtual/libc`,
+    /// used to strip the auto-injected libc dependency atom from both sides of
+    /// the `--changed-deps` comparison, mirroring Portage's `find_libc_deps`
+    /// over the vartree. The default is empty for sources without an installed
+    /// libc provider.
+    fn libc_providers(&self) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
     /// The USE flags whose state is pinned by `use.mask`/`use.force` for the
     /// given package, which USE-dependency autounmask must never propose to
     /// toggle. The default is empty for sources without a force/mask

@@ -303,16 +303,14 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
         // An already-installed package at this exact version and slot is not
         // rebuilt, so its build-time dependencies are not pulled into the graph
         // (matching Portage's default and a binary install). A new install or
-        // upgrade still pulls its build deps. Under `--newuse` a USE change makes
-        // the package a reinstall, so its build deps are pulled again.
-        let newuse_rebuild = self.modifiers.newuse
-            && self
-                .source
-                .installed(cp)
-                .into_iter()
-                .find(|i| i.slot == slot)
-                .is_some_and(|inst| inst.use_enabled != resolved_use);
-        let skip_build = self.source.installed_matches(cp, &meta.version, slot) && !newuse_rebuild;
+        // upgrade still pulls its build deps. Under `--newuse`/`--changed-use` a
+        // USE change makes the package a reinstall, so its build deps are pulled
+        // again; `--newuse` also fires on an IUSE-only change. The same helper
+        // drives the `already_installed` decision so the two sites stay
+        // consistent.
+        let use_rebuild =
+            crate::resolve::use_changed(self.source, &meta, &resolved_use, self.modifiers);
+        let skip_build = self.source.installed_matches(cp, &meta.version, slot) && !use_rebuild;
 
         match encoder.requirements(&meta, &resolved_use, features, skip_build) {
             Ok(reqs) => Dependencies::Known(reqs),

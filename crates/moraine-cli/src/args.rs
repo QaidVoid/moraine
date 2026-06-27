@@ -46,6 +46,11 @@ pub struct Cli {
     #[arg(short = 'N', long)]
     pub newuse: bool,
 
+    /// Reinstall installed packages whose enabled USE flags changed, ignoring a
+    /// change limited to IUSE (`--changed-use`).
+    #[arg(long = "changed-use")]
+    pub changed_use: bool,
+
     /// Reinstall installed packages whose dependencies changed in the ebuild,
     /// ignoring slot-operator bindings (`--changed-deps`).
     #[arg(long = "changed-deps")]

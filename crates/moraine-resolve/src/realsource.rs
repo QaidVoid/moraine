@@ -16,9 +16,14 @@ use moraine_repo::RepoIndex;
 use moraine_vdb::Store;
 use moraine_version::Version;
 
+use crate::depnode::{BlockerKind, DepNode};
 use crate::normalize::normalize_depspec;
 use crate::required_use::parse_required_use;
 use crate::source::{AcceptChange, Acceptability, InstalledMeta, PackageMeta, ResolveSource};
+
+/// The new-style virtual whose installed providers are the system libc, stripped
+/// from the `--changed-deps` comparison (Portage's `LIBC_PACKAGE_ATOM`).
+const LIBC_PACKAGE_ATOM: &str = "virtual/libc";
 
 /// A resolution source over a repository index, installed store, and resolved
 /// configuration.
@@ -401,6 +406,46 @@ impl ResolveSource for RealSource<'_> {
         BTreeSet::new()
     }
 
+    fn forced_use(&self, meta: &PackageMeta) -> BTreeSet<String> {
+        let (category, package) = match Self::split_cp(&meta.cp) {
+            Some(p) => p,
+            None => return BTreeSet::new(),
+        };
+        for cand in self.repo.match_atom_str(&meta.cp) {
+            let store = &self.repo.repos()[cand.repo_order].store;
+            let interner = store.interner();
+            let entry = cand.entry;
+            if entry.version != meta.version {
+                continue;
+            }
+            let pref = PackageRef {
+                category: interner.intern(category),
+                package: interner.intern(package),
+                version: &entry.version,
+                slot: Some(entry.slot),
+                subslot: entry.subslot,
+                repo: Some(entry.repository),
+            };
+            let iuse: Vec<String> = entry
+                .iuse
+                .iter()
+                .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
+                .collect();
+            let restrict_test = entry
+                .restrict
+                .iter()
+                .any(|r| interner.resolve(*r).as_deref() == Some("test"));
+            // `forced` is the union of `use.force` and `use.mask`: exactly the
+            // flags whose state the profile fixes, which the `--newuse` IUSE
+            // difference subtracts before triggering a reinstall.
+            return self
+                .config
+                .effective_use(&pref, &iuse, self.stable, restrict_test)
+                .forced;
+        }
+        BTreeSet::new()
+    }
+
     fn locked_use(&self, meta: &PackageMeta) -> BTreeSet<String> {
         let (category, package) = match Self::split_cp(&meta.cp) {
             Some(p) => p,
@@ -494,6 +539,44 @@ impl ResolveSource for RealSource<'_> {
                 Some(self.record_to_installed(cp, record))
             })
             .collect()
+    }
+
+    fn libc_providers(&self) -> BTreeSet<String> {
+        // Expand `virtual/libc`'s RDEPEND providers from the repository, then
+        // keep only those actually installed, mirroring `find_libc_deps` running
+        // `expand_new_virt` over the vartree.
+        let mut out = BTreeSet::new();
+        for vmeta in self.versions_of(LIBC_PACKAGE_ATOM) {
+            collect_leaf_cps(&vmeta.rdepend, &mut out);
+        }
+        out.retain(|cp| !self.installed(cp).is_empty());
+        out
+    }
+}
+
+/// Collect the `category/package` of every non-blocker leaf atom in a dependency
+/// node, ignoring USE conditionals, so the libc-provider scan sees every concrete
+/// provider a new-style virtual could pull in.
+fn collect_leaf_cps(node: &DepNode, out: &mut BTreeSet<String>) {
+    match node {
+        DepNode::Leaf(atom) => {
+            if atom.blocker == BlockerKind::None {
+                out.insert(atom.cp.clone());
+            }
+        }
+        DepNode::AllOf(children)
+        | DepNode::AnyOf(children)
+        | DepNode::ExactlyOneOf(children)
+        | DepNode::AtMostOneOf(children) => {
+            for c in children {
+                collect_leaf_cps(c, out);
+            }
+        }
+        DepNode::Conditional { body, .. } => {
+            for c in body {
+                collect_leaf_cps(c, out);
+            }
+        }
     }
 }
 

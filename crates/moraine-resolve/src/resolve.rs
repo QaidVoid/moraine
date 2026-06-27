@@ -73,8 +73,12 @@ pub struct Modifiers {
     /// `None` and any positive depth run it. `None` means unbounded.
     pub deep_depth: Option<u32>,
     /// Treat a USE-flag change against the installed package as a reinstall
-    /// trigger (`--newuse`).
+    /// trigger (`--newuse`). This fires on a change to the enabled USE set or,
+    /// after subtracting the profile-forced flags, the declared IUSE set.
     pub newuse: bool,
+    /// Treat only a change to the enabled USE set against the installed package
+    /// as a reinstall trigger (`--changed-use`), ignoring an IUSE-only change.
+    pub changed_use: bool,
     /// Reinstall an installed package whose ebuild dependencies changed,
     /// comparing slot-stripped `*DEPEND` (`--changed-deps`).
     pub changed_deps: bool,
@@ -145,6 +149,14 @@ pub fn resolve_with<S: ResolveSource>(
     let mut use_overrides: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut use_changes: BTreeMap<String, Vec<UseChange>> = BTreeMap::new();
     let mut use_restarts = 0u32;
+    // The installed libc providers' `cp` keys, stripped from both sides of the
+    // `--changed-deps` comparison. Computed once since it depends only on the
+    // source, not on the partial solution.
+    let libc_providers = if modifiers.changed_deps {
+        source.libc_providers()
+    } else {
+        BTreeSet::new()
+    };
 
     loop {
         let mut all_atoms = request_atoms.clone();
@@ -218,8 +230,14 @@ pub fn resolve_with<S: ResolveSource>(
             }
         }
 
-        let mut resolved =
-            assemble_solution(source, &decisions, modifiers, &use_overrides, &use_changes)?;
+        let mut resolved = assemble_solution(
+            source,
+            &decisions,
+            modifiers,
+            &use_overrides,
+            &use_changes,
+            &libc_providers,
+        )?;
         // Fold the `||` branch-fallback, slot-restart, and USE-autounmask
         // re-solves into the reported count, distinct from the solver's inner
         // backjumps (`stats`).
@@ -309,6 +327,7 @@ fn assemble_solution<S: ResolveSource>(
     modifiers: Modifiers,
     use_overrides: &BTreeMap<String, BTreeSet<String>>,
     use_changes: &BTreeMap<String, Vec<UseChange>>,
+    libc: &BTreeSet<String>,
 ) -> Result<ResolvedSolution, ResolveError> {
     // The selected packages, grouped by cp so two slots of one cp both appear.
     let mut selected: BTreeMap<String, Vec<(Version, PackageMeta)>> = BTreeMap::new();
@@ -342,11 +361,12 @@ fn assemble_solution<S: ResolveSource>(
                 .cloned()
                 .unwrap_or_else(|| source.resolved_use(meta));
             let features = features_for(&meta.eapi);
-            // `--newuse` turns a USE change against the installed package into a
-            // reinstall, so an unchanged-version install with a different USE set
-            // is no longer treated as already installed.
+            // `--newuse`/`--changed-use` turn a USE change against the installed
+            // package into a reinstall, so an unchanged-version install with a
+            // different USE (or, under `--newuse`, IUSE) set is no longer treated
+            // as already installed.
             let already_installed = source.installed_matches(cp, version, &meta.slot)
-                && !(modifiers.newuse && use_changed(source, cp, &meta.slot, &resolved_use));
+                && !use_changed(source, meta, &resolved_use, modifiers);
 
             // Autounmask: a newly-merged package the solver could only reach via a
             // soft mask records the keyword/license change the user must accept.
@@ -428,7 +448,7 @@ fn assemble_solution<S: ResolveSource>(
                 && source.installed(cp).iter().any(|inst| {
                     &inst.version == version
                         && !inst.recorded_deps.is_empty()
-                        && deps_changed(meta, inst)
+                        && deps_changed(meta, inst, libc)
                 })
             {
                 subslot_rebuild = true;
@@ -541,19 +561,44 @@ fn change_auto_applied(change: &AcceptChange, policy: &AutounmaskPolicy) -> bool
         && (change.use_changes.is_empty() || !policy.keep_use)
 }
 
-/// Whether the resolved USE for a `(cp, slot)` differs from the installed
-/// package's recorded enabled USE, the `--newuse` reinstall trigger.
-fn use_changed<S: ResolveSource>(
+/// Whether the installed package at `meta`'s `(cp, slot)` must be reinstalled
+/// because its USE changed, the `--newuse`/`--changed-use` reinstall trigger.
+///
+/// `--changed-use` fires when the resolved enabled USE differs from the
+/// installed record. `--newuse` fires on that same enabled-set change or, after
+/// subtracting the profile-forced flags, on a change to the declared IUSE set,
+/// so adding or removing a default-off flag reinstalls even when no enabled flag
+/// changed. The terms mirror Portage's `_reinstall_for_flags`: the enabled-set
+/// term is `(orig_iuse & orig_use) ^ (cur_iuse & cur_use)`, which the recorded
+/// IUSE-intersected `use_enabled` makes equal to `inst.use_enabled != resolved`,
+/// and the IUSE term is `(orig_iuse ^ cur_iuse) - forced_flags`. With neither
+/// modifier set the trigger never fires.
+pub(crate) fn use_changed<S: ResolveSource>(
     source: &S,
-    cp: &str,
-    slot: &str,
+    meta: &PackageMeta,
     resolved_use: &BTreeSet<String>,
+    modifiers: Modifiers,
 ) -> bool {
-    source
-        .installed(cp)
+    if !modifiers.newuse && !modifiers.changed_use {
+        return false;
+    }
+    let Some(inst) = source
+        .installed(&meta.cp)
         .into_iter()
-        .find(|i| i.slot == slot)
-        .is_some_and(|inst| &inst.use_enabled != resolved_use)
+        .find(|i| i.slot == meta.slot)
+    else {
+        return false;
+    };
+    let enabled_changed = inst.use_enabled != *resolved_use;
+    if !modifiers.newuse {
+        return enabled_changed;
+    }
+    let forced = source.forced_use(meta);
+    let iuse_changed = inst
+        .iuse
+        .symmetric_difference(&meta.iuse)
+        .any(|flag| !forced.contains(flag));
+    enabled_changed || iuse_changed
 }
 
 /// Enforce blockers declared by packages that remain installed against the
@@ -1007,15 +1052,26 @@ fn emit_virtual_edges<S: ResolveSource>(
 /// Both sides are USE-reduced against the installed USE and rendered without
 /// slot/sub-slot, so only a structural dependency change (an atom added,
 /// removed, or its version constraint or USE-deps changed) is detected, not a
-/// slot-operator binding difference, mirroring Portage's `strip_slots`.
-fn deps_changed(meta: &PackageMeta, inst: &crate::source::InstalledMeta) -> bool {
+/// slot-operator binding difference, mirroring Portage's `strip_slots`. Any atom
+/// whose `cp` is in `libc` is dropped from both sides first, so the auto-injected
+/// libc dependency does not register as a change, mirroring `strip_libc_deps`.
+fn deps_changed(
+    meta: &PackageMeta,
+    inst: &crate::source::InstalledMeta,
+    libc: &BTreeSet<String>,
+) -> bool {
     let interner = Interner::new();
-    current_dep_set(meta, &inst.use_enabled) != recorded_dep_set(&inst.recorded_deps, &interner)
+    current_dep_set(meta, &inst.use_enabled, libc)
+        != recorded_dep_set(&inst.recorded_deps, &interner, libc)
 }
 
 /// The slot-stripped atom set of the current ebuild's dependencies, USE-reduced
-/// against `parent_use`.
-fn current_dep_set(meta: &PackageMeta, parent_use: &BTreeSet<String>) -> BTreeSet<String> {
+/// against `parent_use`, with libc-provider atoms removed.
+fn current_dep_set(
+    meta: &PackageMeta,
+    parent_use: &BTreeSet<String>,
+    libc: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for node in [
         &meta.bdepend,
@@ -1027,6 +1083,9 @@ fn current_dep_set(meta: &PackageMeta, parent_use: &BTreeSet<String>) -> BTreeSe
         let mut atoms: Vec<(&NormAtom, bool)> = Vec::new();
         collect_atoms(node, parent_use, false, &mut atoms);
         for (atom, _) in atoms {
+            if libc.contains(&atom.cp) {
+                continue;
+            }
             out.insert(canonical_atom(atom));
         }
     }
@@ -1034,8 +1093,12 @@ fn current_dep_set(meta: &PackageMeta, parent_use: &BTreeSet<String>) -> BTreeSe
 }
 
 /// The slot-stripped atom set parsed from recorded `*DEPEND` strings (already
-/// USE-reduced when recorded).
-fn recorded_dep_set(recorded: &BTreeMap<String, String>, interner: &Interner) -> BTreeSet<String> {
+/// USE-reduced when recorded), with libc-provider atoms removed.
+fn recorded_dep_set(
+    recorded: &BTreeMap<String, String>,
+    interner: &Interner,
+    libc: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let empty = BTreeSet::new();
     let mut out = BTreeSet::new();
     for raw in recorded.values() {
@@ -1046,6 +1109,9 @@ fn recorded_dep_set(recorded: &BTreeMap<String, String>, interner: &Interner) ->
         let mut atoms: Vec<(&NormAtom, bool)> = Vec::new();
         collect_atoms(&node, &empty, false, &mut atoms);
         for (atom, _) in atoms {
+            if libc.contains(&atom.cp) {
+                continue;
+            }
             out.insert(canonical_atom(atom));
         }
     }

@@ -1016,6 +1016,85 @@ fn newuse_reinstalls_on_use_change() {
 }
 
 #[test]
+fn newuse_reinstalls_on_iuse_addition() {
+    // The current ebuild gained a default-off IUSE flag `foo` that nothing
+    // enables; the installed build never carried it in IUSE. The enabled USE
+    // set is unchanged, so only the IUSE symmetric difference fires.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/a",
+        version: "1",
+        iuse: &["foo"],
+        use_enabled: &[],
+        ..Default::default()
+    });
+    f.add_installed(installed("cat/a", "1", "0", None, &[]));
+
+    // --changed-use: only the enabled set counts, and it is unchanged, so the
+    // package stays a no-op reinstall.
+    let sol = resolve_with(
+        &f,
+        &["cat/a"],
+        Modifiers {
+            changed_use: true,
+            ..Default::default()
+        },
+    )
+    .expect("resolves");
+    assert!(
+        sol.package("cat/a").unwrap().already_installed,
+        "an IUSE-only change must not trigger --changed-use"
+    );
+
+    // --newuse: the IUSE symmetric difference is non-empty, so the package is
+    // reinstalled even though no enabled flag changed.
+    let sol = resolve_with(
+        &f,
+        &["cat/a"],
+        Modifiers {
+            newuse: true,
+            ..Default::default()
+        },
+    )
+    .expect("resolves");
+    assert!(
+        !sol.package("cat/a").unwrap().already_installed,
+        "an added default-off IUSE flag must trigger --newuse"
+    );
+}
+
+#[test]
+fn newuse_ignores_forced_iuse_flag() {
+    // The current ebuild gained an IUSE flag `foo` that the profile forces or
+    // masks. Subtracting the forced set empties the IUSE difference, so it does
+    // not trigger a reinstall on its own.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/a",
+        version: "1",
+        iuse: &["foo"],
+        use_enabled: &[],
+        forced_use: &["foo"],
+        ..Default::default()
+    });
+    f.add_installed(installed("cat/a", "1", "0", None, &[]));
+
+    let sol = resolve_with(
+        &f,
+        &["cat/a"],
+        Modifiers {
+            newuse: true,
+            ..Default::default()
+        },
+    )
+    .expect("resolves");
+    assert!(
+        sol.package("cat/a").unwrap().already_installed,
+        "a profile-forced IUSE flag must not trigger a --newuse reinstall"
+    );
+}
+
+#[test]
 fn installed_package_blocker_blocks_new_install() {
     // An installed Y declares `!cat/x` in RDEPEND. Installing cat/x while Y
     // stays installed is an unresolvable blocker.
@@ -1278,6 +1357,54 @@ fn changed_deps_forces_reinstall() {
     assert!(
         sol.package("cat/a").unwrap().subslot_rebuild,
         "a dependency change must force a reinstall under --changed-deps"
+    );
+}
+
+#[test]
+fn changed_deps_ignores_libc_only_difference() {
+    // The installed cat/a-1 recorded an auto-injected sys-libs/glibc dependency
+    // that the current ebuild does not declare. The only structural difference
+    // is that libc atom.
+    let make = || {
+        let mut f = Fixture::new();
+        f.add(pkg("cat/a", "1"));
+        let mut inst = installed("cat/a", "1", "0", None, &[]);
+        inst.recorded_deps
+            .insert("RDEPEND".to_owned(), "sys-libs/glibc".to_owned());
+        f.add_installed(inst);
+        f
+    };
+
+    // Without a libc-provider set the injected atom is a structural difference,
+    // so --changed-deps flags the package.
+    let f = make();
+    let sol = resolve_with(
+        &f,
+        &["cat/a"],
+        Modifiers {
+            changed_deps: true,
+            ..Default::default()
+        },
+    )
+    .expect("resolves");
+    assert!(sol.package("cat/a").unwrap().subslot_rebuild);
+
+    // Reporting sys-libs/glibc as a libc provider strips it from both sides, so
+    // the difference vanishes and the package is not flagged.
+    let mut f = make();
+    f.set_libc_providers(&["sys-libs/glibc"]);
+    let sol = resolve_with(
+        &f,
+        &["cat/a"],
+        Modifiers {
+            changed_deps: true,
+            ..Default::default()
+        },
+    )
+    .expect("resolves");
+    assert!(
+        !sol.package("cat/a").unwrap().subslot_rebuild,
+        "a difference limited to the libc atom must not trigger --changed-deps"
     );
 }
 
