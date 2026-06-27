@@ -113,11 +113,12 @@ impl Store {
             .collect()
     }
 
-    /// The sonames `record` requires, as recorded in its linkage data.
+    /// The sonames `record` requires as `(multilib-category bucket, soname)`
+    /// pairs, as recorded in its linkage data.
     pub fn required_sonames<'a>(
         &self,
         record: &'a PackageRecord,
-    ) -> impl Iterator<Item = Symbol> + 'a {
-        record.requires.sonames()
+    ) -> impl Iterator<Item = (Symbol, Symbol)> + 'a {
+        record.requires.entries.iter().map(|e| (e.bucket, e.soname))
     }
 }

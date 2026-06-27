@@ -86,7 +86,16 @@ pub fn scan_image_sonames(image_dir: &Path) -> SonameScan {
     scan.provides.dedup();
     scan.requires.sort();
     scan.requires.dedup();
+    intersect_self_provided(&scan.provides, &mut scan.requires);
     scan
+}
+
+/// Drop from `requires` any `(bucket, soname)` present in `provides` for the same
+/// bucket, mirroring `SonameDepsProcessor._intersect`: a soname the image itself
+/// provides is not an external requirement.
+fn intersect_self_provided(provides: &[(String, String)], requires: &mut Vec<(String, String)>) {
+    let provided: std::collections::HashSet<&(String, String)> = provides.iter().collect();
+    requires.retain(|pair| !provided.contains(pair));
 }
 
 /// The dynamic linkage of one ELF object.
@@ -299,6 +308,21 @@ mod tests {
             dynamic.soname.is_some() || !dynamic.needed.is_empty(),
             "a dynamic ELF should declare a soname or needed libraries"
         );
+    }
+
+    #[test]
+    fn intersect_drops_self_provided_per_bucket() {
+        let provides = vec![("x86_64".to_string(), "libfoo.so.1".to_string())];
+        let mut requires = vec![
+            ("x86_64".to_string(), "libfoo.so.1".to_string()),
+            ("x86_64".to_string(), "libc.so.6".to_string()),
+            // Same soname in a different bucket is not self-provided here.
+            ("x86_32".to_string(), "libfoo.so.1".to_string()),
+        ];
+        intersect_self_provided(&provides, &mut requires);
+        assert!(!requires.contains(&("x86_64".to_string(), "libfoo.so.1".to_string())));
+        assert!(requires.contains(&("x86_64".to_string(), "libc.so.6".to_string())));
+        assert!(requires.contains(&("x86_32".to_string(), "libfoo.so.1".to_string())));
     }
 
     #[test]

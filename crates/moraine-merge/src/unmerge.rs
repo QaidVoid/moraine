@@ -42,8 +42,8 @@ enum ObjAction {
     /// modified, or already gone).
     Skip,
     /// Defer the file to preserve-libs reconciliation, carrying its recorded
-    /// soname so the standalone-unmerge path can register it.
-    Preserve(String),
+    /// `(bucket, soname)` so the standalone-unmerge path can register it.
+    Preserve(String, String),
 }
 
 /// Walk and remove the CONTENTS of `cpv` from the live root.
@@ -113,10 +113,11 @@ pub(crate) fn unmerge(
                         result.skipped.push(entry.path.clone());
                         continue;
                     }
-                    ObjAction::Preserve(soname) => {
+                    ObjAction::Preserve(bucket, soname) => {
                         result.skipped.push(entry.path.clone());
                         result.preserved.push(PreservedEntry {
                             cpv: cpv.to_string(),
+                            bucket,
                             soname,
                             path: entry.path.clone(),
                         });
@@ -222,7 +223,7 @@ fn classify_obj(
     interner: &Interner,
     cpv: &str,
     path: &str,
-    soname_map: &HashMap<String, String>,
+    soname_map: &HashMap<String, (String, String)>,
     md5: &str,
     mtime: i64,
 ) -> Result<ObjAction, MergeError> {
@@ -235,12 +236,13 @@ fn classify_obj(
         return Ok(ObjAction::Skip);
     }
     // Defer a still-needed shared library to preserve-libs reconciliation,
-    // matching the library to its soname by recorded `NEEDED.ELF.2` linkage.
+    // matching the library to its soname by recorded `NEEDED.ELF.2` linkage and
+    // matching consumers within the same multilib category bucket.
     if ctx.features.preserve_libs
-        && let Some(soname) = soname_map.get(path)
-        && preserve::soname_still_needed(store, interner, soname, Some(cpv))
+        && let Some((bucket, soname)) = soname_map.get(path)
+        && preserve::soname_still_needed(store, interner, bucket, soname, Some(cpv))
     {
-        return Ok(ObjAction::Preserve(soname.clone()));
+        return Ok(ObjAction::Preserve(bucket.clone(), soname.clone()));
     }
     // An empty recorded md5 is a preserved-library placeholder: never remove it.
     if md5.is_empty() {

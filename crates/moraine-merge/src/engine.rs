@@ -125,11 +125,12 @@ impl MergeEngine {
             let cpv = record.cpv(interner);
             let soname_map = preserve::needed_soname_map(&record.needed);
             for entry in record.contents.iter() {
-                if let Some(soname) = soname_map.get(&entry.path)
-                    && preserve::soname_still_needed(store, interner, soname, Some(&cpv))
+                if let Some((bucket, soname)) = soname_map.get(&entry.path)
+                    && preserve::soname_still_needed(store, interner, bucket, soname, Some(&cpv))
                 {
                     reg.insert(crate::preserve::PreservedEntry {
                         cpv: cpv.clone(),
+                        bucket: bucket.clone(),
                         soname: soname.clone(),
                         path: entry.path.clone(),
                     });

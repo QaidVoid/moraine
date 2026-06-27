@@ -53,4 +53,11 @@ impl Requires {
     pub fn sonames(&self) -> impl Iterator<Item = Symbol> + '_ {
         self.entries.iter().map(|e| e.soname)
     }
+
+    /// Whether this package requires `soname` within `bucket`.
+    pub fn requires_in(&self, bucket: Symbol, soname: Symbol) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.bucket == bucket && e.soname == soname)
+    }
 }

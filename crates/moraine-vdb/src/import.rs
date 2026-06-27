@@ -150,8 +150,7 @@ pub fn import_package_dir(dir: &Path, interner: &Interner) -> Result<PackageReco
         }
     }
 
-    let provides = parse_needed_provides(dir, interner)?;
-    let requires = parse_needed_requires(dir, interner)?;
+    let (provides, requires) = read_soname_linkage(dir, interner)?;
     let contents = parse_contents(dir, &cpv)?;
 
     let environment = env_blob.map(|blob| EnvironmentRef {
@@ -381,13 +380,77 @@ fn parse_contents_line(line: &str) -> Option<Entry> {
     }
 }
 
-/// Parse `NEEDED.ELF.2` into the provided sonames.
+/// Read a package's soname linkage, preferring the authoritative `PROVIDES` and
+/// `REQUIRES` files Portage writes over a recompute from `NEEDED.ELF.2`.
+///
+/// When a `PROVIDES` or `REQUIRES` file is present it is recorded verbatim, since
+/// it already carries the multilib-category buckets and the `PROVIDES_EXCLUDE`/
+/// `REQUIRES_EXCLUDE` filtering moraine cannot reconstruct from `NEEDED.ELF.2`
+/// (`doebuild.py:3270-3363`). When a file is absent the side is recomputed from
+/// `NEEDED.ELF.2`; the recomputed `REQUIRES` drops any soname the package itself
+/// provides in the same bucket, mirroring `SonameDepsProcessor._intersect`.
+fn read_soname_linkage(dir: &Path, interner: &Interner) -> Result<(Provides, Requires), VdbError> {
+    // The NEEDED-derived provides are the fallback for an absent `PROVIDES` file
+    // and the self-provided set the recomputed `REQUIRES` intersects against.
+    let needed_provides = parse_needed_provides(dir, interner)?;
+
+    let provides = match read_soname_file(dir, "PROVIDES", interner)? {
+        Some(entries) => Provides { entries },
+        None => needed_provides.clone(),
+    };
+    let requires = match read_soname_file(dir, "REQUIRES", interner)? {
+        Some(entries) => Requires { entries },
+        None => {
+            let recomputed = parse_needed_requires(dir, interner)?;
+            Requires {
+                entries: recomputed
+                    .entries
+                    .into_iter()
+                    .filter(|e| !needed_provides.provides_in(e.bucket, e.soname))
+                    .collect(),
+            }
+        }
+    };
+    Ok((provides, requires))
+}
+
+/// Read an authoritative `PROVIDES`/`REQUIRES` file into `(bucket, soname)`
+/// entries, returning `None` when the file is absent. The format is
+/// `bucket: soname soname` groups, the inverse of `render_sonames`, matching the
+/// shape `moraine_binpkg::resolution::parse_sonames` reads.
+fn read_soname_file(
+    dir: &Path,
+    name: &str,
+    interner: &Interner,
+) -> Result<Option<Vec<SonameEntry>>, VdbError> {
+    let path = dir.join(name);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(VdbError::Io { path, source }),
+    };
+    let mut entries = Vec::new();
+    let mut bucket = "";
+    for token in text.split_whitespace() {
+        if let Some(label) = token.strip_suffix(':') {
+            bucket = label;
+        } else {
+            entries.push(SonameEntry {
+                bucket: interner.intern(bucket),
+                soname: interner.intern(token),
+            });
+        }
+    }
+    Ok(Some(entries))
+}
+
+/// Parse `NEEDED.ELF.2` into the provided sonames, bucketed by multilib category.
 fn parse_needed_provides(dir: &Path, interner: &Interner) -> Result<Provides, VdbError> {
     let mut entries = Vec::new();
     for fields in read_needed(dir)? {
         if let Some(soname) = fields.soname {
             entries.push(SonameEntry {
-                bucket: interner.intern(&fields.arch),
+                bucket: interner.intern(&fields.bucket),
                 soname: interner.intern(&soname),
             });
         }
@@ -395,11 +458,11 @@ fn parse_needed_provides(dir: &Path, interner: &Interner) -> Result<Provides, Vd
     Ok(Provides { entries })
 }
 
-/// Parse `NEEDED.ELF.2` into the required sonames.
+/// Parse `NEEDED.ELF.2` into the required sonames, bucketed by multilib category.
 fn parse_needed_requires(dir: &Path, interner: &Interner) -> Result<Requires, VdbError> {
     let mut entries = Vec::new();
     for fields in read_needed(dir)? {
-        let bucket = interner.intern(&fields.arch);
+        let bucket = interner.intern(&fields.bucket);
         for needed in fields.needed {
             entries.push(SonameEntry {
                 bucket,
@@ -412,7 +475,10 @@ fn parse_needed_requires(dir: &Path, interner: &Interner) -> Result<Requires, Vd
 
 /// One parsed `NEEDED.ELF.2` line.
 struct Needed {
-    arch: String,
+    /// The multilib category bucket: the sixth field when present, else the
+    /// first field (the ELF arch) as a fallback, mirroring
+    /// `NeededEntry.multilib_category`.
+    bucket: String,
     soname: Option<String>,
     needed: Vec<String>,
 }
@@ -437,7 +503,10 @@ fn read_needed(dir: &Path) -> Result<Vec<Needed>, VdbError> {
         if line.trim().is_empty() {
             continue;
         }
-        // `arch;path;soname;rpath;needed-csv`
+        // `arch;path;soname;rpath;needed-csv;multilib-category`. The sixth field
+        // is the authoritative multilib-category bucket; field 0 (the ELF arch)
+        // is the fallback only when it is absent or empty, so Portage's six-field
+        // lines and moraine's legacy five-field lines both resolve to the bucket.
         let fields: Vec<&str> = line.split(';').collect();
         if fields.len() < 5 {
             return Err(VdbError::BadNeeded {
@@ -445,7 +514,12 @@ fn read_needed(dir: &Path) -> Result<Vec<Needed>, VdbError> {
                 line: line.to_string(),
             });
         }
-        let arch = fields[0].to_string();
+        let bucket = fields
+            .get(5)
+            .filter(|f| !f.is_empty())
+            .copied()
+            .unwrap_or(fields[0])
+            .to_string();
         let soname = if fields[2].is_empty() {
             None
         } else {
@@ -457,7 +531,7 @@ fn read_needed(dir: &Path) -> Result<Vec<Needed>, VdbError> {
             .map(str::to_string)
             .collect();
         out.push(Needed {
-            arch,
+            bucket,
             soname,
             needed,
         });
@@ -553,5 +627,89 @@ mod tests {
     fn parses_dir_line() {
         let e = parse_contents_line("dir /usr/bin").unwrap();
         assert!(matches!(e.kind, EntryKind::Dir));
+    }
+
+    #[test]
+    fn buckets_by_multilib_category_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("app-misc").join("foo-1");
+        std::fs::create_dir_all(&pkg).unwrap();
+        // A Portage six-field line: ELF arch `X86_64`, multilib category `x86_64`.
+        std::fs::write(
+            pkg.join("NEEDED.ELF.2"),
+            "X86_64;/usr/lib64/libfoo.so.1;libfoo.so.1;;libc.so.6;x86_64\n",
+        )
+        .unwrap();
+
+        let interner = Interner::new();
+        let provides = parse_needed_provides(&pkg, &interner).unwrap();
+        let x86_64 = interner.intern("x86_64");
+        let big_x86_64 = interner.intern("X86_64");
+        let libfoo = interner.intern("libfoo.so.1");
+        // The soname buckets under the multilib category, not the ELF arch.
+        assert!(provides.provides_in(x86_64, libfoo));
+        assert!(!provides.provides_in(big_x86_64, libfoo));
+    }
+
+    #[test]
+    fn legacy_five_field_line_buckets_by_field_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("app-misc").join("bar-1");
+        std::fs::create_dir_all(&pkg).unwrap();
+        // A moraine legacy five-field line carries the multilib token in field 0.
+        std::fs::write(
+            pkg.join("NEEDED.ELF.2"),
+            "x86_64;/usr/lib64/libbar.so.1;libbar.so.1;;libc.so.6\n",
+        )
+        .unwrap();
+
+        let interner = Interner::new();
+        let provides = parse_needed_provides(&pkg, &interner).unwrap();
+        let x86_64 = interner.intern("x86_64");
+        let libbar = interner.intern("libbar.so.1");
+        assert!(provides.provides_in(x86_64, libbar));
+    }
+
+    #[test]
+    fn stored_requires_file_is_recorded_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("app-misc").join("baz-1");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("NEEDED.ELF.2"),
+            "X86_64;/usr/lib64/libbaz.so.1;libbaz.so.1;;libc.so.6;x86_64\n",
+        )
+        .unwrap();
+        // Portage wrote authoritative PROVIDES/REQUIRES; they win over a recompute.
+        std::fs::write(pkg.join("PROVIDES"), "x86_64: libbaz.so.1\n").unwrap();
+        std::fs::write(pkg.join("REQUIRES"), "x86_64: libc.so.6\n").unwrap();
+
+        let interner = Interner::new();
+        let (provides, requires) = read_soname_linkage(&pkg, &interner).unwrap();
+        let x86_64 = interner.intern("x86_64");
+        assert!(provides.provides_in(x86_64, interner.intern("libbaz.so.1")));
+        assert!(requires.requires_in(x86_64, interner.intern("libc.so.6")));
+    }
+
+    #[test]
+    fn recomputed_requires_excludes_self_provided() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("app-misc").join("qux-1");
+        std::fs::create_dir_all(&pkg).unwrap();
+        // No PROVIDES/REQUIRES files: recompute from NEEDED. One object provides
+        // `libqux.so.1` and another needs it, so it must drop out of REQUIRES.
+        std::fs::write(
+            pkg.join("NEEDED.ELF.2"),
+            "X86_64;/usr/lib64/libqux.so.1;libqux.so.1;;libc.so.6;x86_64\n\
+             X86_64;/usr/bin/qux;;;libqux.so.1,libc.so.6;x86_64\n",
+        )
+        .unwrap();
+
+        let interner = Interner::new();
+        let (_provides, requires) = read_soname_linkage(&pkg, &interner).unwrap();
+        let x86_64 = interner.intern("x86_64");
+        // The self-provided soname is intersected out; the external one remains.
+        assert!(!requires.requires_in(x86_64, interner.intern("libqux.so.1")));
+        assert!(requires.requires_in(x86_64, interner.intern("libc.so.6")));
     }
 }

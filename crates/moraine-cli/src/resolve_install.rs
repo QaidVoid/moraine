@@ -1466,10 +1466,22 @@ fn compute_preserved_rebuild(vdb: &Store, state_dir: &Path) -> Vec<String> {
     if registry.is_empty() {
         return Vec::new();
     }
-    let preserved_sonames: BTreeSet<String> = registry
+    let interner = vdb.interner();
+    // A soname is preserved-only when no non-preserved installed package provides
+    // it in the same bucket, mirroring `findConsumers(greedy=False)`. The
+    // preserved library itself is recorded under the new owner but never appears
+    // in any record's PROVIDES, so a bucketed provides match is a real provider.
+    let preserved_sonames: BTreeSet<(String, String)> = registry
         .entries()
         .iter()
-        .map(|e| e.soname.clone())
+        .map(|e| (e.bucket.clone(), e.soname.clone()))
+        .filter(|(bucket, soname)| {
+            let bucket_sym = interner.intern(bucket);
+            let soname_sym = interner.intern(soname);
+            !vdb.records()
+                .iter()
+                .any(|r| r.provides.provides_in(bucket_sym, soname_sym))
+        })
         .collect();
     let preserved_owners: BTreeSet<String> = registry
         .entries()
@@ -1480,8 +1492,7 @@ fn compute_preserved_rebuild(vdb: &Store, state_dir: &Path) -> Vec<String> {
             format!("{category}/{pn}")
         })
         .collect();
-    let interner = vdb.interner();
-    let consumers: Vec<(String, Vec<String>)> = vdb
+    let consumers: Vec<(String, Vec<(String, String)>)> = vdb
         .records()
         .iter()
         .filter_map(|record| {
@@ -1489,7 +1500,12 @@ fn compute_preserved_rebuild(vdb: &Store, state_dir: &Path) -> Vec<String> {
             let package = interner.resolve(record.package)?;
             let sonames = vdb
                 .required_sonames(record)
-                .filter_map(|s| interner.resolve(s).map(|x| x.to_string()))
+                .filter_map(|(bucket, soname)| {
+                    Some((
+                        interner.resolve(bucket)?.to_string(),
+                        interner.resolve(soname)?.to_string(),
+                    ))
+                })
                 .collect();
             Some((format!("{category}/{package}"), sonames))
         })

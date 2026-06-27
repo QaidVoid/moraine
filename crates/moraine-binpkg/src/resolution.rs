@@ -392,6 +392,18 @@ mod tests {
     }
 
     #[test]
+    fn imported_provider_satisfies_bucketed_requires() {
+        // A binary requires `libc.so.6` in the `x86_64` bucket; an installed
+        // provider imported from a Portage VDB carries the same bucket label.
+        let mut c = candidate("", "x86_64-pc-linux-gnu");
+        c.metadata.set_str(KEY_REQUIRES, "x86_64: libc.so.6");
+        let mut t = target(&[], "x86_64-pc-linux-gnu");
+        t.available_sonames
+            .insert(("x86_64".into(), "libc.so.6".into()));
+        assert_eq!(check_compatibility(&c, &t), Verdict::Accept);
+    }
+
+    #[test]
     fn absent_soname_data_falls_back() {
         // No REQUIRES recorded: soname check is skipped, USE/CHOST decide.
         let c = candidate("ssl", "x86_64-pc-linux-gnu");

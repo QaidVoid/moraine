@@ -222,43 +222,46 @@ fn render_needed(record: &PackageRecord, interner: &Interner) -> String {
     }
     let mut out = String::new();
     for e in &record.provides.entries {
-        let arch = resolve(interner, e.bucket);
+        let bucket = resolve(interner, e.bucket);
         let soname = resolve(interner, e.soname);
-        out.push_str(&format!("{arch};/{soname};{soname};;\n"));
+        // `arch;path;soname;rpath;needed;multilib_category`: the bucket fills both
+        // the arch and the multilib-category field so the line round-trips.
+        out.push_str(&format!("{bucket};/{soname};{soname};;;{bucket}\n"));
     }
-    // Group requires by arch into a single consumer line each.
-    let mut by_arch: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    // Group requires by bucket into a single consumer line each.
+    let mut by_bucket: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for e in &record.requires.entries {
-        by_arch
+        by_bucket
             .entry(resolve(interner, e.bucket))
             .or_default()
             .push(resolve(interner, e.soname));
     }
-    for (arch, sonames) in by_arch {
+    for (bucket, sonames) in by_bucket {
         out.push_str(&format!(
-            "{arch};/{}.consumer;;;{}\n",
-            arch,
+            "{bucket};/{}.consumer;;;{};{bucket}\n",
+            bucket,
             sonames.join(",")
         ));
     }
     out
 }
 
-/// Render the PROVIDES/REQUIRES file as `<arch>: soname soname` lines.
+/// Render the PROVIDES/REQUIRES file as `<multilib-category>: soname soname`
+/// lines, labeling each group by the multilib category carried in the records.
 fn render_sonames<'a>(
     entries: impl Iterator<Item = &'a crate::soname::SonameEntry>,
     interner: &Interner,
 ) -> String {
-    let mut by_arch: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut by_bucket: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for e in entries {
-        by_arch
+        by_bucket
             .entry(resolve(interner, e.bucket))
             .or_default()
             .push(resolve(interner, e.soname));
     }
     let mut out = String::new();
-    for (arch, sonames) in by_arch {
-        out.push_str(&format!("{arch}: {}\n", sonames.join(" ")));
+    for (bucket, sonames) in by_bucket {
+        out.push_str(&format!("{bucket}: {}\n", sonames.join(" ")));
     }
     out
 }

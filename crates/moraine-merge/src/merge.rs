@@ -645,9 +645,9 @@ fn remove_obsolete(
     let mut preserved_paths: BTreeSet<String> = BTreeSet::new();
     for entry in &obsolete {
         if ctx.features.preserve_libs
-            && let Some(soname) = library_soname(&entry.path, &prior_sonames)
+            && let Some((bucket, soname)) = library_soname(&entry.path, &prior_sonames)
             && !new_sonames.contains(soname.as_str())
-            && preserve::soname_still_needed(store, interner, &soname, Some(prior_cpv))
+            && preserve::soname_still_needed(store, interner, &bucket, &soname, Some(prior_cpv))
         {
             // Preserve the matched library and its soname-symlink chain partners
             // (the bare soname symlink alongside the real versioned file).
@@ -659,11 +659,13 @@ fn remove_obsolete(
                 }
                 registry.insert(PreservedEntry {
                     cpv: prior_cpv.to_string(),
+                    bucket: bucket.clone(),
                     soname: soname.clone(),
                     path: path.clone(),
                 });
                 preserved.push(PreservedEntry {
                     cpv: prior_cpv.to_string(),
+                    bucket: bucket.clone(),
                     soname: soname.clone(),
                     path,
                 });
@@ -705,10 +707,13 @@ fn remove_obsolete(
     Ok(preserved)
 }
 
-/// The recorded soname of the library at `path`, from the per-object
+/// The recorded `(bucket, soname)` of the library at `path`, from the per-object
 /// `NEEDED.ELF.2` linkage map, or `None` when the path is not a recorded ELF
 /// object with a soname.
-fn library_soname(path: &str, soname_map: &HashMap<String, String>) -> Option<String> {
+fn library_soname(
+    path: &str,
+    soname_map: &HashMap<String, (String, String)>,
+) -> Option<(String, String)> {
     soname_map.get(path).cloned()
 }
 

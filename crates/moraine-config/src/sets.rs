@@ -101,14 +101,16 @@ pub fn world_set(
 /// satisfied only by a preserved library, minus the preserved libraries' own
 /// owners.
 ///
-/// `consumers` is each installed `(cp, required_sonames)`; `preserved_sonames`
-/// are the sonames whose only remaining provider is a preserved library;
-/// `preserved_owners` are the `cp`s that own a preserved library. A consumer
-/// requiring any preserved-only soname is selected for rebuild, excluding the
-/// owners themselves, mirroring `PreservedLibraryConsumerSet.load`.
+/// `consumers` is each installed `(cp, required (bucket, soname) pairs)`;
+/// `preserved_sonames` are the `(bucket, soname)` pairs whose only remaining
+/// provider is a preserved library; `preserved_owners` are the `cp`s that own a
+/// preserved library. A consumer requiring any preserved-only `(bucket, soname)`
+/// is selected for rebuild, excluding the owners themselves, mirroring
+/// `PreservedLibraryConsumerSet.load`. Matching is scoped to the multilib
+/// category bucket so a 32-bit requirement is not satisfied by a 64-bit provider.
 pub fn preserved_rebuild_set(
-    consumers: &[(String, Vec<String>)],
-    preserved_sonames: &BTreeSet<String>,
+    consumers: &[(String, Vec<(String, String)>)],
+    preserved_sonames: &BTreeSet<(String, String)>,
     preserved_owners: &BTreeSet<String>,
 ) -> Vec<String> {
     let mut out: Vec<String> = consumers
@@ -181,19 +183,56 @@ mod tests {
     #[test]
     fn preserved_rebuild_selects_consumers_minus_owners() {
         let consumers = vec![
-            ("app/uses-old".to_owned(), vec!["libold.so.1".to_owned()]),
+            (
+                "app/uses-old".to_owned(),
+                vec![("x86_64".to_owned(), "libold.so.1".to_owned())],
+            ),
             (
                 "app/unaffected".to_owned(),
-                vec!["libcurrent.so.2".to_owned()],
+                vec![("x86_64".to_owned(), "libcurrent.so.2".to_owned())],
             ),
-            ("lib/owner".to_owned(), vec!["libold.so.1".to_owned()]),
+            (
+                "lib/owner".to_owned(),
+                vec![("x86_64".to_owned(), "libold.so.1".to_owned())],
+            ),
         ];
-        let preserved: BTreeSet<String> = ["libold.so.1".to_owned()].into_iter().collect();
+        let preserved: BTreeSet<(String, String)> =
+            [("x86_64".to_owned(), "libold.so.1".to_owned())]
+                .into_iter()
+                .collect();
         let owners: BTreeSet<String> = ["lib/owner".to_owned()].into_iter().collect();
 
         let set = preserved_rebuild_set(&consumers, &preserved, &owners);
         // The consumer of the preserved soname is selected; the unaffected
         // package and the preserved-lib owner are excluded.
+        assert_eq!(set, vec!["app/uses-old".to_owned()]);
+    }
+
+    #[test]
+    fn preserved_rebuild_omits_other_abi_and_alternative_provider() {
+        let consumers = vec![
+            // Requires the soname in the 32-bit bucket only.
+            (
+                "app/abi32".to_owned(),
+                vec![("x86_32".to_owned(), "libold.so.1".to_owned())],
+            ),
+            // Requires the preserved-only 64-bit soname: selected.
+            (
+                "app/uses-old".to_owned(),
+                vec![("x86_64".to_owned(), "libold.so.1".to_owned())],
+            ),
+        ];
+        // Only the 64-bit soname is preserved-only; the 32-bit one has an
+        // alternative provider and so is not in the preserved-only set.
+        let preserved: BTreeSet<(String, String)> =
+            [("x86_64".to_owned(), "libold.so.1".to_owned())]
+                .into_iter()
+                .collect();
+        let owners: BTreeSet<String> = BTreeSet::new();
+
+        let set = preserved_rebuild_set(&consumers, &preserved, &owners);
+        // The 32-bit consumer is omitted (wrong bucket / alternative provider);
+        // the 64-bit consumer is selected.
         assert_eq!(set, vec!["app/uses-old".to_owned()]);
     }
 

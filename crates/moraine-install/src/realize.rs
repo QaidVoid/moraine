@@ -340,8 +340,11 @@ impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
             })?;
 
         // Scan the staged image and read BUILD_TIME once, feeding both the binary
-        // package metadata and the recorded installed state.
-        let scan = moraine_build::scan_image_sonames(&outcome.image_dir);
+        // package metadata and the recorded installed state. The configured
+        // `PROVIDES_EXCLUDE`/`REQUIRES_EXCLUDE` patterns are applied before the
+        // soname sets are recorded or written into binpkg metadata.
+        let mut scan = moraine_build::scan_image_sonames(&outcome.image_dir);
+        apply_soname_excludes(&mut scan, &request.config.vars);
         let build_time = read_line_u64(&outcome.build_info_dir.join("BUILD_TIME"));
 
         // `buildsyspkg` emits a binary package for an `@system` member even when
@@ -529,17 +532,22 @@ fn split_ws(s: &str) -> Vec<String> {
     s.split_whitespace().map(str::to_owned).collect()
 }
 
-/// Render scanned NEEDED lines into the `arch;path;soname;rpath;needed` text form.
+/// Render scanned NEEDED lines into the
+/// `arch;path;soname;rpath;needed;multilib_category` text form. moraine does not
+/// run `scanelf`, so the multilib bucket fills both the arch field and the sixth
+/// multilib-category field; the sixth field is the authoritative bucket a reader
+/// recovers, mirroring Portage rewriting it in `doebuild.py:3296-3298`.
 fn render_needed_lines(lines: &[moraine_build::NeededLine]) -> Vec<String> {
     lines
         .iter()
         .map(|l| {
             format!(
-                "{};{};{};;{}",
+                "{};{};{};;{};{}",
                 l.bucket,
                 l.path,
                 l.soname.clone().unwrap_or_default(),
-                l.needed.join(",")
+                l.needed.join(","),
+                l.bucket
             )
         })
         .collect()
@@ -617,6 +625,73 @@ fn metadata_from_request(
         meta.set_str("BUILD_TIME", bt.to_string());
     }
     meta
+}
+
+/// Apply `PROVIDES_EXCLUDE`/`REQUIRES_EXCLUDE` to the scanned soname linkage.
+///
+/// A `(bucket, soname)` is dropped from `provides`/`requires` when its soname
+/// matches an exclude pattern, or when every object contributing it has a path
+/// that matches one. Patterns are `fnmatch` globs matched against the
+/// leading-slash-stripped object path and the soname, mirroring
+/// `SonameDepsProcessor`'s per-entry exclude handling
+/// (`soname_deps.py:46-55,76-110`). The `NEEDED.ELF.2` lines are left intact.
+fn apply_soname_excludes(
+    scan: &mut moraine_build::SonameScan,
+    vars: &std::collections::BTreeMap<String, String>,
+) {
+    let provides_exclude = exclude_patterns(vars.get("PROVIDES_EXCLUDE"));
+    let requires_exclude = exclude_patterns(vars.get("REQUIRES_EXCLUDE"));
+    if provides_exclude.is_empty() && requires_exclude.is_empty() {
+        return;
+    }
+    let lines = &scan.needed_lines;
+
+    if !provides_exclude.is_empty() {
+        scan.provides.retain(|(bucket, soname)| {
+            if matches_any(&provides_exclude, soname) {
+                return false;
+            }
+            lines.iter().any(|l| {
+                &l.bucket == bucket
+                    && l.soname.as_deref() == Some(soname.as_str())
+                    && !matches_any(&provides_exclude, &l.path)
+            })
+        });
+    }
+    if !requires_exclude.is_empty() {
+        scan.requires.retain(|(bucket, soname)| {
+            if matches_any(&requires_exclude, soname) {
+                return false;
+            }
+            lines.iter().any(|l| {
+                &l.bucket == bucket
+                    && l.needed.iter().any(|n| n == soname)
+                    && !matches_any(&requires_exclude, &l.path)
+            })
+        });
+    }
+}
+
+/// Split a `PROVIDES_EXCLUDE`/`REQUIRES_EXCLUDE` value into its whitespace-
+/// separated `fnmatch` patterns, with any leading slash stripped so a pattern
+/// matches the leading-slash-stripped object path, as Portage does.
+fn exclude_patterns(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|v| {
+            v.split_whitespace()
+                .map(|p| p.trim_start_matches('/').to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether any exclude pattern matches `text` (an object path or soname), with
+/// the leading slash stripped from the text before matching.
+fn matches_any(patterns: &[String], text: &str) -> bool {
+    let text = text.trim_start_matches('/');
+    patterns
+        .iter()
+        .any(|p| moraine_common::glob::fnmatch(text, p))
 }
 
 /// Render `(bucket, soname)` pairs into Portage's `bucket: soname soname` field
@@ -851,6 +926,74 @@ mod tests {
         meta.set_str("USE", "ssl zlib");
         meta.set_str("RDEPEND", "dev-libs/openssl");
         write_bytes(&meta, &image, &WriteOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn render_needed_lines_emits_multilib_category_field() {
+        let line = moraine_build::NeededLine {
+            bucket: "x86_64".to_string(),
+            path: "/usr/lib64/libfoo.so.1".to_string(),
+            soname: Some("libfoo.so.1".to_string()),
+            needed: vec!["libc.so.6".to_string()],
+        };
+        let rendered = render_needed_lines(std::slice::from_ref(&line));
+        assert_eq!(
+            rendered,
+            vec!["x86_64;/usr/lib64/libfoo.so.1;libfoo.so.1;;libc.so.6;x86_64".to_string()]
+        );
+        // The sixth semicolon field is the multilib category.
+        assert_eq!(rendered[0].split(';').nth(5), Some("x86_64"));
+    }
+
+    #[test]
+    fn soname_excludes_drop_matching_provides_and_requires() {
+        let mut scan = moraine_build::SonameScan {
+            provides: vec![
+                ("x86_64".to_string(), "libfoo.so.1".to_string()),
+                ("x86_64".to_string(), "libprivate.so.0".to_string()),
+            ],
+            requires: vec![
+                ("x86_64".to_string(), "libc.so.6".to_string()),
+                ("x86_64".to_string(), "libskip.so.2".to_string()),
+            ],
+            needed_lines: vec![
+                moraine_build::NeededLine {
+                    bucket: "x86_64".to_string(),
+                    path: "/usr/lib64/libfoo.so.1".to_string(),
+                    soname: Some("libfoo.so.1".to_string()),
+                    needed: vec!["libc.so.6".to_string(), "libskip.so.2".to_string()],
+                },
+                moraine_build::NeededLine {
+                    bucket: "x86_64".to_string(),
+                    path: "/usr/lib64/libprivate.so.0".to_string(),
+                    soname: Some("libprivate.so.0".to_string()),
+                    needed: vec![],
+                },
+            ],
+        };
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("PROVIDES_EXCLUDE".to_string(), "libprivate.so.0".to_string());
+        vars.insert("REQUIRES_EXCLUDE".to_string(), "libskip.so.2".to_string());
+        apply_soname_excludes(&mut scan, &vars);
+
+        assert!(
+            scan.provides
+                .contains(&("x86_64".to_string(), "libfoo.so.1".to_string()))
+        );
+        assert!(
+            !scan
+                .provides
+                .contains(&("x86_64".to_string(), "libprivate.so.0".to_string()))
+        );
+        assert!(
+            scan.requires
+                .contains(&("x86_64".to_string(), "libc.so.6".to_string()))
+        );
+        assert!(
+            !scan
+                .requires
+                .contains(&("x86_64".to_string(), "libskip.so.2".to_string()))
+        );
     }
 
     #[test]
