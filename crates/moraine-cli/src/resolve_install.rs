@@ -407,10 +407,19 @@ impl BuildPlanner for CliPlanner<'_> {
         let run_tests = self.ctx.features.iter().any(|f| f == "test")
             && !entry.restrict.iter().any(|r| r == "test");
 
+        // The eclass search path is per-repository, so it is set on the config
+        // for this package rather than in the shared config_env.
+        let mut config = self.config_env();
+        config.eclass_locations = self.eclass_locations(&entry.repository);
+
         Ok(BuildRequest {
             package,
-            config: self.config_env(),
+            config,
             use_flags,
+            // Left empty so the strict use()/in_iuse check stays disabled until
+            // the full IUSE_EFFECTIVE (with implicit/forced/masked flags) is
+            // computed here; an incomplete set would make use() die spuriously.
+            iuse_effective: Vec::new(),
             fetch: self.fetch_config(),
             run_tests,
             require_digest: true,
@@ -495,7 +504,19 @@ impl CliPlanner<'_> {
             root: root.clone(),
             sysroot: root,
             eprefix: String::new(),
+            config_root: self.eroot.to_string_lossy().into_owned(),
+            eclass_locations: Vec::new(),
         }
+    }
+
+    /// The eclass search locations for a repository, in the order `inherit`
+    /// walks them (closest repository first), as exported strings.
+    fn eclass_locations(&self, repo: &str) -> Vec<String> {
+        self.repo_set
+            .eclass_search_path(repo)
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
     }
 
     /// The fetch configuration from `make.conf`.

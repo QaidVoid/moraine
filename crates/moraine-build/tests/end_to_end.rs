@@ -72,6 +72,8 @@ fn builds_fixture_and_writes_image_and_build_info() {
         root: "/".into(),
         sysroot: "/".into(),
         eprefix: String::new(),
+        config_root: "/".into(),
+        eclass_locations: vec![],
     };
 
     let mut reduced = BTreeMap::new();
@@ -100,6 +102,7 @@ fn builds_fixture_and_writes_image_and_build_info() {
         package,
         config,
         use_flags,
+        iuse_effective: vec![],
         fetch: FetchConfig::new(&distdir),
         run_tests: false,
         require_digest: true,
@@ -208,6 +211,7 @@ fn restricted_fetch_missing_fails_build() {
             ..ConfigEnv::rooted([])
         },
         use_flags: HashSet::new(),
+        iuse_effective: vec![],
         fetch: FetchConfig::new(&distdir),
         run_tests: false,
         require_digest: true,

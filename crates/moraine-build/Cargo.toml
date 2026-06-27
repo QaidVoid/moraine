@@ -11,6 +11,7 @@ moraine-common = { version = "0.1.0", path = "../moraine-common" }
 moraine-config = { version = "0.1.0", path = "../moraine-config" }
 moraine-eapi = { version = "0.1.0", path = "../moraine-eapi" }
 moraine-repo = { version = "0.1.0", path = "../moraine-repo" }
+moraine-resolve = { version = "0.1.0", path = "../moraine-resolve" }
 object = { version = "0.39.1", default-features = false, features = ["read_core", "elf", "std"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 thiserror = "2.0.18"

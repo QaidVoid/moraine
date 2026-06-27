@@ -160,6 +160,13 @@ pub enum BuildError {
         reason: String,
     },
 
+    /// The resolved USE violates the package's `REQUIRED_USE`.
+    #[error("REQUIRED_USE not satisfied: {constraint}")]
+    RequiredUse {
+        /// The failing sub-constraint.
+        constraint: String,
+    },
+
     /// An underlying I/O or primitive operation failed.
     #[error(transparent)]
     Common(#[from] CommonError),

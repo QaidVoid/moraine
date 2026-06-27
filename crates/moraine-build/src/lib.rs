@@ -102,6 +102,11 @@ pub struct BuildRequest {
     pub config: ConfigEnv,
     /// The resolved USE flags for the package.
     pub use_flags: HashSet<String>,
+    /// The full `IUSE_EFFECTIVE` set (IUSE plus implicit/forced/masked flags),
+    /// exported so the strict `use()`/`in_iuse` checks can run. When empty the
+    /// strict check is disabled (`PORTAGE_INTERNAL_CALLER` is not set), so an
+    /// incomplete set cannot make `use()` die spuriously.
+    pub iuse_effective: Vec<String>,
     /// The fetch configuration.
     pub fetch: FetchConfig,
     /// Whether `src_test` runs (`FEATURES=test` and not `RESTRICT=test`).
@@ -153,11 +158,34 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
     layout.create()?;
 
     // 2. Environment.
-    let env = EnvBuilder::new(pkg.ident.clone(), request.config.clone(), &layout)?;
+    let mut env = EnvBuilder::new(pkg.ident.clone(), request.config.clone(), &layout)?;
+
+    // 2b. Evaluate REQUIRED_USE against the resolved USE before driving phases,
+    // guarding the direct build_package path (the resolver guards the emerge
+    // path). Export REQUIRED_USE for diagnostics regardless.
+    if let Some(required_use) = pkg.reduced_meta.get("REQUIRED_USE") {
+        check_required_use(required_use, &request.use_flags)?;
+        env.insert_base("REQUIRED_USE", required_use.clone());
+    }
+
+    // 2c. Inject the per-package values computed outside the EAPI gates: the
+    // resolved USE, IUSE_EFFECTIVE (with the strict-check opt-in), and
+    // DEFINED_PHASES.
+    env.insert_base("USE", sorted(&request.use_flags).join(" "));
+    env.insert_base("DEFINED_PHASES", defined_phases_token(&pkg.defined_phases));
+    if request.iuse_effective.is_empty() {
+        env.insert_base("IUSE_EFFECTIVE", pkg.iuse.join(" "));
+    } else {
+        env.insert_base("IUSE_EFFECTIVE", request.iuse_effective.join(" "));
+        env.insert_base("PORTAGE_INTERNAL_CALLER", "1");
+    }
 
     // 3. SRC_URI mapping and fetch.
     let src_map =
         srcuri::parse_and_reduce(&pkg.src_uri, &request.use_flags, pkg.ident.eapi_features())?;
+    // A is the unpack list the default src_unpack and the S/WORKDIR fallback
+    // read; export it into the phase environment.
+    env.insert_base("A", src_map.a_string());
     let manifest = Manifest::read(&pkg.manifest_path)?;
     // Verify the ebuild and its `files/` aux entries against the Manifest before
     // the ebuild is sourced (the GLEP 74 integrity chain).
@@ -275,6 +303,32 @@ fn sorted(set: &HashSet<String>) -> Vec<String> {
     v
 }
 
+/// The `DEFINED_PHASES` token, the literal `-` when no phases are defined,
+/// matching the stock `ebuild.sh` representation.
+fn defined_phases_token(phases: &[String]) -> String {
+    if phases.is_empty() {
+        "-".to_string()
+    } else {
+        phases.join(" ")
+    }
+}
+
+/// Evaluate a package's `REQUIRED_USE` against the resolved USE, returning an
+/// error naming the failing sub-constraint on a violation.
+fn check_required_use(required_use: &str, use_flags: &HashSet<String>) -> Result<()> {
+    if required_use.trim().is_empty() {
+        return Ok(());
+    }
+    let node = moraine_resolve::required_use::parse_required_use(required_use);
+    let use_set: std::collections::BTreeSet<String> = use_flags.iter().cloned().collect();
+    match moraine_resolve::required_use::evaluate_required_use(&node, &use_set) {
+        moraine_resolve::required_use::RequiredUseOutcome::Satisfied => Ok(()),
+        moraine_resolve::required_use::RequiredUseOutcome::Violated(constraint) => {
+            Err(BuildError::RequiredUse { constraint })
+        }
+    }
+}
+
 fn union_features(report: &PhaseReport) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
     for run in &report.runs {
@@ -285,4 +339,48 @@ fn union_features(report: &PhaseReport) -> Vec<String> {
         }
     }
     seen
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn use_set<'a>(flags: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+        flags.into_iter().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn defined_phases_token_uses_dash_when_empty() {
+        assert_eq!(defined_phases_token(&[]), "-");
+        assert_eq!(
+            defined_phases_token(&["compile".into(), "install".into()]),
+            "compile install"
+        );
+    }
+
+    #[test]
+    fn required_use_satisfied_and_violated() {
+        // `^^ ( ssl gnutls )` is satisfied by exactly one of the two.
+        let constraint = "^^ ( ssl gnutls )";
+        assert!(check_required_use(constraint, &use_set(["ssl"])).is_ok());
+        let err = check_required_use(constraint, &use_set(["ssl", "gnutls"]));
+        assert!(matches!(err, Err(BuildError::RequiredUse { .. })));
+        let err = check_required_use(constraint, &use_set([]));
+        assert!(matches!(err, Err(BuildError::RequiredUse { .. })));
+    }
+
+    #[test]
+    fn required_use_conditional() {
+        // `python? ( ssl )` requires ssl only when python is enabled.
+        let constraint = "python? ( ssl )";
+        assert!(check_required_use(constraint, &use_set(["python", "ssl"])).is_ok());
+        assert!(check_required_use(constraint, &use_set(["other"])).is_ok());
+        assert!(check_required_use(constraint, &use_set(["python"])).is_err());
+    }
+
+    #[test]
+    fn required_use_empty_is_ok() {
+        assert!(check_required_use("", &use_set([])).is_ok());
+        assert!(check_required_use("   ", &use_set([])).is_ok());
+    }
 }

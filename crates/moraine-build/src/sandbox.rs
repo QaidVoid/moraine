@@ -253,6 +253,8 @@ mod tests {
             root: "/".into(),
             sysroot: "/".into(),
             eprefix: String::new(),
+            config_root: "/".into(),
+            eclass_locations: Vec::new(),
         }
     }
 

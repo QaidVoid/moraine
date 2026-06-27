@@ -781,6 +781,7 @@ dependencies = [
  "moraine-config",
  "moraine-eapi",
  "moraine-repo",
+ "moraine-resolve",
  "object 0.39.1",
  "proptest",
  "rustix",

@@ -39,6 +39,13 @@ pub struct ConfigEnv {
     pub sysroot: String,
     /// The `EPREFIX` offset for prefix installs (empty for a non-prefix build).
     pub eprefix: String,
+    /// The `PORTAGE_CONFIGROOT` the helper surface reads `/etc/portage` from
+    /// (normally `/`), used by `eapply_user`.
+    pub config_root: String,
+    /// The eclass search locations exported as `PORTAGE_ECLASS_LOCATIONS`, in
+    /// the order `inherit` walks them (closest repository first). The
+    /// orchestrator fills this from `moraine-repo`'s `eclass_search_path`.
+    pub eclass_locations: Vec<String>,
 }
 
 impl ConfigEnv {
@@ -51,6 +58,8 @@ impl ConfigEnv {
             root: "/".to_string(),
             sysroot: "/".to_string(),
             eprefix: String::new(),
+            config_root: "/".to_string(),
+            eclass_locations: Vec::new(),
         }
     }
 
@@ -175,6 +184,23 @@ impl EnvBuilder {
         base.insert("D".to_string(), path_str(&layout.image)?);
         base.insert("HOME".to_string(), path_str(&layout.home)?);
         base.insert("PORTAGE_BUILD_HOME".to_string(), path_str(&layout.home)?);
+
+        // The default source directory, ${WORKDIR}/${P}; an ebuild may override
+        // S at source time and the phase driver re-sources it each phase.
+        base.insert(
+            "S".to_string(),
+            format!("{}/{}", path_str(&layout.workdir)?, ident.p),
+        );
+
+        // Where the helper surface reads /etc/portage from (eapply_user).
+        base.insert("PORTAGE_CONFIGROOT".to_string(), config.config_root.clone());
+
+        // The eclass search path inherit() walks, shell-quoted so ebuild.sh's
+        // `eval` reconstructs the array (closest repository first).
+        base.insert(
+            "PORTAGE_ECLASS_LOCATIONS".to_string(),
+            shell_quote_join(&config.eclass_locations),
+        );
 
         // Root and prefix variables, EAPI-gated.
         Self::insert_root_vars(&mut base, &ident, &config, features)?;
@@ -306,6 +332,25 @@ impl EnvBuilder {
     pub fn base(&self) -> &BTreeMap<String, String> {
         &self.base
     }
+
+    /// Inject a variable into the static base environment after construction.
+    /// The orchestrator uses this to add the per-package values computed outside
+    /// the EAPI gates: the resolved `USE`, `A`, `DEFINED_PHASES`,
+    /// `IUSE_EFFECTIVE`, `REQUIRED_USE`, and `PORTAGE_INTERNAL_CALLER`.
+    pub fn insert_base(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.base.insert(key.into(), value.into());
+    }
+}
+
+/// Join paths into the single shell-quoted string `inherit` evaluates into the
+/// `PORTAGE_ECLASS_LOCATIONS` array. Each element is wrapped in single quotes
+/// with embedded single quotes escaped, matching Python's `shlex.join`.
+fn shell_quote_join(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|p| format!("'{}'", p.replace('\'', r#"'\''"#)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Variables that are readonly ebuild metadata and must never be re-imported as
@@ -335,6 +380,14 @@ const READONLY_VARS: &[&str] = &[
     "EBUILD_PHASE",
     "EBUILD_PHASE_FUNC",
     "PORTAGE_REPO_NAME",
+    "USE",
+    "A",
+    "IUSE_EFFECTIVE",
+    "DEFINED_PHASES",
+    "REQUIRED_USE",
+    "PORTAGE_ECLASS_LOCATIONS",
+    "PORTAGE_INTERNAL_CALLER",
+    "PORTAGE_CONFIGROOT",
 ];
 
 /// Bash-internal variables that must be dropped from a saved environment.
@@ -572,6 +625,61 @@ mod tests {
         let e3 = b3.for_phase("compile", "src_compile");
         assert!(e3.get("EPREFIX").is_some());
         assert!(e3.get("EROOT").is_some());
+    }
+
+    #[test]
+    fn eclass_locations_exported_quoted_in_order() {
+        let (_t, layout) = layout();
+        let mut cfg = ConfigEnv::rooted([]);
+        cfg.eclass_locations = vec![
+            "/repos/child".to_string(),
+            "/repos/it's odd".to_string(),
+            "/repos/gentoo".to_string(),
+        ];
+        let b = EnvBuilder::new(ident("8"), cfg, &layout).unwrap();
+        let env = b.for_phase("compile", "src_compile");
+        // Closest repository first, each element single-quoted with embedded
+        // quotes escaped, matching shlex.join.
+        assert_eq!(
+            env.get("PORTAGE_ECLASS_LOCATIONS"),
+            Some(r#"'/repos/child' '/repos/it'\''s odd' '/repos/gentoo'"#)
+        );
+    }
+
+    #[test]
+    fn s_defaults_to_workdir_p() {
+        let (_t, layout) = layout();
+        let workdir = layout.workdir.to_string_lossy().into_owned();
+        let b = EnvBuilder::new(ident("8"), ConfigEnv::rooted([]), &layout).unwrap();
+        let env = b.for_phase("compile", "src_compile");
+        assert_eq!(env.get("S"), Some(format!("{workdir}/foo-1.2.3").as_str()));
+        assert_eq!(env.get("PORTAGE_CONFIGROOT"), Some("/"));
+    }
+
+    #[test]
+    fn insert_base_reaches_the_phase_env() {
+        let (_t, layout) = layout();
+        let mut b = EnvBuilder::new(ident("8"), ConfigEnv::rooted([]), &layout).unwrap();
+        b.insert_base("USE", "ssl threads");
+        b.insert_base("IUSE_EFFECTIVE", "ssl threads prefix");
+        b.insert_base("PORTAGE_INTERNAL_CALLER", "1");
+        let env = b.for_phase("compile", "src_compile");
+        assert_eq!(env.get("USE"), Some("ssl threads"));
+        assert_eq!(env.get("IUSE_EFFECTIVE"), Some("ssl threads prefix"));
+        assert_eq!(env.get("PORTAGE_INTERNAL_CALLER"), Some("1"));
+    }
+
+    #[test]
+    fn injected_per_package_vars_are_not_carried_mutably() {
+        let prev = BTreeMap::new();
+        let mut incoming = BTreeMap::new();
+        incoming.insert("USE".into(), "tampered".into());
+        incoming.insert("IUSE_EFFECTIVE".into(), "tampered".into());
+        incoming.insert("PORTAGE_ECLASS_LOCATIONS".into(), "tampered".into());
+        let out = filter_saved_env(&prev, &incoming);
+        assert_eq!(out.get("USE"), None);
+        assert_eq!(out.get("IUSE_EFFECTIVE"), None);
+        assert_eq!(out.get("PORTAGE_ECLASS_LOCATIONS"), None);
     }
 
     #[test]
