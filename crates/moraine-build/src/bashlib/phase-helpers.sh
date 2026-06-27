@@ -429,6 +429,30 @@ econf() {
 
     : ${ECONF_SOURCE:=.}
     if [[ -x "${ECONF_SOURCE}/configure" ]]; then
+        # Rewrite a #!/bin/sh shebang to CONFIG_SHELL, preserving the timestamp.
+        if [[ -n ${CONFIG_SHELL} && \
+            "$(head -n1 "${ECONF_SOURCE}/configure")" =~ ^'#!'[[:space:]]*/bin/sh([[:space:]]|$) ]]; then
+            cp -p "${ECONF_SOURCE}/configure" "${ECONF_SOURCE}/configure._portage_tmp_.${pid}" || die
+            sed -i \
+                -e "1s:^#![[:space:]]*/bin/sh:#!${CONFIG_SHELL}:" \
+                "${ECONF_SOURCE}/configure._portage_tmp_.${pid}" \
+                || die "Substitution of shebang in '${ECONF_SOURCE}/configure' failed"
+            touch -r "${ECONF_SOURCE}/configure" "${ECONF_SOURCE}/configure._portage_tmp_.${pid}" || die
+            mv -f "${ECONF_SOURCE}/configure._portage_tmp_.${pid}" "${ECONF_SOURCE}/configure" || die
+        fi
+
+        # Refresh bundled config.guess/config.sub from the system gnuconfig copy,
+        # replacing each atomically.
+        if [[ -e "${EPREFIX}"/usr/share/gnuconfig/ ]]; then
+            find "${WORKDIR}" -type f '(' \
+                -name config.guess -o -name config.sub ')' -print0 | \
+            while read -r -d $'\0' x; do
+                __vecho " * econf: updating ${x/${WORKDIR}\/} with ${EPREFIX}/usr/share/gnuconfig/${x##*/}"
+                cp -f "${EPREFIX}"/usr/share/gnuconfig/"${x##*/}" "${x}.${pid}"
+                mv -f "${x}.${pid}" "${x}"
+            done
+        fi
+
         local conf_args=()
         if ___eapi_econf_passes_--disable-dependency-tracking || ___eapi_econf_passes_--disable-silent-rules || ___eapi_econf_passes_--docdir_and_--htmldir || ___eapi_econf_passes_--with-sysroot; then
             local conf_help=$("${ECONF_SOURCE}/configure" --help 2>/dev/null)
@@ -643,17 +667,15 @@ dodir() {
 }
 
 dobin() {
-    local ED=$(__edest)
-    into "${__E_DESTTREE:-/usr}"
-    install -d "${ED}/${__E_DESTTREE#/}/bin"
-    install -m0755 "$@" "${ED}/${__E_DESTTREE#/}/bin/" || __helpers_die "${FUNCNAME} failed"
+    local ED=$(__edest) desttree=${__E_DESTTREE-/usr}
+    install -d "${ED}/${desttree#/}/bin"
+    install -m0755 "$@" "${ED}/${desttree#/}/bin/" || __helpers_die "${FUNCNAME} failed"
 }
 
 dosbin() {
-    local ED=$(__edest)
-    into "${__E_DESTTREE:-/usr}"
-    install -d "${ED}/${__E_DESTTREE#/}/sbin"
-    install -m0755 "$@" "${ED}/${__E_DESTTREE#/}/sbin/" || __helpers_die "${FUNCNAME} failed"
+    local ED=$(__edest) desttree=${__E_DESTTREE-/usr}
+    install -d "${ED}/${desttree#/}/sbin"
+    install -m0755 "$@" "${ED}/${desttree#/}/sbin/" || __helpers_die "${FUNCNAME} failed"
 }
 
 doexe() {
@@ -713,12 +735,27 @@ doins() {
 }
 
 dolib() {
-    local ED=$(__edest) libdir
+    local ED=$(__edest) libdir desttree=${__E_DESTTREE-/usr} x ret=0
     libdir=$(get_libdir 2>/dev/null) || libdir=lib
-    into "${__E_DESTTREE:-/usr}"
-    local dir="${ED}/${__E_DESTTREE#/}/${libdir}"
+    local dir="${ED}/${desttree#/}/${libdir}"
     install -d "${dir}"
-    install ${LIBOPTIONS:--m0644} "$@" "${dir}/" || __helpers_die "${FUNCNAME} failed"
+    for x in "$@"; do
+        if [[ -e ${x} ]]; then
+            # Recreate a symlink source as a symlink so VDB CONTENTS keeps a sym
+            # entry; install only regular files. Mirrors bin/ebuild-helpers/dolib.
+            if [[ ! -L ${x} ]]; then
+                install ${LIBOPTIONS:--m0644} "${x}" "${dir}/"
+            else
+                ln -s "$(readlink "${x}")" "${dir}/${x##*/}"
+            fi
+        else
+            echo "!!! ${FUNCNAME}: ${x} does not exist" >&2
+            false
+        fi
+        (( ret |= $? ))
+    done
+    (( ret != 0 )) && __helpers_die "${FUNCNAME} failed"
+    return ${ret}
 }
 dolib.a() { LIBOPTIONS="-m0644" dolib "$@"; }
 dolib.so() { LIBOPTIONS="-m0755" dolib "$@"; }
@@ -957,14 +994,111 @@ keepdir() {
 }
 
 fperms() {
-    local ED=$(__edest) mode=$1
-    shift
-    chmod "${mode}" "${@/#/${ED}/}" || __helpers_die "${FUNCNAME} failed"
+    local ED=$(__edest) arg got_mode=
+    local -a args=()
+    for arg in "$@"; do
+        # A leading dash is an option unless it is a single symbolic mode
+        # character, in which case it is the mode. Mirrors bin/ebuild-helpers/fperms.
+        if [[ ${arg} == -* && ${arg} != -[ugorwxXst] ]]; then
+            args+=( "${arg}" )
+        elif [[ ! ${got_mode} ]]; then
+            got_mode=1
+            args+=( "${arg}" )
+        else
+            args+=( "${ED}/${arg#/}" )
+        fi
+    done
+    chmod "${args[@]}" || __helpers_die "${FUNCNAME} failed"
 }
+
+# Resolve a symbolic fowners owner spec to a numeric uid:gid against the target
+# root account database, mirroring bin/ebuild-helpers/fowners __resolve_owner. A
+# numeric user or group passes through unchanged. The colon-separated passwd and
+# group fields are parsed with a pure-bash read loop rather than awk.
+__resolve_owner() {
+    local owner=$1 pwdb_path=${2}/etc
+    local user group uid gid pgid name pw num grp
+
+    IFS=':' read -r user group <<< "${owner}"
+
+    if [[ -n ${user} ]]; then
+        if [[ ${user} =~ ^[0-9]+$ ]]; then
+            uid=${user}
+        else
+            while IFS=: read -r name pw num grp _; do
+                if [[ ${name} == "${user}" ]]; then
+                    uid=${num}
+                    pgid=${grp}
+                    break
+                fi
+            done < "${pwdb_path}/passwd"
+            [[ ${uid} =~ ^[0-9]+$ ]] || \
+                __helpers_die "fowners: invalid user in ${pwdb_path}/passwd: ${owner}"
+        fi
+    fi
+
+    if [[ -n ${group} ]]; then
+        if [[ ${group} =~ ^[0-9]+$ ]]; then
+            gid=${group}
+        else
+            while IFS=: read -r name pw num _; do
+                if [[ ${name} == "${group}" ]]; then
+                    gid=${num}
+                    break
+                fi
+            done < "${pwdb_path}/group"
+            [[ ${gid} =~ ^[0-9]+$ ]] || \
+                __helpers_die "fowners: invalid group in ${pwdb_path}/group: ${owner}"
+        fi
+        gid=":${gid}"
+    elif [[ ${owner} == *: ]]; then
+        # `chown uid:` resolves the group to the user's primary group.
+        if [[ ${pgid} =~ ^[0-9]+$ ]]; then
+            gid=":${pgid}"
+        else
+            __helpers_die "fowners: invalid primary group for ${user} in ${pwdb_path}/passwd: ${owner}"
+        fi
+    fi
+
+    printf '%s%s' "${uid}" "${gid}"
+}
+
 fowners() {
-    local ED=$(__edest) owner=$1
-    shift
-    chown "${owner}" "${@/#/${ED}/}" || __helpers_die "${FUNCNAME} failed"
+    local ED=$(__edest) arg got_owner= eroot pwdb_root pwdb_eroot
+    local -a args=()
+
+    if ___eapi_has_prefix_variables; then
+        eroot=${EROOT}
+    else
+        eroot=${ROOT}
+    fi
+
+    if ___eapi_has_SYSROOT && [[ ${EBUILD_PHASE} == install ]]; then
+        pwdb_root=${SYSROOT}
+        pwdb_eroot=${ESYSROOT}
+    else
+        pwdb_root=${ROOT%/}
+        pwdb_eroot=${eroot%/}
+    fi
+
+    for arg in "$@"; do
+        if [[ ${arg} == -* ]]; then
+            args+=( "${arg}" )
+        elif [[ ! ${got_owner} ]]; then
+            got_owner=1
+            # For a cross-root install resolve the owner against the target
+            # account database; ROOT=/ passes the owner straight through.
+            if [[ -n ${pwdb_root} ]]; then
+                args+=( "$(__resolve_owner "${arg}" "${pwdb_eroot}")" )
+            else
+                args+=( "${arg}" )
+            fi
+        else
+            args+=( "${ED}/${arg#/}" )
+        fi
+    done
+
+    chown "${args[@]}" || __helpers_die "${FUNCNAME} failed"
 }
 
 # Record paths whose docs the (future) compression stage should compress, or
@@ -1034,6 +1168,15 @@ if ___eapi_has_dosed; then
                 expr="s:${ED}::g"
             fi
         done
+    }
+fi
+
+if ___eapi_has_dohard; then
+    dohard() {
+        [[ $# -eq 2 ]] || { __helpers_die "dohard: two arguments needed"; return 1; }
+        local ED=$(__edest) destdir=${2%/*}
+        [[ ! -d ${ED}/${destdir#/} ]] && dodir "${destdir}"
+        ln -f "${ED}/${1#/}" "${ED}/${2#/}" || __helpers_die "${FUNCNAME} failed"
     }
 fi
 

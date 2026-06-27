@@ -546,6 +546,152 @@ fn doins_recursive_normalizes_mode() {
 }
 
 #[test]
+fn fperms_routes_options_and_symbolic_mode() {
+    if !bash_available() {
+        return;
+    }
+    let fx = Fixture::new();
+    let image = fx.root.join("image");
+    let tree = image.join("some/dir");
+    std::fs::create_dir_all(&tree).unwrap();
+    let inner = tree.join("file");
+    std::fs::write(&inner, "data\n").unwrap();
+    let loose = image.join("some/loose");
+    std::fs::write(&loose, "data\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // `-R` must be forwarded as an option to chmod, `0755` taken as the mode, and
+    // only the path prefixed; `-x` must be treated as the mode, not an option.
+    let eb = fx.ebuild(
+        "EAPI=8\nsrc_install() { fperms -R 0755 some/dir; fperms -x some/loose; }\n",
+    );
+    let (out, ok) = fx.run_phase("8", &eb, "src_install", &[]);
+    assert!(ok, "fperms aborted: {out}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = std::fs::metadata(&tree).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&inner).unwrap().permissions().mode() & 0o777;
+        let loose_mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o755, "recursive dir mode wrong: {dir_mode:o}");
+        assert_eq!(file_mode, 0o755, "recursive file mode wrong: {file_mode:o}");
+        assert_eq!(loose_mode, 0o644, "-x not applied as mode: {loose_mode:o}");
+    }
+}
+
+#[test]
+fn into_slash_routes_dobin_to_image_root() {
+    if !bash_available() {
+        return;
+    }
+    let fx = Fixture::new();
+    let work = fx.root.join("work");
+    std::fs::write(work.join("foo"), "#!/bin/sh\n").unwrap();
+    std::fs::write(work.join("bar"), "#!/bin/sh\n").unwrap();
+
+    // `into /` routes dobin to the image root rather than collapsing back to /usr.
+    let eb = fx.ebuild("EAPI=8\nsrc_install() { into /; dobin foo; }\n");
+    let (out, ok) = fx.run_phase("8", &eb, "src_install", &[]);
+    assert!(ok, "dobin after into / aborted: {out}");
+    assert!(
+        fx.root.join("image/bin/foo").is_file(),
+        "into /; dobin did not land foo at image/bin/foo: {out}"
+    );
+
+    // A fresh phase without `into` defaults the destination tree back to /usr.
+    let eb = fx.ebuild("EAPI=8\nsrc_install() { dobin bar; }\n");
+    let (out, ok) = fx.run_phase("8", &eb, "src_install", &[]);
+    assert!(ok, "dobin without into aborted: {out}");
+    assert!(
+        fx.root.join("image/usr/bin/bar").is_file(),
+        "dobin without into did not default to image/usr/bin/bar: {out}"
+    );
+}
+
+#[test]
+fn dolib_preserves_symlink_source() {
+    if !bash_available() {
+        return;
+    }
+    let fx = Fixture::new();
+    let work = fx.root.join("work");
+    std::fs::write(work.join("libfoo.so.1"), "lib\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("libfoo.so.1", work.join("libfoo.so")).unwrap();
+    let eb = fx.ebuild("EAPI=8\nsrc_install() { dolib.so libfoo.so.1 libfoo.so; }\n");
+    let (out, ok) = fx.run_phase("8", &eb, "src_install", &[]);
+    assert!(ok, "dolib.so aborted: {out}");
+    let libdir = fx.root.join("image/usr/lib");
+    assert!(
+        libdir.join("libfoo.so.1").is_file(),
+        "regular library not installed: {out}"
+    );
+    let link = libdir.join("libfoo.so");
+    assert!(
+        link.symlink_metadata().unwrap().file_type().is_symlink(),
+        "symlink source was dereferenced into a regular file: {out}"
+    );
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        std::path::PathBuf::from("libfoo.so.1"),
+        "symlink target not preserved: {out}"
+    );
+}
+
+#[test]
+fn fowners_resolves_owner_against_target_root() {
+    if !bash_available() {
+        return;
+    }
+    let fx = Fixture::new();
+    let target = fx.root.join("target");
+    std::fs::create_dir_all(target.join("etc")).unwrap();
+    std::fs::write(
+        target.join("etc/passwd"),
+        "root:x:0:0:root:/root:/bin/bash\nmessagebus:x:101:102:System Message Bus:/dev/null:/sbin/nologin\n",
+    )
+    .unwrap();
+    std::fs::write(
+        target.join("etc/group"),
+        "root:x:0:\nmessagebus:x:102:\n",
+    )
+    .unwrap();
+    let t = target.to_string_lossy().into_owned();
+
+    // A non-root target resolves the symbolic owner to numeric uid:gid from the
+    // target passwd/group. A fake chown captures the resolved owner so the test
+    // does not need privileges to change ownership to root.
+    let eb = fx.ebuild(
+        "EAPI=8\nchown() { echo \"CHOWN:$*\"; }\nsrc_install() { fowners messagebus:messagebus usr/bin/foo; }\n",
+    );
+    let (out, ok) = fx.run_phase(
+        "8",
+        &eb,
+        "src_install",
+        &[("ROOT", &t), ("SYSROOT", &t), ("ESYSROOT", &t), ("EROOT", &t)],
+    );
+    assert!(ok, "cross-root fowners aborted: {out}");
+    assert!(
+        out.contains("CHOWN:101:102"),
+        "owner not resolved to numeric uid:gid: {out}"
+    );
+
+    // With ROOT=/ (unset gating root) the owner passes straight through.
+    let eb = fx.ebuild(
+        "EAPI=8\nchown() { echo \"CHOWN:$*\"; }\nsrc_install() { fowners root:root usr/bin/foo; }\n",
+    );
+    let (out, ok) = fx.run_phase("8", &eb, "src_install", &[]);
+    assert!(ok, "default-root fowners aborted: {out}");
+    assert!(
+        out.contains("CHOWN:root:root"),
+        "owner not passed through for ROOT=/: {out}"
+    );
+}
+
+#[test]
 fn corpus_helper_fidelity_end_to_end() {
     if std::env::var_os("MORAINE_CORPUS").is_none() {
         // No real end-to-end build without the corpus opt-in.
