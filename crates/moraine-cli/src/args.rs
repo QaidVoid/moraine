@@ -91,6 +91,11 @@ pub struct Cli {
     #[arg(short = 'k', long)]
     pub usepkg: bool,
 
+    /// Use only binary packages: a package with no compatible binary is
+    /// unsatisfiable rather than built from source.
+    #[arg(short = 'K', long)]
+    pub usepkgonly: bool,
+
     /// Fetch binary packages from the configured binhost.
     #[arg(short = 'g', long)]
     pub getbinpkg: bool,
@@ -204,6 +209,7 @@ pub fn prepass(args: &[String]) -> Vec<String> {
         ('b', "--buildpkg"),
         ('B', "--buildpkgonly"),
         ('k', "--usepkg"),
+        ('K', "--usepkgonly"),
         ('g', "--getbinpkg"),
     ];
 

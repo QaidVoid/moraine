@@ -70,6 +70,58 @@ impl DepSpec {
         }
     }
 
+    /// Render the spec back to a dependency string, preserving grouping.
+    ///
+    /// All-of groups are flattened (redundant parentheses are dropped) while
+    /// any-of (`||`) groups are emitted as `|| ( ... )` and an all-of group that
+    /// is a direct alternative of an any-of keeps its `( ... )` parentheses,
+    /// matching stock `use_reduce` followed by `paren_enclose`. A USE conditional
+    /// that survived (an unevaluated spec) is rendered as `flag? ( ... )`.
+    pub fn render(&self, interner: &Interner) -> String {
+        let mut parts = Vec::new();
+        self.render_into(&mut parts, interner, false);
+        parts.join(" ")
+    }
+
+    fn render_into(&self, parts: &mut Vec<String>, interner: &Interner, in_any_of: bool) {
+        match self {
+            DepSpec::Leaf(atom) => parts.push(atom.render(interner)),
+            DepSpec::AllOf(items) => {
+                if in_any_of {
+                    // A meaningful sub-alternative under `||`: keep its parens.
+                    let mut inner = Vec::new();
+                    for item in items {
+                        item.render_into(&mut inner, interner, false);
+                    }
+                    if !inner.is_empty() {
+                        parts.push(format!("( {} )", inner.join(" ")));
+                    }
+                } else {
+                    // A redundant all-of group: flatten into the parent sequence.
+                    for item in items {
+                        item.render_into(parts, interner, false);
+                    }
+                }
+            }
+            DepSpec::AnyOf(items) => {
+                let mut inner = Vec::new();
+                for item in items {
+                    item.render_into(&mut inner, interner, true);
+                }
+                parts.push(format!("|| ( {} )", inner.join(" ")));
+            }
+            DepSpec::Conditional { flag, sense, body } => {
+                let mut inner = Vec::new();
+                for item in body {
+                    item.render_into(&mut inner, interner, false);
+                }
+                let name = interner.resolve(*flag).unwrap_or_default();
+                let prefix = if *sense { "" } else { "!" };
+                parts.push(format!("{prefix}{name}? ( {} )", inner.join(" ")));
+            }
+        }
+    }
+
     /// Collect every atom leaf in the tree, depth-first.
     pub fn atoms(&self) -> Vec<&Atom> {
         let mut out = Vec::new();

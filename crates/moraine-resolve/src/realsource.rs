@@ -7,9 +7,10 @@
 //! through the [`ResolveSource`] trait so the provider and encoder never touch a
 //! foreign interner.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use moraine_atom::PackageRef;
+use moraine_binpkg::resolution::{BinaryCandidate, TargetConfig, Verdict, check_compatibility};
 use moraine_config::ResolvedConfig;
 use moraine_repo::RepoIndex;
 use moraine_vdb::Store;
@@ -27,9 +28,12 @@ pub struct RealSource<'a> {
     config: &'a ResolvedConfig,
     /// Whether to evaluate keyword acceptance as stable.
     stable: bool,
-    /// `cp-version` strings that a binary package is available for, so version
-    /// selection can prefer a binary. Empty when `getbinpkg` is off.
-    binary_cpvs: std::collections::HashSet<String>,
+    /// Binary candidates keyed by `cp-version`, so version selection can prefer a
+    /// compatible binary. Empty when `getbinpkg`/`usepkg` is off.
+    binaries: HashMap<String, BinaryCandidate>,
+    /// The target configuration binary candidates are checked against. When
+    /// `None`, a present candidate is offered on cpv presence alone.
+    binary_target: Option<TargetConfig>,
 }
 
 impl<'a> RealSource<'a> {
@@ -40,7 +44,8 @@ impl<'a> RealSource<'a> {
             vdb,
             config,
             stable: false,
-            binary_cpvs: std::collections::HashSet::new(),
+            binaries: HashMap::new(),
+            binary_target: None,
         }
     }
 
@@ -50,10 +55,16 @@ impl<'a> RealSource<'a> {
         self
     }
 
-    /// Provide the set of `cp-version` strings that have a binary package, so
-    /// version selection prefers them under `getbinpkg`.
-    pub fn with_binaries(mut self, cpvs: std::collections::HashSet<String>) -> Self {
-        self.binary_cpvs = cpvs;
+    /// Provide the binary candidates (keyed by `cp-version`) and the optional
+    /// target configuration they are checked against, so version selection
+    /// prefers a compatible binary under `getbinpkg`/`usepkg`.
+    pub fn with_binaries(
+        mut self,
+        binaries: HashMap<String, BinaryCandidate>,
+        target: Option<TargetConfig>,
+    ) -> Self {
+        self.binaries = binaries;
+        self.binary_target = target;
         self
     }
 
@@ -126,6 +137,26 @@ impl<'a> RealSource<'a> {
             slot_bindings,
             recorded_deps,
         }
+    }
+}
+
+/// Whether the binary candidate keyed by `key` is offered for selection.
+///
+/// A candidate is offered only when it is present and (with a `target` present)
+/// passes [`check_compatibility`]; an incompatible binary (foreign CHOST,
+/// mismatched USE, or unsatisfied sonames) is not offered, so the ebuild
+/// candidate is used instead.
+fn binary_offered(
+    binaries: &HashMap<String, BinaryCandidate>,
+    target: Option<&TargetConfig>,
+    key: &str,
+) -> bool {
+    let Some(candidate) = binaries.get(key) else {
+        return false;
+    };
+    match target {
+        None => true,
+        Some(target) => check_compatibility(candidate, target) == Verdict::Accept,
     }
 }
 
@@ -250,7 +281,11 @@ impl ResolveSource for RealSource<'_> {
     }
 
     fn has_binary(&self, cp: &str, version: &Version) -> bool {
-        !self.binary_cpvs.is_empty() && self.binary_cpvs.contains(&format!("{cp}-{version}"))
+        binary_offered(
+            &self.binaries,
+            self.binary_target.as_ref(),
+            &format!("{cp}-{version}"),
+        )
     }
 
     fn acceptability(&self, meta: &PackageMeta) -> Acceptability {
@@ -396,5 +431,61 @@ impl ResolveSource for RealSource<'_> {
                 Some(self.record_to_installed(cp, record))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moraine_binpkg::MetadataMap;
+    use moraine_binpkg::metadata::{KEY_CHOST, KEY_USE};
+
+    fn candidate(use_str: &str, chost: &str) -> BinaryCandidate {
+        let mut m = MetadataMap::new();
+        m.set_str(KEY_USE, use_str);
+        m.set_str(KEY_CHOST, chost);
+        BinaryCandidate {
+            cp: "dev-libs/foo".into(),
+            version: Version::parse("1").unwrap(),
+            metadata: m,
+        }
+    }
+
+    fn target(use_flags: &[&str], chost: &str) -> TargetConfig {
+        TargetConfig {
+            chost: chost.into(),
+            selected_use: use_flags.iter().map(|s| s.to_string()).collect(),
+            forced_use: BTreeSet::new(),
+            masked_use: BTreeSet::new(),
+            available_sonames: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn incompatible_binary_is_not_offered() {
+        let target = target(&["ssl"], "x86_64-pc-linux-gnu");
+        let mut binaries = HashMap::new();
+        binaries.insert(
+            "dev-libs/foo-1".to_string(),
+            candidate("ssl", "x86_64-pc-linux-gnu"),
+        );
+        // A foreign CHOST is not offered.
+        binaries.insert(
+            "dev-libs/bar-1".to_string(),
+            candidate("ssl", "i686-pc-linux-gnu"),
+        );
+        // A mismatched USE is not offered.
+        binaries.insert(
+            "dev-libs/baz-1".to_string(),
+            candidate("", "x86_64-pc-linux-gnu"),
+        );
+
+        assert!(binary_offered(&binaries, Some(&target), "dev-libs/foo-1"));
+        assert!(!binary_offered(&binaries, Some(&target), "dev-libs/bar-1"));
+        assert!(!binary_offered(&binaries, Some(&target), "dev-libs/baz-1"));
+        // Absent candidate is never offered.
+        assert!(!binary_offered(&binaries, Some(&target), "dev-libs/none-1"));
+        // With no target, a present candidate is offered on presence alone.
+        assert!(binary_offered(&binaries, None, "dev-libs/bar-1"));
     }
 }

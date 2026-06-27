@@ -19,6 +19,8 @@ pub const KEY_BUILD_TIME: &str = "BUILD_TIME";
 pub const KEY_CHOST: &str = "CHOST";
 /// The recorded enabled USE flags key, space separated.
 pub const KEY_USE: &str = "USE";
+/// The recorded IUSE flags key, space separated.
+pub const KEY_IUSE: &str = "IUSE";
 /// The soname PROVIDES key.
 pub const KEY_PROVIDES: &str = "PROVIDES";
 /// The soname REQUIRES key.
@@ -105,6 +107,18 @@ impl MetadataMap {
     pub fn use_flags(&self) -> Vec<String> {
         self.get_str(KEY_USE)
             .map(|s| s.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The recorded IUSE flags, split on whitespace with any `+`/`-` default
+    /// prefix stripped.
+    pub fn iuse_flags(&self) -> Vec<String> {
+        self.get_str(KEY_IUSE)
+            .map(|s| {
+                s.split_whitespace()
+                    .map(|f| f.trim_start_matches(['+', '-']).to_string())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

@@ -171,6 +171,22 @@ fn validate_features(raw: Vec<String>) -> Vec<String> {
     }
 }
 
+/// Map the binary-package signature `FEATURES` to a [`SignaturePolicy`].
+///
+/// `binpkg-ignore-signature` relaxes verification, `binpkg-request-signature`
+/// makes an unsigned Manifest fatal, and otherwise a present signature is
+/// verified, matching Portage's defaults.
+pub fn signature_policy(features: &[String]) -> moraine_binpkg::SignaturePolicy {
+    use moraine_binpkg::SignaturePolicy;
+    if feature_enabled(features, "binpkg-ignore-signature", false) {
+        SignaturePolicy::IgnoreSignature
+    } else if feature_enabled(features, "binpkg-request-signature", false) {
+        SignaturePolicy::RequestSignature
+    } else {
+        SignaturePolicy::VerifyIfPresent
+    }
+}
+
 /// Global root and profile selection from the command line.
 #[derive(Debug, Clone, Default)]
 pub struct Roots {

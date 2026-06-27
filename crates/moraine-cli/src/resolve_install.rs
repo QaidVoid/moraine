@@ -49,6 +49,9 @@ use crate::write::{WriteRoots, cp_of_atom, ensure_dirs, merge_context};
 struct BinaryPrefs {
     getbinpkg: bool,
     usepkg: bool,
+    /// Only binary packages may be used; a package with no compatible binary is
+    /// unsatisfiable rather than built from source (`--usepkgonly`).
+    usepkgonly: bool,
     buildpkg: bool,
     buildpkgonly: bool,
     buildsyspkg: bool,
@@ -60,7 +63,9 @@ impl BinaryPrefs {
         BinaryPrefs {
             // `getbinpkg` also implies considering binary packages, like emerge.
             getbinpkg: cli.getbinpkg || has("getbinpkg"),
-            usepkg: cli.usepkg || cli.getbinpkg || has("getbinpkg"),
+            // `--usepkgonly` also considers binary packages.
+            usepkg: cli.usepkg || cli.usepkgonly || cli.getbinpkg || has("getbinpkg"),
+            usepkgonly: cli.usepkgonly,
             buildpkg: cli.buildpkg || has("buildpkg"),
             buildpkgonly: cli.buildpkgonly,
             // `buildsyspkg` emits binaries only for `@system` members.
@@ -148,10 +153,21 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     } else {
         None
     };
-    let binary_cpvs = binary_cpv_set(&pkgdir, binhost.as_ref());
+    let bin_candidates = binary_candidates(&pkgdir, binhost.as_ref());
+    let bin_target = if bin_candidates.is_empty() {
+        None
+    } else {
+        Some(binary_target(&config, &ctx.vars, &bin_candidates, &vdb))
+    };
+    let bctx = BinaryContext {
+        candidates: bin_candidates,
+        target: bin_target,
+    };
 
-    // Resolve and serialize the merge order, timing the solve.
-    let source = RealSource::new(&repo_index, &vdb, &config).with_binaries(binary_cpvs);
+    // Resolve and serialize the merge order, timing the solve. The resolver
+    // prefers a version with a compatible binary package.
+    let source = RealSource::new(&repo_index, &vdb, &config)
+        .with_binaries(bctx.candidates.clone(), bctx.target.clone());
     let atom_refs: Vec<&str> = request.atoms.iter().map(String::as_str).collect();
     let started = std::time::Instant::now();
     let modifiers = Modifiers {
@@ -208,6 +224,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         &prefs,
         &pkgdir,
         binhost.as_ref(),
+        &bctx,
     );
     let use_expand = moraine_config::use_expand_groups(&ctx.vars);
     for entry in &mut plan.entries {
@@ -242,9 +259,22 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
                 cli.oneshot,
                 &pkgdir,
                 binhost.as_ref(),
+                &bctx,
             )
         })
         .collect();
+
+    // Under `--usepkgonly` a package with no compatible binary is unsatisfiable
+    // rather than built from source, matching emerge's `--usepkgonly`.
+    if prefs.usepkgonly {
+        let unsatisfiable = usepkgonly_unsatisfiable(&tasks);
+        if !unsatisfiable.is_empty() {
+            return Err(miette!(
+                "--usepkgonly: no compatible binary package for {}",
+                unsatisfiable.join(", ")
+            ));
+        }
+    }
 
     // Drive the orchestrator with a runner that dispatches source vs binary.
     ensure_dirs(&wr)?;
@@ -290,9 +320,11 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         sources.push(Box::new(bh));
     }
     let binpkg_source = crate::binhost::ChainSource::new(sources);
+    let signature_policy = crate::config::signature_policy(&ctx.features);
     let runner = CombinedRunner {
         source: SourceRunner::new(planner, &command_runner, options),
-        binpkg: BinpkgRunner::new(binpkg_source, stage),
+        binpkg: BinpkgRunner::new(binpkg_source, stage)
+            .with_signature(signature_policy, signature_config(&ctx.vars)),
     };
     let applier = EngineApplier::new(merge_context(ctx, &wr));
     let engine = TransactionEngine::new(&runner, &applier, &wr.state_dir);
@@ -310,6 +342,26 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     // Surface relevant unread news for every repository after the install.
     crate::news_state::display_after_action(ctx, &wr.vdb_dir, &wr.eroot, &repo_set);
     Ok(())
+}
+
+/// The signature verification key configuration, derived from the gpg command
+/// and optional keyring named in configuration, used when reading a binary
+/// package at install time.
+fn signature_config(
+    vars: &moraine_config::makeconf::VarMap,
+) -> Option<moraine_binpkg::SignatureConfig> {
+    let mut config = moraine_binpkg::SignatureConfig::default();
+    if let Some(gpg) = vars.get("BINPKG_GPG_VERIFY_GPG").filter(|s| !s.is_empty()) {
+        config.gpg_command = gpg.to_owned();
+    }
+    if let Some(home) = vars
+        .get("BINPKG_GPG_VERIFY_GPG_HOME")
+        .filter(|s| !s.is_empty())
+    {
+        config.extra_args.push("--homedir".to_owned());
+        config.extra_args.push(home.to_owned());
+    }
+    Some(config)
 }
 
 /// A runner that dispatches each task to the source or binary path.
@@ -615,6 +667,20 @@ fn required_manifest_hashes(
 }
 
 /// Convert a serialized task into an orchestrator task.
+/// The cpvs of merge tasks that resolved to a source build, which are the
+/// packages with no compatible binary. Under `--usepkgonly` these are reported
+/// unsatisfiable instead of being built.
+fn usepkgonly_unsatisfiable(tasks: &[InstallTask]) -> Vec<String> {
+    tasks
+        .iter()
+        .filter(|t| {
+            matches!(t.kind, moraine_install::TaskKind::Merge)
+                && matches!(t.source, SourceKind::Source)
+        })
+        .map(|t| t.cpv.clone())
+        .collect()
+}
+
 fn to_install_task(
     task: &Task,
     explicit: &BTreeSet<String>,
@@ -622,13 +688,17 @@ fn to_install_task(
     oneshot: bool,
     pkgdir: &Path,
     binhost: Option<&crate::binhost::IndexedBinhost>,
+    bctx: &BinaryContext,
 ) -> InstallTask {
     let cpv = format!("{}-{}", task.cp, task.version);
     let kind = match task.kind {
         ResolveTaskKind::Uninstall => moraine_install::TaskKind::Uninstall,
         ResolveTaskKind::Merge => moraine_install::TaskKind::Merge,
     };
+    // A binary is installed only when one is available and compatible; an
+    // incompatible binary falls back to a source build.
     let (binary, _) = binary_choice(&task.cp, &task.version, prefs, pkgdir, binhost);
+    let binary = binary && bctx.compatible(&cpv);
     InstallTask {
         cpv,
         cp: task.cp.clone(),
@@ -644,36 +714,186 @@ fn to_install_task(
     }
 }
 
-/// Decide whether a task installs a binary package, and whether that package
-/// comes from a binhost (the `g` indicator). Honors `--usepkg`/`--getbinpkg` and
-/// the `getbinpkg` `FEATURE`. A local package is preferred over the binhost.
-/// The set of `cp-version` strings a binary package exists for: every binhost
-/// index entry plus local `.gpkg` files under `pkgdir`. Fed to the resolver so
-/// version selection can prefer a version that has a binary.
-fn binary_cpv_set(
-    pkgdir: &Path,
-    binhost: Option<&crate::binhost::IndexedBinhost>,
-) -> HashSet<String> {
-    let mut set: HashSet<String> = binhost
-        .map(|bh| bh.cpvs().map(str::to_owned).collect())
-        .unwrap_or_default();
-    if let Ok(categories) = std::fs::read_dir(pkgdir) {
-        for cat in categories.flatten() {
-            if !cat.path().is_dir() {
-                continue;
-            }
-            let category = cat.file_name().to_string_lossy().into_owned();
-            if let Ok(files) = std::fs::read_dir(cat.path()) {
-                for f in files.flatten() {
-                    let name = f.file_name().to_string_lossy().into_owned();
-                    if let Some(pf) = name.strip_suffix(".gpkg") {
-                        set.insert(format!("{category}/{pf}"));
-                    }
-                }
+/// The binary candidates available for selection plus the target configuration
+/// they are checked against, so a binary is offered only when its recorded USE,
+/// CHOST, and soname REQUIRES are compatible with the resolved configuration.
+struct BinaryContext {
+    /// Binary candidates keyed by `cpv` (`category/package-version`), from the
+    /// binhost index plus local `.gpkg.tar` packages.
+    candidates: HashMap<String, moraine_binpkg::BinaryCandidate>,
+    /// The target configuration, or `None` when no compatibility gating applies.
+    target: Option<moraine_binpkg::TargetConfig>,
+}
+
+impl BinaryContext {
+    /// Whether the binary for `cpv` is compatible with the target.
+    ///
+    /// A candidate absent from the map (no recorded metadata) or failing the
+    /// compatibility check is not compatible, so the ebuild candidate is used.
+    fn compatible(&self, cpv: &str) -> bool {
+        let Some(candidate) = self.candidates.get(cpv) else {
+            return false;
+        };
+        match &self.target {
+            None => true,
+            Some(target) => {
+                moraine_binpkg::check_compatibility(candidate, target)
+                    == moraine_binpkg::Verdict::Accept
             }
         }
     }
-    set
+}
+
+/// Build the binary candidates available for selection: every binhost index
+/// stanza (newest build per cpv) plus every local `.gpkg.tar` package under
+/// `pkgdir`, including the multi-instance `<cp>/<pf>-<buildid>.gpkg.tar` layout.
+fn binary_candidates(
+    pkgdir: &Path,
+    binhost: Option<&crate::binhost::IndexedBinhost>,
+) -> HashMap<String, moraine_binpkg::BinaryCandidate> {
+    let mut map: HashMap<String, moraine_binpkg::BinaryCandidate> = HashMap::new();
+    if let Some(bh) = binhost {
+        for (cpv, metadata) in bh.candidate_metadata() {
+            map.insert(cpv.clone(), candidate_from(&cpv, metadata.clone()));
+        }
+    }
+    // Local packages override binhost stanzas: the on-disk metadata is read
+    // directly from the container.
+    for (cpv, path) in local_gpkg_files(pkgdir) {
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Ok(pkg) = moraine_binpkg::read_package(&bytes, None)
+        {
+            map.insert(cpv.clone(), candidate_from(&cpv, pkg.metadata));
+        }
+    }
+    map
+}
+
+/// Every local `.gpkg.tar` package under `pkgdir` as `(cpv, path)` pairs,
+/// covering the single-instance `<category>/<pf>.gpkg.tar` and the multi-instance
+/// `<cp>/<pf>-<buildid>.gpkg.tar` subdirectory layout.
+fn local_gpkg_files(pkgdir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(categories) = std::fs::read_dir(pkgdir) else {
+        return out;
+    };
+    for cat in categories.flatten() {
+        if !cat.path().is_dir() {
+            continue;
+        }
+        let category = cat.file_name().to_string_lossy().into_owned();
+        let Ok(entries) = std::fs::read_dir(cat.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.path().is_dir() {
+                // Multi-instance `<category>/<package>/<pf>-<buildid>.gpkg.tar`.
+                if let Ok(files) = std::fs::read_dir(entry.path()) {
+                    for f in files.flatten() {
+                        let fname = f.file_name().to_string_lossy().into_owned();
+                        let Some(stem) = fname.strip_suffix(".gpkg.tar") else {
+                            continue;
+                        };
+                        let pf = strip_build_id(stem);
+                        out.push((format!("{category}/{pf}"), f.path()));
+                    }
+                }
+            } else if let Some(pf) = name.strip_suffix(".gpkg.tar") {
+                // Single-instance `<category>/<pf>.gpkg.tar`.
+                out.push((format!("{category}/{pf}"), entry.path()));
+            }
+        }
+    }
+    out
+}
+
+/// Strip a trailing `-<buildid>` (numeric) from a multi-instance filename stem,
+/// recovering the `<pf>`, matching Portage's `getname_build_id`.
+fn strip_build_id(stem: &str) -> String {
+    match stem.rsplit_once('-') {
+        Some((pf, id)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => pf.to_owned(),
+        _ => stem.to_owned(),
+    }
+}
+
+/// Build a [`moraine_binpkg::BinaryCandidate`] from a cpv and recorded metadata.
+fn candidate_from(
+    cpv: &str,
+    metadata: moraine_binpkg::MetadataMap,
+) -> moraine_binpkg::BinaryCandidate {
+    let (category, pf) = split_cpv(cpv);
+    let (pn, pvr) = split_pf(&pf);
+    let cp = if category.is_empty() {
+        pn
+    } else {
+        format!("{category}/{pn}")
+    };
+    let version = Version::parse(&pvr).unwrap_or_else(|_| Version::parse("0").unwrap());
+    moraine_binpkg::BinaryCandidate {
+        cp,
+        version,
+        metadata,
+    }
+}
+
+/// Build the global target configuration binary candidates are checked against:
+/// the target `CHOST`, the globally selected/forced/masked USE, and the sonames
+/// provided by the installed store and the binary candidates themselves.
+fn binary_target(
+    config: &ResolvedConfig,
+    vars: &moraine_config::makeconf::VarMap,
+    candidates: &HashMap<String, moraine_binpkg::BinaryCandidate>,
+    vdb: &Store,
+) -> moraine_binpkg::TargetConfig {
+    let chost = vars.get("CHOST").unwrap_or_default().to_owned();
+
+    // The globally selected USE, computed against a neutral package so only the
+    // global and profile settings apply. `forced` from `EffectiveUse` is the
+    // union of use.force and use.mask; a forced flag is enabled, a masked flag is
+    // not, so the two are separated by membership in `enabled`.
+    let interner = moraine_common::Interner::new();
+    let dummy = Version::parse("0").unwrap();
+    let pref = moraine_atom::PackageRef {
+        category: interner.intern("null"),
+        package: interner.intern("null"),
+        version: &dummy,
+        slot: Some(interner.intern("0")),
+        subslot: None,
+        repo: None,
+    };
+    let eu = config.effective_use(&pref, &[], false);
+    let forced_use: BTreeSet<String> = eu.forced.intersection(&eu.enabled).cloned().collect();
+    let masked_use: BTreeSet<String> = eu.forced.difference(&eu.enabled).cloned().collect();
+    let selected_use = eu.enabled;
+
+    let mut available_sonames: BTreeSet<(String, String)> = BTreeSet::new();
+    let vdb_interner = vdb.interner();
+    for record in vdb.records() {
+        for e in &record.provides.entries {
+            if let (Some(bucket), Some(soname)) = (
+                vdb_interner.resolve(e.bucket),
+                vdb_interner.resolve(e.soname),
+            ) {
+                available_sonames.insert((bucket.to_string(), soname.to_string()));
+            }
+        }
+    }
+    for candidate in candidates.values() {
+        if let Some(provides) = candidate.metadata.get_str("PROVIDES") {
+            for pair in moraine_binpkg::resolution::parse_sonames(&provides) {
+                available_sonames.insert(pair);
+            }
+        }
+    }
+
+    moraine_binpkg::TargetConfig {
+        chost,
+        selected_use,
+        forced_use,
+        masked_use,
+        available_sonames,
+    }
 }
 
 fn binary_choice(
@@ -683,13 +903,12 @@ fn binary_choice(
     pkgdir: &Path,
     binhost: Option<&crate::binhost::IndexedBinhost>,
 ) -> (bool, bool) {
-    let (category, _) = cp.split_once('/').unwrap_or((cp, ""));
-    let pf = format!("{}-{}", cp.rsplit('/').next().unwrap_or(cp), version);
-    let local = pkgdir.join(category).join(format!("{pf}.gpkg")).exists();
+    let cpv = format!("{cp}-{version}");
+    let local = moraine_install::locate_local_gpkg(pkgdir, cp, &cpv).is_some();
     if (prefs.usepkg || prefs.getbinpkg) && local {
         // A local binary package is present.
         (true, false)
-    } else if prefs.getbinpkg && binhost.is_some_and(|bh| bh.contains(&format!("{cp}-{version}"))) {
+    } else if prefs.getbinpkg && binhost.is_some_and(|bh| bh.contains(&cpv)) {
         // The binhost actually lists this version (the `g` flag).
         (true, true)
     } else {
@@ -839,6 +1058,7 @@ fn enrich_plan(
     prefs: &BinaryPrefs,
     pkgdir: &Path,
     binhost: Option<&crate::binhost::IndexedBinhost>,
+    bctx: &BinaryContext,
 ) {
     let mut cache: HashMap<String, Arc<Vec<StoredEntry>>> = HashMap::new();
     for entry in &mut plan.entries {
@@ -846,7 +1066,13 @@ fn enrich_plan(
             continue;
         }
         let cpv = format!("{}-{}", entry.cp, entry.version);
-        let (binary, fetched) = binary_choice(&entry.cp, &entry.version, prefs, pkgdir, binhost);
+        let (mut binary, mut fetched) =
+            binary_choice(&entry.cp, &entry.version, prefs, pkgdir, binhost);
+        // An incompatible binary is not offered; the source build is shown.
+        if binary && !bctx.compatible(&cpv) {
+            binary = false;
+            fetched = false;
+        }
         entry.binary = binary;
         entry.fetched = fetched;
         if binary {
@@ -916,10 +1142,12 @@ fn lookup_entry(
     None
 }
 
-/// The on-disk size of a local binary package, if present.
+/// The on-disk size of a local binary package, if present, covering the
+/// single-instance and multi-instance `.gpkg.tar` layouts.
 fn binary_size(pkgdir: &Path, cpv: &str) -> Option<u64> {
     let (category, pf) = split_cpv(cpv);
-    let path = pkgdir.join(category).join(format!("{pf}.gpkg"));
+    let cp = format!("{category}/{}", split_pf(&pf).0);
+    let path = moraine_install::locate_local_gpkg(pkgdir, &cp, cpv)?;
     std::fs::metadata(path).ok().map(|m| m.len())
 }
 
@@ -1233,6 +1461,43 @@ mod tests {
     }
 
     #[test]
+    fn usepkgonly_reports_source_merges_unsatisfiable() {
+        let task = |cpv: &str, kind, source| InstallTask {
+            cpv: cpv.to_owned(),
+            cp: cpv
+                .rsplit_once('-')
+                .map(|(c, _)| c)
+                .unwrap_or(cpv)
+                .to_owned(),
+            slot: "0".to_owned(),
+            kind,
+            source,
+            in_world: false,
+            replaces: None,
+        };
+        let tasks = vec![
+            task(
+                "cat/a-1",
+                moraine_install::TaskKind::Merge,
+                SourceKind::Binary,
+            ),
+            task(
+                "cat/b-2",
+                moraine_install::TaskKind::Merge,
+                SourceKind::Source,
+            ),
+            task(
+                "cat/c-3",
+                moraine_install::TaskKind::Uninstall,
+                SourceKind::Source,
+            ),
+        ];
+        // Only the source-build merge (no compatible binary) is unsatisfiable; a
+        // binary merge and an uninstall are not.
+        assert_eq!(usepkgonly_unsatisfiable(&tasks), vec!["cat/b-2".to_owned()]);
+    }
+
+    #[test]
     fn package_ident_splits_revision() {
         let id = package_ident(
             "dev-libs",
@@ -1252,6 +1517,7 @@ mod tests {
         BinaryPrefs {
             getbinpkg,
             usepkg,
+            usepkgonly: false,
             buildpkg: false,
             buildpkgonly: false,
             buildsyspkg: false,
@@ -1271,7 +1537,7 @@ mod tests {
     fn binary_choice_prefers_local_with_usepkg() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("cat")).unwrap();
-        std::fs::write(dir.path().join("cat/pkg-1.gpkg"), b"x").unwrap();
+        std::fs::write(dir.path().join("cat/pkg-1.gpkg.tar"), b"x").unwrap();
         assert_eq!(
             binary_choice("cat/pkg", "1", &prefs(false, true), dir.path(), None),
             (true, false)

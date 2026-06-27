@@ -255,20 +255,41 @@ impl PackagesIndex {
         }
     }
 
-    /// Add or replace the stanza for `entry`'s cpv.
+    /// Add or replace the stanza matching `entry`'s `(cpv, BUILD_ID)`.
+    ///
+    /// Only the stanza whose cpv and `BUILD_ID` both equal the new entry's is
+    /// replaced; otherwise the entry is appended. This keys mutation by
+    /// `(cpv, BUILD_ID)` like Portage's `bindbapi`, so several builds of one cpv
+    /// coexist rather than the first stanza sharing the cpv being overwritten.
     pub fn upsert(&mut self, entry: PackageEntry) {
-        if let Some(slot) = self.packages.iter_mut().find(|p| p.cpv == entry.cpv) {
+        let build_id = entry.metadata.get_str("BUILD_ID");
+        if let Some(slot) = self
+            .packages
+            .iter_mut()
+            .find(|p| p.cpv == entry.cpv && p.metadata.get_str("BUILD_ID") == build_id)
+        {
             *slot = entry;
         } else {
             self.packages.push(entry);
         }
     }
 
-    /// Remove the stanza whose cpv equals `cpv`, returning whether one was
+    /// Remove every stanza whose cpv equals `cpv`, returning whether one was
     /// removed.
     pub fn remove(&mut self, cpv: &str) -> bool {
         let before = self.packages.len();
         self.packages.retain(|p| p.cpv != cpv);
+        self.packages.len() != before
+    }
+
+    /// Remove only the stanza matching `(cpv, build_id)`, returning whether one
+    /// was removed, so dropping one build of a multi-instance cpv leaves the
+    /// other builds in the index.
+    pub fn remove_build(&mut self, cpv: &str, build_id: &str) -> bool {
+        let before = self.packages.len();
+        self.packages.retain(|p| {
+            !(p.cpv == cpv && p.metadata.get_str("BUILD_ID").as_deref() == Some(build_id))
+        });
         self.packages.len() != before
     }
 }
@@ -302,16 +323,7 @@ fn reduce_use(
         return raw.to_string();
     };
     let reduced = spec.evaluate(enabled);
-    render_depspec(&reduced, interner)
-}
-
-/// Render a flattened [`DepSpec`] back to a space-separated atom string.
-fn render_depspec(spec: &DepSpec, interner: &Interner) -> String {
-    let mut atoms = Vec::new();
-    for atom in spec.atoms() {
-        atoms.push(atom.render(interner));
-    }
-    atoms.join(" ")
+    reduced.render(interner)
 }
 
 /// Translate a canonical key name to its `Packages` index name.
@@ -467,6 +479,69 @@ mod tests {
             PackagesIndex::parse(&text),
             Err(IndexError::UnsupportedVersion { .. })
         ));
+    }
+
+    #[test]
+    fn any_of_group_preserved_on_emit() {
+        let interner = Interner::new();
+        let mut index = PackagesIndex::new();
+        let mut meta = MetadataMap::new();
+        meta.set_str("SLOT", "0");
+        meta.set_str("RDEPEND", "|| ( dev-libs/a dev-libs/b )");
+        meta.set_str("LICENSE", "|| ( GPL-2 BSD )");
+        index.packages.push(PackageEntry {
+            cpv: "dev-libs/foo-1".into(),
+            metadata: meta,
+        });
+        let text = index.emit(&interner);
+        let rdepend = text.lines().find(|l| l.starts_with("RDEPEND:")).unwrap();
+        assert!(
+            rdepend.contains("|| ( dev-libs/a dev-libs/b )"),
+            "any-of preserved: {rdepend}"
+        );
+        let license = text.lines().find(|l| l.starts_with("LICENSE:")).unwrap();
+        assert!(
+            license.contains("|| ( GPL-2 BSD )"),
+            "license any-of preserved: {license}"
+        );
+    }
+
+    #[test]
+    fn multi_instance_upsert_and_targeted_remove() {
+        let entry = |build_id: &str, desc: &str| {
+            let mut meta = MetadataMap::new();
+            meta.set_str("BUILD_ID", build_id);
+            meta.set_str(KEY_DESCRIPTION, desc);
+            PackageEntry {
+                cpv: "dev-libs/foo-1".into(),
+                metadata: meta,
+            }
+        };
+        let mut index = PackagesIndex::new();
+        index.upsert(entry("1", "first"));
+        index.upsert(entry("2", "second"));
+        assert_eq!(index.packages.len(), 2);
+
+        // Upsert build 1 again: only that stanza is replaced.
+        index.upsert(entry("1", "first-rebuilt"));
+        assert_eq!(index.packages.len(), 2);
+        let b1 = index
+            .packages
+            .iter()
+            .find(|p| p.metadata.get_str("BUILD_ID").as_deref() == Some("1"))
+            .unwrap();
+        assert_eq!(
+            b1.metadata.get_str(KEY_DESCRIPTION).as_deref(),
+            Some("first-rebuilt")
+        );
+
+        // Targeted removal drops only build 1.
+        assert!(index.remove_build("dev-libs/foo-1", "1"));
+        assert_eq!(index.packages.len(), 1);
+        assert_eq!(
+            index.packages[0].metadata.get_str("BUILD_ID").as_deref(),
+            Some("2")
+        );
     }
 
     #[test]

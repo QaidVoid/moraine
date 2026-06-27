@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use moraine_binpkg::greenfield::WriteOptions;
-use moraine_binpkg::{MetadataMap, read_package};
+use moraine_binpkg::{MetadataMap, read_package_with_policy};
 use moraine_build::{BuildOutcome, BuildRequest, CommandRunner, build_package};
 use moraine_merge::state::PackageState;
 use moraine_merge::{MergeOp, Operation};
@@ -31,8 +31,10 @@ pub trait BinpkgSource {
     fn fetch(&self, task: &InstallTask) -> Result<Option<Vec<u8>>>;
 }
 
-/// A [`BinpkgSource`] backed by a local package directory laid out as
-/// `<pkgdir>/<category>/<pf>.gpkg`.
+/// A [`BinpkgSource`] backed by a local package directory laid out as the
+/// single-instance `<pkgdir>/<category>/<pf>.gpkg.tar` or the multi-instance
+/// `<pkgdir>/<cp>/<pf>-<buildid>.gpkg.tar`, matching Portage's
+/// `getname_build_id` and `SUPPORTED_GPKG_EXTENSIONS`.
 pub struct LocalPkgdir {
     /// The package directory root (`PKGDIR`).
     pub pkgdir: PathBuf,
@@ -40,15 +42,49 @@ pub struct LocalPkgdir {
 
 impl BinpkgSource for LocalPkgdir {
     fn fetch(&self, task: &InstallTask) -> Result<Option<Vec<u8>>> {
-        let (category, _) = task.cp.split_once('/').unwrap_or((task.cp.as_str(), ""));
-        let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
-        let path = self.pkgdir.join(category).join(format!("{pf}.gpkg"));
+        let Some(path) = locate_local_gpkg(&self.pkgdir, &task.cp, &task.cpv) else {
+            return Ok(None);
+        };
         match std::fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(InstallError::io(path, e)),
         }
     }
+}
+
+/// Locate a local `.gpkg.tar` container for `cp`/`cpv` under `pkgdir`.
+///
+/// The single-instance `<category>/<pf>.gpkg.tar` is preferred; otherwise the
+/// multi-instance `<cp>/<pf>-<buildid>.gpkg.tar` subdirectory is scanned and the
+/// highest build id is returned.
+pub fn locate_local_gpkg(pkgdir: &Path, cp: &str, cpv: &str) -> Option<PathBuf> {
+    let (category, _) = cp.split_once('/').unwrap_or((cp, ""));
+    let pf = cpv.rsplit('/').next().unwrap_or(cpv);
+    let single = pkgdir.join(category).join(format!("{pf}.gpkg.tar"));
+    if single.exists() {
+        return Some(single);
+    }
+    // Multi-instance: `<pkgdir>/<cp>/<pf>-<buildid>.gpkg.tar`, newest build id.
+    let dir = pkgdir.join(cp);
+    let prefix = format!("{pf}-");
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".gpkg.tar") else {
+            continue;
+        };
+        let Some(id) = stem.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Ok(build_id) = id.parse::<u64>() else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(b, _)| build_id > *b) {
+            best = Some((build_id, entry.path()));
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 impl BinpkgSource for Box<dyn BinpkgSource> {
@@ -58,7 +94,7 @@ impl BinpkgSource for Box<dyn BinpkgSource> {
 }
 
 /// A [`BinpkgSource`] that fetches containers from a binhost base URI, laid out
-/// as `<base>/<category>/<pf>.gpkg`, into a staging directory.
+/// as `<base>/<category>/<pf>.gpkg.tar`, into a staging directory.
 pub struct BinhostSource {
     /// The binhost base URI (`PORTAGE_BINHOST`).
     pub base_uri: String,
@@ -76,14 +112,14 @@ impl BinpkgSource for BinhostSource {
         let (category, _) = task.cp.split_once('/').unwrap_or((task.cp.as_str(), ""));
         let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
         let uri = format!(
-            "{}/{}/{}.gpkg",
+            "{}/{}/{}.gpkg.tar",
             self.base_uri.trim_end_matches('/'),
             category,
             pf
         );
         std::fs::create_dir_all(&self.stage_dir)
             .map_err(|e| InstallError::io(&self.stage_dir, e))?;
-        let dest = self.stage_dir.join(format!("{pf}.gpkg"));
+        let dest = self.stage_dir.join(format!("{pf}.gpkg.tar"));
         // A fetch failure means the container is unavailable from the binhost,
         // not a hard error: the caller falls back or reports it per task.
         if self.fetch.run(&uri, &dest).is_err() {
@@ -101,15 +137,32 @@ impl BinpkgSource for BinhostSource {
 pub struct BinpkgRunner<S: BinpkgSource> {
     source: S,
     stage_dir: PathBuf,
+    signature: Option<moraine_binpkg::SignatureConfig>,
+    policy: moraine_binpkg::SignaturePolicy,
 }
 
 impl<S: BinpkgSource> BinpkgRunner<S> {
-    /// Build a runner that stages unpacked images under `stage_dir`.
+    /// Build a runner that stages unpacked images under `stage_dir`, applying the
+    /// default `VerifyIfPresent` signature policy with no configured key.
     pub fn new(source: S, stage_dir: impl Into<PathBuf>) -> Self {
         BinpkgRunner {
             source,
             stage_dir: stage_dir.into(),
+            signature: None,
+            policy: moraine_binpkg::SignaturePolicy::default(),
         }
+    }
+
+    /// Set the signature `policy` and optional key `config` applied to each
+    /// container read at install time.
+    pub fn with_signature(
+        mut self,
+        policy: moraine_binpkg::SignaturePolicy,
+        config: Option<moraine_binpkg::SignatureConfig>,
+    ) -> Self {
+        self.policy = policy;
+        self.signature = config;
+        self
     }
 }
 
@@ -130,7 +183,13 @@ impl<S: BinpkgSource> StepRunner for BinpkgRunner<S> {
                 cpv: task.cpv.clone(),
                 reason: "no compatible binary package found".to_owned(),
             })?;
-        realize_binpkg(&bytes, task, &self.stage_dir)
+        realize_binpkg(
+            &bytes,
+            task,
+            &self.stage_dir,
+            self.signature.as_ref(),
+            self.policy,
+        )
     }
 }
 
@@ -465,11 +524,23 @@ fn render_soname_field(pairs: &[(String, String)]) -> String {
 
 /// Unpack a binary package and build the merge operation for `task`, staging the
 /// image under `stage_dir`.
-pub fn realize_binpkg(bytes: &[u8], task: &InstallTask, stage_dir: &Path) -> Result<Realized> {
-    let pkg = read_package(bytes, None).map_err(|e| InstallError::Realize {
-        cpv: task.cpv.clone(),
-        reason: format!("could not read binary package: {e}"),
-    })?;
+///
+/// The container is read under the given signature `policy` and optional key
+/// `signature` config, so `binpkg-request-signature` makes an unsigned package
+/// fatal and an inline-signed Manifest is gpg-verified before its contents are
+/// trusted.
+pub fn realize_binpkg(
+    bytes: &[u8],
+    task: &InstallTask,
+    stage_dir: &Path,
+    signature: Option<&moraine_binpkg::SignatureConfig>,
+    policy: moraine_binpkg::SignaturePolicy,
+) -> Result<Realized> {
+    let pkg =
+        read_package_with_policy(bytes, signature, policy).map_err(|e| InstallError::Realize {
+            cpv: task.cpv.clone(),
+            reason: format!("could not read binary package: {e}"),
+        })?;
 
     let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
     let image_dir = stage_dir.join(pf);
@@ -667,7 +738,7 @@ mod tests {
             t.in_world = true;
             t
         };
-        let realized = realize_binpkg(&bytes, &task, dir.path()).unwrap();
+        let realized = realize_binpkg(&bytes, &task, dir.path(), None, Default::default()).unwrap();
         let Realized::Apply(Operation::Merge(op)) = realized else {
             panic!("expected a merge op");
         };
@@ -709,7 +780,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut task = InstallTask::merge("app/foo-1.2", "app/foo", "0");
             task.source = SourceKind::Binary;
-            let realized = realize_binpkg(&bytes, &task, dir.path()).unwrap();
+            let realized =
+                realize_binpkg(&bytes, &task, dir.path(), None, Default::default()).unwrap();
             let Realized::Apply(Operation::Merge(op)) = realized else {
                 panic!("expected a merge op for {format:?}");
             };
@@ -723,6 +795,56 @@ mod tests {
                 "the image/ prefix must be stripped for {format:?}"
             );
         }
+    }
+
+    #[test]
+    fn request_signature_makes_unsigned_install_fatal() {
+        // A plain gpkg (unsigned Manifest) must fail to install under
+        // `RequestSignature`, but install normally under the default policy.
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        let data = b"x";
+        header.set_size(data.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/bin/foo", data.as_slice())
+            .unwrap();
+        let image_tar = builder.into_inner().unwrap();
+        let mut meta = MetadataMap::new();
+        meta.set_str("EAPI", "8");
+        meta.set_str("SLOT", "0");
+        meta.set_str("PF", "foo-1.2");
+        let bytes = moraine_binpkg::BinpkgFormat::Gpkg
+            .write(&meta, &image_tar, moraine_binpkg::Compression::Gzip)
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = InstallTask::merge("app/foo-1.2", "app/foo", "0");
+        task.source = SourceKind::Binary;
+
+        assert!(
+            realize_binpkg(
+                &bytes,
+                &task,
+                dir.path(),
+                None,
+                moraine_binpkg::SignaturePolicy::RequestSignature,
+            )
+            .is_err(),
+            "request-signature rejects an unsigned package"
+        );
+        assert!(
+            realize_binpkg(
+                &bytes,
+                &task,
+                dir.path(),
+                None,
+                moraine_binpkg::SignaturePolicy::default(),
+            )
+            .is_ok(),
+            "the default policy installs an unsigned package"
+        );
     }
 
     #[test]
@@ -769,7 +891,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pkgdir = dir.path().join("pkgs");
         std::fs::create_dir_all(pkgdir.join("app")).unwrap();
-        std::fs::write(pkgdir.join("app/foo-1.2.gpkg"), make_binpkg()).unwrap();
+        std::fs::write(pkgdir.join("app/foo-1.2.gpkg.tar"), make_binpkg()).unwrap();
         let source = LocalPkgdir {
             pkgdir: pkgdir.clone(),
         };
@@ -779,5 +901,27 @@ mod tests {
         let mut missing = InstallTask::merge("app/bar-9", "app/bar", "0");
         missing.source = SourceKind::Binary;
         assert!(source.fetch(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn local_pkgdir_finds_single_and_multi_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkgdir = dir.path().join("pkgs");
+        // Single-instance: <category>/<pf>.gpkg.tar
+        std::fs::create_dir_all(pkgdir.join("app")).unwrap();
+        std::fs::write(pkgdir.join("app/foo-1.2.gpkg.tar"), make_binpkg()).unwrap();
+        // Multi-instance: <cp>/<pf>-<buildid>.gpkg.tar
+        std::fs::create_dir_all(pkgdir.join("app/bar")).unwrap();
+        std::fs::write(pkgdir.join("app/bar/bar-2-1.gpkg.tar"), make_binpkg()).unwrap();
+        std::fs::write(pkgdir.join("app/bar/bar-2-3.gpkg.tar"), make_binpkg()).unwrap();
+
+        let single = locate_local_gpkg(&pkgdir, "app/foo", "app/foo-1.2").unwrap();
+        assert!(single.ends_with("app/foo-1.2.gpkg.tar"));
+
+        // The newest build id wins for the multi-instance layout.
+        let multi = locate_local_gpkg(&pkgdir, "app/bar", "app/bar-2").unwrap();
+        assert!(multi.ends_with("app/bar/bar-2-3.gpkg.tar"));
+
+        assert!(locate_local_gpkg(&pkgdir, "app/none", "app/none-9").is_none());
     }
 }

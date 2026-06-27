@@ -113,6 +113,12 @@ impl BinaryCandidate {
     pub fn recorded_dep(&self, key: &str) -> Option<String> {
         self.metadata.get_str(key)
     }
+
+    /// The binary's recorded IUSE flags, with any `+`/`-` default prefix
+    /// stripped. Empty when the binary recorded no IUSE.
+    pub fn recorded_iuse(&self) -> Vec<String> {
+        self.metadata.iuse_flags()
+    }
 }
 
 /// The target configuration a binary is checked against.
@@ -212,11 +218,22 @@ fn check_use(candidate: &BinaryCandidate, target: &TargetConfig) -> Option<Rejec
 
     // The effective recorded set, with masked flags ignored on both sides since
     // a masked flag cannot legitimately differ.
-    let recorded_effective: BTreeSet<String> = recorded
+    let mut recorded_effective: BTreeSet<String> = recorded
         .iter()
         .filter(|f| !target.masked_use.contains(*f))
         .cloned()
         .collect();
+
+    // Scope both sides to the binary's recorded IUSE before diffing, mirroring
+    // Portage's `orig_iuse.intersection(orig_use) ^ cur_iuse.intersection(cur_use)`
+    // (`lib/_emerge/depgraph.py:2978`), so implicit or expand flags outside IUSE
+    // cannot spuriously reject a compatible binary. When the binary recorded no
+    // IUSE, the comparison stays unscoped so the full sets are diffed.
+    let iuse: BTreeSet<String> = candidate.recorded_iuse().into_iter().collect();
+    if !iuse.is_empty() {
+        wanted.retain(|f| iuse.contains(f));
+        recorded_effective.retain(|f| iuse.contains(f));
+    }
 
     let extra: Vec<String> = recorded_effective.difference(&wanted).cloned().collect();
     let missing: Vec<String> = wanted.difference(&recorded_effective).cloned().collect();
@@ -322,6 +339,30 @@ mod tests {
             check_compatibility(&c, &t),
             Verdict::Reject(Rejection::ChostMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn out_of_iuse_flag_does_not_reject() {
+        // The recorded and wanted sets differ only on `foo`, which is not in the
+        // binary's recorded IUSE, so the candidate must not be rejected.
+        let mut c = candidate("ssl", "x86_64-pc-linux-gnu");
+        c.metadata.set_str(crate::metadata::KEY_IUSE, "ssl zlib");
+        let t = target(&["ssl", "foo"], "x86_64-pc-linux-gnu");
+        assert_eq!(check_compatibility(&c, &t), Verdict::Accept);
+    }
+
+    #[test]
+    fn in_iuse_mismatch_still_rejects() {
+        // `zlib` is in IUSE and wanted but not recorded: a real mismatch.
+        let mut c = candidate("ssl", "x86_64-pc-linux-gnu");
+        c.metadata.set_str(crate::metadata::KEY_IUSE, "ssl zlib");
+        let t = target(&["ssl", "zlib"], "x86_64-pc-linux-gnu");
+        match check_compatibility(&c, &t) {
+            Verdict::Reject(Rejection::UseMismatch { missing, .. }) => {
+                assert_eq!(missing, vec!["zlib".to_string()]);
+            }
+            other => panic!("expected use mismatch, got {other:?}"),
+        }
     }
 
     #[test]

@@ -49,9 +49,10 @@ impl GpkgPackage {
     }
 }
 
-/// A parsed `Manifest` line: a member name and its two digests.
+/// A parsed `Manifest` line: a member name, its recorded size, and its digests.
 #[derive(Debug, Clone)]
 struct ManifestEntry {
+    size: Option<u64>,
     blake2b: Option<String>,
     sha512: Option<String>,
 }
@@ -130,7 +131,11 @@ pub fn read_with_policy(
             };
             parse_manifest(&body)?
         }
-        None => Default::default(),
+        None => {
+            return Err(ContainerError::MalformedGpkg(
+                "missing Manifest member".into(),
+            ));
+        }
     };
 
     // Verify any signed members and detached signatures.
@@ -147,14 +152,41 @@ pub fn read_with_policy(
         }
     }
 
+    let mut verified: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     let metadata_member = find_inner(&members, "metadata.tar")?;
     verify_member(&manifest, &metadata_member.rel, &metadata_member.bytes)?;
+    verified.insert(metadata_member.rel.clone());
     let metadata = decode_metadata_tar(metadata_member)?;
 
     let image_member = find_inner(&members, "image.tar")?;
     verify_member(&manifest, &image_member.rel, &image_member.bytes)?;
+    verified.insert(image_member.rel.clone());
     let image_comp = inner_compression(&image_member.rel)?;
     let image = image_comp.decompress(&image_member.bytes)?;
+
+    // Cross-check completeness in both directions: every container member except
+    // the version marker, the Manifest, and any detached signature must have been
+    // verified, and every Manifest record must map to a verified member, matching
+    // Portage's `_verify_binpkg` (`lib/portage/gpkg.py:1811`).
+    for member in &members {
+        let rel = member.rel.as_str();
+        if rel == MARKER_PREFIX || rel == "Manifest" || rel.ends_with(".sig") {
+            continue;
+        }
+        if !verified.contains(rel) {
+            return Err(ContainerError::MalformedGpkg(format!(
+                "container member `{rel}` is not listed in the Manifest"
+            )));
+        }
+    }
+    for name in manifest.keys() {
+        if !verified.contains(name) {
+            return Err(ContainerError::MalformedGpkg(format!(
+                "Manifest record `{name}` has no corresponding container member"
+            )));
+        }
+    }
 
     tracing::info!(entries = metadata.len(), "gpkg imported");
     Ok(GpkgPackage {
@@ -308,8 +340,19 @@ fn verify_member(
     bytes: &[u8],
 ) -> Result<(), ContainerError> {
     let Some(entry) = manifest.get(rel) else {
-        return Ok(());
+        return Err(ContainerError::MalformedGpkg(format!(
+            "member `{rel}` has no Manifest record"
+        )));
     };
+    if let Some(expected) = entry.size
+        && expected != bytes.len() as u64
+    {
+        return Err(ContainerError::IntegrityMismatch {
+            section: format!("{rel}.size"),
+            expected: expected.to_string(),
+            actual: bytes.len().to_string(),
+        });
+    }
     if let Some(expected) = &entry.blake2b {
         let actual = blake2b(bytes);
         if &actual != expected {
@@ -364,9 +407,16 @@ fn decode_metadata_tar(member: &Member) -> Result<MetadataMap, ContainerError> {
 }
 
 /// Read the outer tar into its members, stripping the shared basename prefix.
+///
+/// Validates the container structure as Portage's `_verify_binpkg` does: no
+/// member name begins with `/`, every member has exactly one path-separator
+/// depth, all members share a single non-empty common prefix, and no member name
+/// repeats (a duplicate-name attack).
 fn read_outer(bytes: &[u8]) -> Result<Vec<Member>, ContainerError> {
     let mut archive = tar::Archive::new(bytes);
     let mut out = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut prefix: Option<String> = None;
     let entries = archive
         .entries()
         .map_err(|e| ContainerError::MalformedGpkg(format!("outer tar: {e}")))?;
@@ -377,10 +427,32 @@ fn read_outer(bytes: &[u8]) -> Result<Vec<Member>, ContainerError> {
             .path()
             .map_err(|e| ContainerError::MalformedGpkg(format!("outer path: {e}")))?;
         let full = path.to_string_lossy().into_owned();
-        let rel = match full.split_once('/') {
-            Some((_, rest)) => rest.to_string(),
-            None => full,
-        };
+        let full = full.strip_suffix('/').unwrap_or(&full).to_string();
+        if full.is_empty() {
+            continue;
+        }
+        if full.starts_with('/') || full.matches('/').count() != 1 {
+            return Err(ContainerError::MalformedGpkg(format!(
+                "gpkg structure mismatch: `{full}`"
+            )));
+        }
+        if seen.contains(&full) {
+            return Err(ContainerError::MalformedGpkg(format!(
+                "duplicate member `{full}`"
+            )));
+        }
+        let (dir, rest) = full.split_once('/').expect("one separator checked above");
+        match &prefix {
+            Some(p) if p != dir => {
+                return Err(ContainerError::MalformedGpkg(
+                    "gpkg members do not share a single common prefix".into(),
+                ));
+            }
+            Some(_) => {}
+            None => prefix = Some(dir.to_string()),
+        }
+        seen.push(full.clone());
+        let rel = rest.to_string();
         if rel.is_empty() {
             continue;
         }
@@ -450,8 +522,9 @@ fn parse_manifest(bytes: &[u8]) -> Result<HashMap<String, ManifestEntry>, Contai
         let mut tokens = line.split_whitespace();
         let Some(_kind) = tokens.next() else { continue };
         let Some(name) = tokens.next() else { continue };
-        let _size = tokens.next();
+        let size = tokens.next().and_then(|s| s.parse::<u64>().ok());
         let mut entry = ManifestEntry {
+            size,
             blake2b: None,
             sha512: None,
         };
@@ -653,6 +726,91 @@ mod tests {
             manifest.as_bytes(),
         );
         builder.into_inner().unwrap()
+    }
+
+    /// Build a gpkg, then apply `mutate` to its outer-tar members before
+    /// re-packing, so a test can strip the Manifest, add an extra member, repeat
+    /// a name, or change a size.
+    fn build_gpkg_mutated(
+        meta: &MetadataMap,
+        comp: Compression,
+        mutate: impl Fn(&mut Vec<(String, Vec<u8>)>),
+    ) -> Vec<u8> {
+        let basename = "cat_pkg-1-2";
+        let meta_tar = comp.compress(&build_inner_metadata_tar(meta)).unwrap();
+        let image_tar = comp.compress(&build_inner_image_tar()).unwrap();
+        let meta_name = format!("metadata.tar.{}", comp.suffix());
+        let image_name = format!("image.tar.{}", comp.suffix());
+        let manifest = format!(
+            "DATA {meta_name} {} BLAKE2B {} SHA512 {}\nDATA {image_name} {} BLAKE2B {} SHA512 {}\n",
+            meta_tar.len(),
+            blake2b(&meta_tar),
+            sha512(&meta_tar),
+            image_tar.len(),
+            blake2b(&image_tar),
+            sha512(&image_tar),
+        );
+        let mut members: Vec<(String, Vec<u8>)> = vec![
+            (format!("{basename}/gpkg-1"), b"".to_vec()),
+            (format!("{basename}/{meta_name}"), meta_tar),
+            (format!("{basename}/{image_name}"), image_tar),
+            (format!("{basename}/Manifest"), manifest.into_bytes()),
+        ];
+        mutate(&mut members);
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, bytes) in &members {
+            append_member(&mut builder, name, bytes);
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn stripped_manifest_rejected() {
+        let meta = sample_metadata();
+        let file = build_gpkg_mutated(&meta, Compression::Gzip, |members| {
+            members.retain(|(name, _)| !name.ends_with("/Manifest"));
+        });
+        assert!(read(&file, None).is_err());
+    }
+
+    #[test]
+    fn extra_unlisted_member_rejected() {
+        let meta = sample_metadata();
+        let file = build_gpkg_mutated(&meta, Compression::Gzip, |members| {
+            members.push(("cat_pkg-1-2/extra".to_string(), b"surprise".to_vec()));
+        });
+        assert!(read(&file, None).is_err());
+    }
+
+    #[test]
+    fn duplicate_member_name_rejected() {
+        let meta = sample_metadata();
+        let file = build_gpkg_mutated(&meta, Compression::Gzip, |members| {
+            members.push(("cat_pkg-1-2/gpkg-1".to_string(), b"".to_vec()));
+        });
+        assert!(read(&file, None).is_err());
+    }
+
+    #[test]
+    fn member_size_mismatch_rejected() {
+        let meta = sample_metadata();
+        let file = build_gpkg_mutated(&meta, Compression::Gzip, |members| {
+            for (name, bytes) in members.iter_mut() {
+                if name.contains("/image.tar.") {
+                    bytes.extend_from_slice(b"trailing bytes that break the size");
+                }
+            }
+        });
+        assert!(read(&file, None).is_err());
+    }
+
+    #[test]
+    fn nested_member_path_rejected() {
+        let meta = sample_metadata();
+        let file = build_gpkg_mutated(&meta, Compression::Gzip, |members| {
+            members.push(("cat_pkg-1-2/sub/deep".to_string(), b"x".to_vec()));
+        });
+        assert!(read(&file, None).is_err());
     }
 
     #[test]

@@ -55,7 +55,7 @@ fn install_then_unmerge_round_trip() {
     let pkgdir = root.join("var/cache/binpkgs");
     std::fs::create_dir_all(pkgdir.join("app-misc")).unwrap();
     std::fs::write(
-        pkgdir.join("app-misc/hello-1.0.gpkg"),
+        pkgdir.join("app-misc/hello-1.0.gpkg.tar"),
         binpkg("usr/bin/hello", b"#!/bin/sh\necho hi\n"),
     )
     .unwrap();

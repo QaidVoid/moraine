@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 moraine-atom = { version = "0.1.0", path = "../moraine-atom" }
+moraine-binpkg = { version = "0.1.0", path = "../moraine-binpkg" }
 moraine-common = { version = "0.1.0", path = "../moraine-common" }
 moraine-config = { version = "0.1.0", path = "../moraine-config" }
 moraine-eapi = { version = "0.1.0", path = "../moraine-eapi" }

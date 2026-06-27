@@ -143,6 +143,21 @@ impl IndexedBinhost {
         self.index.packages.iter().map(|e| e.cpv.as_str())
     }
 
+    /// The newest-build metadata for each unique cpv the index lists, for
+    /// building binary candidates the compatibility check consults.
+    pub fn candidate_metadata(&self) -> Vec<(String, &moraine_binpkg::MetadataMap)> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for entry in &self.index.packages {
+            if seen.insert(entry.cpv.clone())
+                && let Some(best) = self.entry(&entry.cpv)
+            {
+                out.push((entry.cpv.clone(), &best.metadata));
+            }
+        }
+        out
+    }
+
     /// The binary package build id recorded for `cpv`, if present.
     pub fn build_id(&self, cpv: &str) -> Option<String> {
         self.entry(cpv)?
@@ -209,11 +224,47 @@ impl BinpkgSource for IndexedBinhost {
         if self.fetch.run(&url, &dest).is_err() {
             return Ok(None);
         }
-        match std::fs::read(&dest) {
-            Ok(bytes) if !bytes.is_empty() => Ok(Some(bytes)),
-            _ => Ok(None),
+        let bytes = match std::fs::read(&dest) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            _ => return Ok(None),
+        };
+        // Bind the downloaded bytes to the published index digests before the
+        // container is trusted. A mismatch reports the container unavailable so
+        // the resolver falls back to a source candidate.
+        match self.entry(&task.cpv) {
+            Some(entry) if !container_matches_entry(entry, &bytes) => Ok(None),
+            _ => Ok(Some(bytes)),
         }
     }
+}
+
+/// Whether `bytes` matches the integrity fields recorded in the index `entry`.
+///
+/// Compares the file size to `SIZE` and the computed `MD5`/`SHA1` to the recorded
+/// digests. When the stanza records no `SIZE`, the digest check is skipped,
+/// mirroring Portage's `BinpkgVerifier` short-circuit when `size` is absent.
+fn container_matches_entry(entry: &moraine_binpkg::PackageEntry, bytes: &[u8]) -> bool {
+    let Some(size) = entry
+        .metadata
+        .get_str("SIZE")
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    else {
+        return true;
+    };
+    if size != bytes.len() as u64 {
+        return false;
+    }
+    if let Some(md5) = entry.metadata.get_str("MD5")
+        && md5.trim() != moraine_common::hash::md5(bytes)
+    {
+        return false;
+    }
+    if let Some(sha1) = entry.metadata.get_str("SHA1")
+        && sha1.trim() != moraine_common::hash::sha1(bytes)
+    {
+        return false;
+    }
+    true
 }
 
 /// A filesystem-safe cache key for a binhost URI.
@@ -288,6 +339,39 @@ mod tests {
             binhost.build_id("app-text/xmlto-0.0.28-r11").as_deref(),
             Some("21")
         );
+    }
+
+    #[test]
+    fn container_digest_match_and_mismatch() {
+        use moraine_binpkg::{MetadataMap, PackageEntry};
+
+        let container = b"the binary package bytes";
+        let mut meta = MetadataMap::new();
+        meta.set_str("SIZE", container.len().to_string());
+        meta.set_str("MD5", moraine_common::hash::md5(container));
+        meta.set_str("SHA1", moraine_common::hash::sha1(container));
+        let entry = PackageEntry {
+            cpv: "dev-libs/foo-1".into(),
+            metadata: meta,
+        };
+        // Matching bytes pass.
+        assert!(container_matches_entry(&entry, container));
+        // A byte-flipped container of the same length fails on the hash.
+        let mut flipped = container.to_vec();
+        flipped[0] ^= 0xff;
+        assert!(!container_matches_entry(&entry, &flipped));
+        // A truncated container fails on size.
+        assert!(!container_matches_entry(
+            &entry,
+            &container[..container.len() - 1]
+        ));
+
+        // A stanza with no SIZE skips the check.
+        let bare = PackageEntry {
+            cpv: "dev-libs/bar-1".into(),
+            metadata: MetadataMap::new(),
+        };
+        assert!(container_matches_entry(&bare, b"anything"));
     }
 
     #[test]

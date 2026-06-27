@@ -70,10 +70,32 @@ pub fn read_package(
     bytes: &[u8],
     signature: Option<&signature::SignatureConfig>,
 ) -> Result<Package, ContainerError> {
+    read_package_with_policy(bytes, signature, SignaturePolicy::default())
+}
+
+/// Read any supported binary package under an explicit GPKG signature `policy`.
+///
+/// Identical to [`read_package`] except the `policy` is applied to a GPKG
+/// Manifest: `RequestSignature` makes an unsigned Manifest fatal and
+/// `IgnoreSignature` skips verification. The policy is inert for the greenfield
+/// and xpak formats, which carry no inline Manifest signature.
+pub fn read_package_with_policy(
+    bytes: &[u8],
+    signature: Option<&signature::SignatureConfig>,
+    policy: SignaturePolicy,
+) -> Result<Package, ContainerError> {
     let span = tracing::info_span!("binpkg.read_package");
     let _enter = span.enter();
 
     match detect(bytes)? {
+        Format::Gpkg => {
+            let pkg = gpkg::read_with_policy(bytes, signature, policy)?;
+            Ok(Package {
+                format: Format::Gpkg,
+                metadata: pkg.metadata().clone(),
+                image: pkg.image().to_vec(),
+            })
+        }
         Format::Greenfield => {
             let reader = greenfield::Reader::open(bytes)?;
             reader.verify_manifest()?;
@@ -84,14 +106,6 @@ pub fn read_package(
                 format: Format::Greenfield,
                 metadata: reader.metadata()?,
                 image: reader.image()?,
-            })
-        }
-        Format::Gpkg => {
-            let pkg = gpkg::read(bytes, signature)?;
-            Ok(Package {
-                format: Format::Gpkg,
-                metadata: pkg.metadata().clone(),
-                image: pkg.image().to_vec(),
             })
         }
         Format::Xpak => {
