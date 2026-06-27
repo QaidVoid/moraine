@@ -48,6 +48,7 @@ pub fn modifiers_from(cli: &Cli) -> Modifiers {
     Modifiers {
         update: cli.update,
         deep: cli.is_deep(),
+        deep_depth: cli.deep_depth(),
         newuse: cli.newuse,
         oneshot: cli.oneshot,
     }

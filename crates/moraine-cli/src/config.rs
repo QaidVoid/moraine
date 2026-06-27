@@ -213,6 +213,18 @@ impl Roots {
     }
 }
 
+/// Read `EMERGE_DEFAULT_OPTS` from the effective `make.conf` for `roots`.
+///
+/// Returns the raw value to be shell-split and prepended to the command line,
+/// or an empty string when the variable is unset or the configuration cannot be
+/// loaded. Mirrors `emerge` reading `EMERGE_DEFAULT_OPTS` from `make.conf`.
+pub fn emerge_default_opts(roots: &Roots) -> String {
+    ConfigContext::load(roots)
+        .ok()
+        .and_then(|ctx| ctx.vars.get("EMERGE_DEFAULT_OPTS").map(str::to_owned))
+        .unwrap_or_default()
+}
+
 /// Errors from loading the configuration context.
 #[derive(Debug, Error, Diagnostic)]
 pub enum ConfigLoadError {

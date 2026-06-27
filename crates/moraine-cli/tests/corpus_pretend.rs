@@ -81,6 +81,7 @@ fn pretend_world_expands_over_corpus() {
         Modifiers {
             update: true,
             deep: true,
+            deep_depth: None,
             newuse: true,
             oneshot: false,
         },

@@ -5,6 +5,8 @@
 //! (clustered short flags such as `-puDN`, and `--deep` with an optional
 //! non-negative integer) before the derive parser runs. Atom and `@`-set
 //! positionals are collected verbatim as raw targets for the expansion layer.
+//! [`parse_with_default_opts`] prepends `EMERGE_DEFAULT_OPTS` from `make.conf`
+//! before the authoritative parse, unless `--ignore-default-opts` is given.
 
 use std::path::PathBuf;
 
@@ -33,8 +35,11 @@ pub struct Cli {
 
     /// Consider the entire dependency tree, not just direct dependencies.
     ///
-    /// Accepts an optional non-negative depth limit, for example `--deep=2`.
-    #[arg(short = 'D', long, value_name = "DEPTH", num_args = 0..=1, default_missing_value = "")]
+    /// Accepts an optional non-negative depth limit, for example `--deep=2`. The
+    /// value must be attached with `=`; a following token is never consumed, so
+    /// `--deep cat/pkg` leaves `cat/pkg` as a target. The [`prepass`] attaches a
+    /// space-separated integer (`--deep 2` and `-D 2` become `--deep=2`).
+    #[arg(short = 'D', long, value_name = "DEPTH", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub deep: Option<String>,
 
     /// Reinstall packages whose effective USE flags changed.
@@ -108,6 +113,11 @@ pub struct Cli {
     /// in the read-only phase.
     #[arg(short = '1', long)]
     pub oneshot: bool,
+
+    /// Ignore the options persisted in `EMERGE_DEFAULT_OPTS`, honoring only the
+    /// literal command line.
+    #[arg(long = "ignore-default-opts")]
+    pub ignore_default_opts: bool,
 
     /// Emit a per-phase resolution timing breakdown.
     #[arg(long)]
@@ -188,13 +198,42 @@ impl Cli {
     }
 }
 
+/// Parse `argv` with `EMERGE_DEFAULT_OPTS` prepended, mirroring `emerge`.
+///
+/// `argv` is parsed once to discover the roots and `--ignore-default-opts`.
+/// Unless ignored, `read_opts` supplies the `EMERGE_DEFAULT_OPTS` string from
+/// the effective `make.conf`; it is shell-split and prepended to `argv` before
+/// the authoritative parse. The command-line arguments follow the prepended
+/// tokens, so a last-wins option typed on the command line overrides the
+/// persisted value. Keeping the reader as a closure makes the prepend logic
+/// testable without a real configuration.
+pub fn parse_with_default_opts(
+    argv: &[String],
+    read_opts: impl FnOnce(&Cli) -> String,
+) -> Result<Cli, clap::Error> {
+    let cli = Cli::parse_from_args(argv.iter().cloned())?;
+    if cli.ignore_default_opts {
+        return Ok(cli);
+    }
+    let opts = read_opts(&cli);
+    let Some(tokens) = shlex::split(&opts).filter(|tokens| !tokens.is_empty()) else {
+        return Ok(cli);
+    };
+    let mut combined = tokens;
+    combined.extend(argv.iter().cloned());
+    Cli::parse_from_args(combined)
+}
+
 /// Normalize `emerge`-style argument ergonomics before the derive parser.
 ///
 /// This splits clustered short flags (`-puDN` becomes `-p -u -D -N`) so each
 /// maps to its long option, while leaving a clustered group that ends in a
-/// value-taking short flag intact for `clap` to handle. A bare `-D` keeps its
-/// optional-integer behavior, and an attached form such as `-D2` becomes
-/// `--deep=2`. Long options and positionals pass through unchanged.
+/// value-taking short flag intact for `clap` to handle. A long `--deep` and a
+/// bare short `-D` consume a following token only when it is a non-negative
+/// integer, rewriting `--deep 2` and `-D 2` to `--deep=2`; otherwise `--deep`
+/// stays valueless and the token remains a positional, matching `emerge`'s
+/// `insert_optional_args`. An attached form such as `-D2` becomes `--deep=2`.
+/// Other long options and positionals pass through unchanged.
 pub fn prepass(args: &[String]) -> Vec<String> {
     const SHORT_LONG: &[(char, &str)] = &[
         ('p', "--pretend"),
@@ -215,8 +254,12 @@ pub fn prepass(args: &[String]) -> Vec<String> {
 
     let mut out = Vec::with_capacity(args.len());
     let mut positional_only = false;
+    let mut idx = 0;
 
-    for arg in args {
+    while idx < args.len() {
+        let arg = &args[idx];
+        idx += 1;
+
         if positional_only {
             out.push(arg.clone());
             continue;
@@ -226,7 +269,23 @@ pub fn prepass(args: &[String]) -> Vec<String> {
             out.push(arg.clone());
             continue;
         }
-        // Long options and non-options pass through untouched.
+
+        // A long `--deep` or a bare two-character `-D` consumes a following
+        // non-negative integer as its depth value, otherwise it is valueless and
+        // the next token stays a positional. This mirrors `emerge` consuming
+        // from the argument stack only for `--deep` and the bare `-D`.
+        if arg == "--deep" || arg == "-D" {
+            match args.get(idx) {
+                Some(next) if is_non_negative_integer(next) => {
+                    out.push(format!("--deep={next}"));
+                    idx += 1;
+                }
+                _ => out.push("--deep".to_owned()),
+            }
+            continue;
+        }
+
+        // Other long options and non-options pass through untouched.
         if !arg.starts_with('-') || arg.starts_with("--") || arg == "-" {
             out.push(arg.clone());
             continue;
@@ -235,19 +294,20 @@ pub fn prepass(args: &[String]) -> Vec<String> {
         let chars: Vec<char> = arg.chars().skip(1).collect();
         let mut emitted = Vec::new();
         let mut handled = true;
-        let mut idx = 0;
-        while idx < chars.len() {
-            let ch = chars[idx];
+        let mut cidx = 0;
+        while cidx < chars.len() {
+            let ch = chars[cidx];
             if ch == 'D' {
-                // `-D` only consumes an attached non-negative integer, matching
-                // `emerge`. Trailing flag letters stay in the cluster.
-                let rest: String = chars[idx + 1..].iter().collect();
+                // A clustered `D` only consumes an attached non-negative integer
+                // (`-D2`), never a following token. Trailing flag letters stay in
+                // the cluster.
+                let rest: String = chars[cidx + 1..].iter().collect();
                 if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
                     emitted.push(format!("--deep={rest}"));
                     break;
                 }
                 emitted.push("--deep".to_owned());
-                idx += 1;
+                cidx += 1;
                 continue;
             }
             match SHORT_LONG.iter().find(|(c, _)| *c == ch) {
@@ -257,7 +317,7 @@ pub fn prepass(args: &[String]) -> Vec<String> {
                     break;
                 }
             }
-            idx += 1;
+            cidx += 1;
         }
 
         if handled {
@@ -268,6 +328,11 @@ pub fn prepass(args: &[String]) -> Vec<String> {
     }
 
     out
+}
+
+/// Whether `s` is a non-negative integer, matching `emerge`'s `valid_integers`.
+fn is_non_negative_integer(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -296,6 +361,60 @@ mod tests {
         let bare = parse(&["-D", "cat/pkg"]);
         assert!(bare.is_deep());
         assert_eq!(bare.deep_depth(), None);
+    }
+
+    #[test]
+    fn bare_deep_does_not_swallow_following_target() {
+        for args in [["-uD", "@world"], ["--deep", "@world"]] {
+            let cli = parse(&args);
+            assert!(cli.is_deep());
+            assert_eq!(cli.deep_depth(), None);
+            assert_eq!(cli.targets, vec!["@world".to_owned()]);
+        }
+    }
+
+    #[test]
+    fn clustered_deep_keeps_every_following_target() {
+        let cli = parse(&["-uD", "cat/pkg", "@world"]);
+        assert!(cli.update && cli.is_deep());
+        assert_eq!(cli.deep_depth(), None);
+        assert_eq!(cli.targets, vec!["cat/pkg".to_owned(), "@world".to_owned()]);
+    }
+
+    #[test]
+    fn numeric_deep_value_attaches_and_keeps_target() {
+        for args in [["--deep", "2", "cat/pkg"], ["-D", "2", "cat/pkg"]] {
+            let cli = parse(&args);
+            assert_eq!(cli.deep_depth(), Some(2));
+            assert_eq!(cli.targets, vec!["cat/pkg".to_owned()]);
+        }
+        let attached = parse(&["--deep=2", "cat/pkg"]);
+        assert_eq!(attached.deep_depth(), Some(2));
+        assert_eq!(attached.targets, vec!["cat/pkg".to_owned()]);
+    }
+
+    #[test]
+    fn default_opts_are_prepended() {
+        let argv = vec!["@world".to_owned()];
+        let cli = parse_with_default_opts(&argv, |_| "--deep --newuse".to_owned()).unwrap();
+        assert!(cli.is_deep() && cli.newuse);
+        assert_eq!(cli.targets, vec!["@world".to_owned()]);
+    }
+
+    #[test]
+    fn ignore_default_opts_suppresses_reader() {
+        let argv = vec!["--ignore-default-opts".to_owned(), "@world".to_owned()];
+        let cli = parse_with_default_opts(&argv, |_| "--deep".to_owned()).unwrap();
+        assert!(!cli.is_deep());
+        assert_eq!(cli.targets, vec!["@world".to_owned()]);
+    }
+
+    #[test]
+    fn empty_default_opts_leave_argv_unchanged() {
+        let argv = vec!["-p".to_owned(), "@world".to_owned()];
+        let cli = parse_with_default_opts(&argv, |_| String::new()).unwrap();
+        let plain = Cli::parse_from_args(argv.iter().cloned()).unwrap();
+        assert_eq!(cli, plain);
     }
 
     #[test]

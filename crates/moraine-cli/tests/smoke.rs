@@ -5,7 +5,10 @@ use std::process::Command;
 #[test]
 fn demo_error_reports_and_exits_nonzero() {
     let bin = env!("CARGO_BIN_EXE_moraine");
+    // Ignore any EMERGE_DEFAULT_OPTS from the host make.conf so the test stays
+    // about the demo-error path rather than the host's persisted options.
     let output = Command::new(bin)
+        .arg("--ignore-default-opts")
         .arg("--demo-error")
         .output()
         .expect("failed to run moraine binary");

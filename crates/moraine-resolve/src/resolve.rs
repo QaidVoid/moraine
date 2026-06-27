@@ -35,6 +35,10 @@ pub struct Modifiers {
     /// Run the consistency pass across the installed dependency graph, not just
     /// the request (`--deep`).
     pub deep: bool,
+    /// The optional `--deep` depth bound. A depth of zero disables the deep
+    /// consistency pass even when `deep` is set, matching `emerge`'s `deep != 0`;
+    /// `None` and any positive depth run it. `None` means unbounded.
+    pub deep_depth: Option<u32>,
     /// Treat a USE-flag change against the installed package as a reinstall
     /// trigger (`--newuse`).
     pub newuse: bool,
@@ -387,8 +391,9 @@ fn assemble_solution<S: ResolveSource>(
 
     // `--deep`: validate that no changed package leaves an installed
     // reverse-dependency's atom unsatisfied (Portage's `_complete_graph`,
-    // gated on a version actually changing).
-    if modifiers.deep {
+    // gated on a version actually changing). A `--deep=0` disables the pass,
+    // matching Portage's `deep != 0`.
+    if modifiers.deep && modifiers.deep_depth != Some(0) {
         enforce_reverse_dep_consistency(source, &packages)?;
     }
 

@@ -61,6 +61,9 @@ pub struct Request {
     pub update: bool,
     /// Whether the deep modifier is active.
     pub deep: bool,
+    /// The optional `--deep` depth bound carried to the resolver; `None` is an
+    /// unbounded `--deep`, and a depth of zero disables the deep consistency pass.
+    pub deep_depth: Option<u32>,
     /// Whether the newuse modifier is active.
     pub newuse: bool,
     /// Whether the oneshot display note applies.
@@ -74,6 +77,8 @@ pub struct Modifiers {
     pub update: bool,
     /// Extend update behavior recursively across dependencies.
     pub deep: bool,
+    /// The optional `--deep` depth bound; `None` means unbounded.
+    pub deep_depth: Option<u32>,
     /// Reinstall packages whose effective USE set changed.
     pub newuse: bool,
     /// Do not add targets to the world set (display note only).
@@ -112,6 +117,7 @@ pub fn expand<S: SetSource>(
         excluded: excludes.to_vec(),
         update: modifiers.update,
         deep: modifiers.deep,
+        deep_depth: modifiers.deep_depth,
         newuse: modifiers.newuse,
         oneshot: modifiers.oneshot,
     })
@@ -268,11 +274,13 @@ mod tests {
             Modifiers {
                 update: true,
                 deep: true,
+                deep_depth: Some(2),
                 newuse: true,
                 oneshot: true,
             },
         )
         .unwrap();
         assert!(req.update && req.deep && req.newuse && req.oneshot);
+        assert_eq!(req.deep_depth, Some(2));
     }
 }

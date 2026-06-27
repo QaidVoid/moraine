@@ -173,6 +173,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let modifiers = Modifiers {
         update: request.update,
         deep: request.deep,
+        deep_depth: request.deep_depth,
         newuse: request.newuse,
         changed_deps: cli.changed_deps,
         changed_slot: cli.changed_slot,

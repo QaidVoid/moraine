@@ -1,10 +1,13 @@
 //! Entry point for the `moraine` command.
 
-use moraine_cli::args::Cli;
-use moraine_cli::{DemoError, dispatch, init_tracing};
+use moraine_cli::args::parse_with_default_opts;
+use moraine_cli::{DemoError, config, dispatch, init_tracing, run};
 
 fn main() -> miette::Result<()> {
-    let cli = match Cli::parse_from_args(std::env::args().skip(1)) {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let cli = match parse_with_default_opts(&argv, |cli| {
+        config::emerge_default_opts(&run::roots_from(cli))
+    }) {
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };

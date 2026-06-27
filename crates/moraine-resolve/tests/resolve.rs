@@ -1079,6 +1079,51 @@ fn deep_catches_broken_reverse_dependency() {
 }
 
 #[test]
+fn deep_depth_zero_disables_the_consistency_pass() {
+    // The same broken upgrade as `deep_catches_broken_reverse_dependency`:
+    // `--deep=0` skips the consistency pass (Portage's `deep != 0`), while
+    // unbounded `--deep` and `--deep=1` still catch the broken consumer.
+    let mut f = Fixture::new();
+    f.add(pkg("cat/lib", "1"));
+    f.add(pkg("cat/lib", "2"));
+    f.add(PkgSpec {
+        cp: "cat/consumer",
+        version: "1",
+        rdepend: "<cat/lib-2",
+        ..Default::default()
+    });
+    f.add_installed(installed("cat/lib", "1", "0", None, &[]));
+    f.add_installed(installed("cat/consumer", "1", "0", None, &[]));
+
+    let deep = |depth: Option<u32>| {
+        resolve_with(
+            &f,
+            &["cat/lib"],
+            Modifiers {
+                update: true,
+                deep: true,
+                deep_depth: depth,
+                ..Default::default()
+            },
+        )
+    };
+
+    // Depth zero disables the pass, so the breaking upgrade is allowed.
+    let sol = deep(Some(0)).expect("deep=0 skips the consistency pass");
+    assert_eq!(sol.package("cat/lib").unwrap().version.as_str(), "2");
+
+    // Unbounded `--deep` and a positive depth both run the pass and catch it.
+    for depth in [None, Some(1)] {
+        match deep(depth) {
+            Err(ResolveError::BrokenReverseDependency { dependent, .. }) => {
+                assert_eq!(dependent, "cat/consumer");
+            }
+            other => panic!("expected a broken reverse dependency, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn slot_operator_pulls_in_installed_consumer_for_rebuild() {
     // cat/consumer is installed with a := binding to cat/lib:2/2.1. The available
     // cat/lib is now 2/2.2 (a sub-slot bump). Resolving just cat/lib must pull in
