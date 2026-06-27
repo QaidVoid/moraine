@@ -278,12 +278,21 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
             .map(String::as_str)
             .unwrap_or_default(),
     );
+    let strip_mask = report
+        .final_env
+        .get("STRIP_MASK")
+        .map(String::as_str)
+        .unwrap_or_default();
     strip::strip_image(
         &layout.image,
         &request.config,
         &pkg.restrict,
         &dostrip,
         &dostrip_skip,
+        strip_mask,
+        &layout.workdir,
+        &pkg.ident.category,
+        &pkg.ident.pf,
         runner,
     );
 

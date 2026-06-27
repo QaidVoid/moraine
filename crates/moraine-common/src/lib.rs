@@ -5,6 +5,7 @@
 //! logic:
 //!
 //! - [`fs`]: atomic file writes and memory-mapped reads.
+//! - [`glob`]: a minimal `fnmatch`-style glob matcher.
 //! - [`hash`]: BLAKE3 for greenfield data, plus BLAKE2b, SHA-512, and MD5 for
 //!   compatibility with stock Gentoo formats.
 //! - [`intern`]: a thread-safe string interner for repeated tokens.
@@ -13,6 +14,7 @@
 
 pub mod error;
 pub mod fs;
+pub mod glob;
 pub mod hash;
 pub mod id;
 pub mod intern;

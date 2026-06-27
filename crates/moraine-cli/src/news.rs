@@ -137,7 +137,9 @@ impl NewsItem {
         let interner = Interner::new();
         self.restrictions.iter().all(|r| match r {
             Restriction::IfInstalled(atom) => Atom::parse(atom, features, &interner).is_ok(),
-            Restriction::IfProfile(path) => !path.is_empty(),
+            Restriction::IfProfile(path) => {
+                valid_profile(path) && (!self.format.starts_with("1.") || !path.contains('*'))
+            }
             Restriction::IfKeyword(_) => true,
         })
     }
@@ -196,21 +198,31 @@ fn installed_matches(installed: &[InstalledPkg], atom: &str, features: EapiFeatu
 }
 
 /// Match a `Display-If-Profile` restriction against the repo-relative profile:
-/// format `2.*` allows a trailing `/*` prefix match, every other format requires
-/// exact equality, mirroring `DisplayProfileRestriction.checkRestriction`.
+/// format `2.*` allows a trailing `/*` prefix match keeping the slash, every
+/// other format requires exact equality, mirroring
+/// `DisplayProfileRestriction.checkRestriction`. The bare prefix without the
+/// trailing slash does not match.
 fn profile_matches(profile: &str, restriction: &str, format: &str) -> bool {
     if format.starts_with("2.")
-        && let Some(prefix) = restriction.strip_suffix("/*")
+        && let Some(prefix) = restriction.strip_suffix('*')
+        && prefix.ends_with('/')
     {
-        return profile == prefix || profile.starts_with(&format!("{prefix}/"));
+        return profile.starts_with(prefix);
     }
     profile == restriction
 }
 
-/// Whether the arch satisfies a `Display-If-Keyword` restriction.
+/// Whether the value satisfies Portage's `_valid_profile_RE` (`^[^*]+(/\*)?$`):
+/// one or more non-`*` characters, optionally followed by a trailing `/*`.
+fn valid_profile(value: &str) -> bool {
+    let base = value.strip_suffix("/*").unwrap_or(value);
+    !base.is_empty() && !base.contains('*')
+}
+
+/// Whether the arch satisfies a `Display-If-Keyword` restriction, compared with
+/// exact string equality against `ARCH`, mirroring `DisplayKeywordRestriction`.
 fn keyword_matches(arch: &str, keyword: &str) -> bool {
-    let bare = keyword.trim_start_matches(['~', '-']);
-    bare == arch
+    keyword == arch
 }
 
 /// Read and evaluate unread, relevant news for one repository.
@@ -373,8 +385,47 @@ mod tests {
             "Title: T\nNews-Item-Format: 2.0\nDisplay-If-Profile: default/linux/amd64/17.1/*\n",
         );
         assert!(two.is_relevant(&env(&[], "default/linux/amd64/17.1/desktop", "amd64")));
-        assert!(two.is_relevant(&env(&[], "default/linux/amd64/17.1", "amd64")));
+        // The bare prefix without the trailing slash does not match a `.../17.1/*`
+        // 2.0 item.
+        assert!(!two.is_relevant(&env(&[], "default/linux/amd64/17.1", "amd64")));
         assert!(!two.is_relevant(&env(&[], "default/linux/x86/17.1", "amd64")));
+    }
+
+    #[test]
+    fn keyword_matches_arch_exactly() {
+        let item = NewsItem::parse(
+            "x",
+            "Title: T\nNews-Item-Format: 1.0\nDisplay-If-Keyword: amd64\n",
+        );
+        assert!(item.is_relevant(&env(&[], "", "amd64")));
+        // A `~amd64` keyword does not match the `amd64` arch.
+        let testing = NewsItem::parse(
+            "x",
+            "Title: T\nNews-Item-Format: 1.0\nDisplay-If-Keyword: ~amd64\n",
+        );
+        assert!(!testing.is_relevant(&env(&[], "", "amd64")));
+    }
+
+    #[test]
+    fn profile_validation_rejects_stray_wildcards() {
+        // A `1.*` item with a `*` in the profile is invalid.
+        let one = NewsItem::parse(
+            "x",
+            "Title: T\nNews-Item-Format: 1.0\nDisplay-If-Profile: default/linux/amd64/17.1/*\n",
+        );
+        assert!(!one.is_valid());
+        // A `2.*` item may carry a trailing `/*`.
+        let two = NewsItem::parse(
+            "x",
+            "Title: T\nNews-Item-Format: 2.0\nDisplay-If-Profile: default/linux/amd64/17.1/*\n",
+        );
+        assert!(two.is_valid());
+        // A stray `*` not forming a trailing `/*` is invalid.
+        let bad = NewsItem::parse(
+            "x",
+            "Title: T\nNews-Item-Format: 2.0\nDisplay-If-Profile: default/*/amd64\n",
+        );
+        assert!(!bad.is_valid());
     }
 
     #[test]

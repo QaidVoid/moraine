@@ -336,6 +336,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         &report.elog,
         ctx.vars.get("PORTAGE_ELOG_CLASSES"),
         ctx.vars.get("PORTAGE_ELOG_SYSTEM"),
+        ctx.vars.get("PORTAGE_ELOG_COMMAND"),
         &wr.eroot,
     );
     println!("Installation complete.");

@@ -4,9 +4,11 @@
 //! `${EROOT}/var/lib/portage/news/news-<repoid>.unread` and `.skip`. The
 //! [`update_items`] routine mirrors `lib/portage/news.py`: it lists the repo's
 //! `metadata/news`, skips items already seen, validates and evaluates each item,
-//! and records newly-seen relevant items in both files, written atomically under
-//! a lockfile. [`display_after_action`] runs this for every repository and prints
-//! the unread counts after an install or a sync.
+//! and records newly-seen relevant items in both files. The whole load, mutate,
+//! and save cycle is held under an advisory lock on the `.unread` file so
+//! concurrent runs do not clobber each other, and the written state files carry
+//! the GLEP 42 ownership and permissions. [`display_after_action`] runs this for
+//! every repository and prints the unread counts after an install or a sync.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,38 @@ use moraine_repo::RepoSet;
 
 use crate::config::ConfigContext;
 use crate::news::{InstalledPkg, NewsEnv, NewsItem};
+
+/// GLEP 42 file mode: group write, world read (`0o0064`).
+const GLEP42_FILE_MODE: u32 = 0o0064;
+
+/// A held advisory lock on a news-state lock file: a real `flock(LOCK_EX)` held
+/// for the read-modify-write cycle. The lock is released when the handle drops;
+/// the lock file is never unlinked, so a concurrent acquirer blocks on the same
+/// inode rather than racing a recreated file.
+struct NewsLock {
+    _file: std::fs::File,
+}
+
+impl NewsLock {
+    /// Acquire the exclusive lock for `repo_id` under `news_lib`. Returns `None`
+    /// when the lock file cannot be created or locked, in which case the caller
+    /// proceeds without serialization rather than failing.
+    fn acquire(news_lib: &Path, repo_id: &str) -> Option<Self> {
+        if let Err(e) = std::fs::create_dir_all(news_lib) {
+            tracing::warn!(error = %e, "could not create news state directory");
+            return None;
+        }
+        let path = news_lib.join(format!("news-{repo_id}.unread.lock"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .ok()?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).ok()?;
+        Some(Self { _file: file })
+    }
+}
 
 /// The per-repository news state: which items have been seen (`skip`) and which
 /// remain unread.
@@ -35,8 +69,9 @@ impl NewsState {
         }
     }
 
-    /// Persist both files atomically. A write failure (for example an unprivileged
-    /// run) is logged and ignored, matching `news.py`'s silent `PermissionDenied`.
+    /// Persist both files atomically, then apply the GLEP 42 ownership and
+    /// permissions to each. A write failure (for example an unprivileged run) is
+    /// logged and ignored, matching `news.py`'s silent `PermissionDenied`.
     pub fn save(&self, news_lib: &Path, repo_id: &str) {
         if let Err(e) = std::fs::create_dir_all(news_lib) {
             tracing::warn!(error = %e, "could not create news state directory");
@@ -45,6 +80,38 @@ impl NewsState {
         write_lines(&skip_path(news_lib, repo_id), &self.skip);
         write_lines(&unread_path(news_lib, repo_id), &self.unread);
     }
+}
+
+/// The `portage` group id, read from `/etc/group` without a libc dependency.
+/// `None` when the group is absent or the file cannot be read.
+fn portage_gid() -> Option<u32> {
+    let text = std::fs::read_to_string("/etc/group").ok()?;
+    for line in text.lines() {
+        let mut fields = line.split(':');
+        if fields.next() == Some("portage") {
+            // The gid is the third colon-separated field.
+            return fields.nth(1).and_then(|g| g.trim().parse().ok());
+        }
+    }
+    None
+}
+
+/// Apply the GLEP 42 attributes to a written state file: owner root, group
+/// `portage`, mode `0o0064`. Skipped without privilege: the `0o0064` mode strips
+/// the owner's own permissions, so applying it as a non-root user would lock the
+/// owner out of its own state. Only the privileged (root) run, which bypasses the
+/// owner check, applies the attributes, matching `apply_secpass_permissions`.
+fn apply_glep42_attrs(path: &Path) {
+    use rustix::fs::{Gid, Mode, Uid};
+    if !rustix::process::geteuid().is_root() {
+        return;
+    }
+    if let Some(gid) = portage_gid() {
+        let owner = Uid::from_raw(0);
+        let group = Gid::from_raw(gid);
+        let _ = rustix::fs::chown(path, Some(owner), Some(group));
+    }
+    let _ = rustix::fs::chmod(path, Mode::from_bits_truncate(GLEP42_FILE_MODE));
 }
 
 /// The `${EROOT}/var/lib/portage/news` directory.
@@ -73,6 +140,9 @@ pub fn update_items(
     news_lib: &Path,
     lang: &str,
 ) -> usize {
+    // Hold the lock across the whole load-mutate-save cycle so a concurrent run
+    // cannot read a stale unread set and overwrite our additions.
+    let _lock = NewsLock::acquire(news_lib, repo_id);
     let mut state = NewsState::load(news_lib, repo_id);
     if news_dir.is_dir()
         && let Ok(entries) = std::fs::read_dir(news_dir)
@@ -217,8 +287,11 @@ fn read_lines(path: &Path) -> BTreeSet<String> {
 
 fn write_lines(path: &Path, lines: &BTreeSet<String>) {
     let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
-    if let Err(e) = moraine_common::fs::atomic_write(path, body.as_bytes()) {
-        tracing::warn!(error = %e, path = %path.display(), "could not write news state");
+    match moraine_common::fs::atomic_write(path, body.as_bytes()) {
+        Ok(()) => apply_glep42_attrs(path),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "could not write news state")
+        }
     }
 }
 
@@ -276,5 +349,44 @@ mod tests {
         // A second run sees no new items and keeps the same unread count.
         let again = update_items(&news_dir, "gentoo", &env(&installed), &news_lib, "en");
         assert_eq!(again, 1);
+    }
+
+    #[test]
+    fn concurrent_updates_do_not_lose_unread_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let news_dir = tmp.path().join("metadata/news");
+        // Many relevant items, all seeded fresh on the first scan to see.
+        for i in 0..40 {
+            write_item(
+                &news_dir,
+                &format!("2024-02-{i:02}"),
+                "Title: T\nNews-Item-Format: 1.0\nDisplay-If-Installed: sys-libs/glibc\n\nBody.\n",
+            );
+        }
+        let news_lib = tmp.path().join("newslib");
+        let installed = vec![InstalledPkg {
+            category: "sys-libs".to_owned(),
+            package: "glibc".to_owned(),
+            version: Version::parse("2.5").unwrap(),
+            slot: "0".to_owned(),
+            subslot: None,
+        }];
+
+        // Two threads scan the same repository concurrently. The lockfile must
+        // serialize the read-modify-write so no unread item is dropped.
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let news_dir = news_dir.clone();
+                let news_lib = news_lib.clone();
+                let env = env(&installed);
+                scope.spawn(move || {
+                    update_items(&news_dir, "gentoo", &env, &news_lib, "en");
+                });
+            }
+        });
+
+        let state = NewsState::load(&news_lib, "gentoo");
+        assert_eq!(state.unread.len(), 40);
+        assert_eq!(state.skip.len(), 40);
     }
 }
