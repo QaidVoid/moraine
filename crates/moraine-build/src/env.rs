@@ -596,15 +596,4 @@ mod tests {
         let out = filter_saved_env(&prev, &incoming);
         assert_eq!(out.get("SANDBOX_WRITE").unwrap(), "/tmp/a:/tmp/b:/tmp/c");
     }
-
-    #[test]
-    fn function_carries_across_phases() {
-        // Functions are captured as a synthetic key with a body; the filter must
-        // carry it forward like any other mutable variable.
-        let prev = BTreeMap::new();
-        let mut incoming = BTreeMap::new();
-        incoming.insert("FUNCTION:myfunc".into(), "myfunc() { echo hi; }".into());
-        let out = filter_saved_env(&prev, &incoming);
-        assert_eq!(out.get("FUNCTION:myfunc").unwrap(), "myfunc() { echo hi; }");
-    }
 }

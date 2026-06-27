@@ -322,30 +322,57 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
     }
 
     /// The bash `-c` script body for a phase.
+    ///
+    /// The library scripts are sourced in dependency order, then the carried
+    /// environment from prior phases, then the ebuild (so its top-level
+    /// `inherit` runs). After sourcing the ebuild the driver folds the
+    /// accumulated eclass `E_*` metadata, binds the EAPI default phase set and
+    /// the bare `default`, changes into `${S}` for the source phases, and
+    /// dispatches the phase function with its pre/post hooks.
     fn phase_script(
         &self,
         phase: PhaseKind,
         carried_path: &std::path::Path,
         saved_env_path: &std::path::Path,
     ) -> String {
-        format!(
-            "set -e\n\
-             [ -f {carried} ] && . {carried}\n\
-             . {functions}\n\
-             . {helpers}\n\
-             [ -f {ebuild} ] && . {ebuild}\n\
-             {dispatch} {func}\n\
+        // The library, carried env, and ebuild are sourced without `set -e`:
+        // ebuilds and eclasses are not written to be errexit-clean (stock
+        // Portage never runs them under `set -e`), so failures propagate through
+        // `die` and helper auto-die instead. Sourcing failures are guarded
+        // explicitly so a broken library or ebuild still aborts the phase.
+        let mut script = String::new();
+        for lib in &self.library.scripts {
+            script.push_str(&format!(
+                ". {} || exit 1\n",
+                shquote(&lib.to_string_lossy())
+            ));
+        }
+        script.push_str(&format!(
+            "[ -f {carried} ] && {{ . {carried} || exit 1; }}\n\
+             [ -f {ebuild} ] && {{ . {ebuild} || die \"error sourcing ebuild\"; }}\n\
+             {fold}\n\
+             {bind} \"${{EAPI:-0}}\" {func}\n",
+            carried = shquote(&carried_path.to_string_lossy()),
+            ebuild = shquote(&self.ebuild_path.to_string_lossy()),
+            fold = bashlib::FOLD_FUNC,
+            bind = bashlib::BIND_FUNC,
+            func = phase.func_name(),
+        ));
+        // The source phases run in the unpacked source directory; the pkg_*
+        // phases and src_unpack stay in WORKDIR (the process cwd).
+        if cd_to_source(phase) {
+            script.push_str(&format!("__cd_to_s {}\n", phase.short_name()));
+        }
+        script.push_str(&format!(
+            "{dispatch} {func}\n\
              rc=$?\n\
              ( set -o posix; set ) > {saved} 2>/dev/null || true\n\
              exit $rc\n",
-            carried = shquote(&carried_path.to_string_lossy()),
-            functions = shquote(&self.library.functions.to_string_lossy()),
-            helpers = shquote(&self.library.helpers.to_string_lossy()),
-            ebuild = shquote(&self.ebuild_path.to_string_lossy()),
             dispatch = bashlib::DISPATCH_FUNC,
             func = phase.func_name(),
             saved = shquote(&saved_env_path.to_string_lossy()),
-        )
+        ));
+        script
     }
 
     /// Read the saved environment a phase wrote and merge it into the carried
@@ -411,19 +438,30 @@ fn shquote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r#"'\''"#))
 }
 
-/// Write a `KEY=value` env file, one per line.
+/// Whether a phase runs in the unpacked source directory `${S}`. The source
+/// phases after unpack `cd` into `${S}`; the `pkg_*` phases and `src_unpack`
+/// stay in `WORKDIR`.
+fn cd_to_source(phase: PhaseKind) -> bool {
+    matches!(
+        phase,
+        PhaseKind::SrcPrepare
+            | PhaseKind::SrcConfigure
+            | PhaseKind::SrcCompile
+            | PhaseKind::SrcTest
+            | PhaseKind::SrcInstall
+    )
+}
+
+/// Write a `KEY=value` env file, one per line, as plain exports.
+///
+/// The function bodies the ebuild and eclasses define are re-established by
+/// re-sourcing the ebuild (with a working `inherit`) each phase, so the saved
+/// environment only carries plain variable assignments; `set -o posix; set`
+/// never emits function definitions for this carry to capture.
 fn write_env_file(path: &std::path::Path, env: &BTreeMap<String, String>) -> Result<()> {
     let mut body = String::new();
     for (k, v) in env {
-        // Carried variables are exported as plain assignments. Functions captured
-        // as FUNCTION:name keys are written verbatim as their body.
-        if let Some(name) = k.strip_prefix("FUNCTION:") {
-            let _ = name;
-            body.push_str(v);
-            body.push('\n');
-        } else {
-            body.push_str(&format!("export {}={}\n", k, shquote(v)));
-        }
+        body.push_str(&format!("export {}={}\n", k, shquote(v)));
     }
     moraine_common::fs::atomic_write(path, body.as_bytes())?;
     Ok(())
@@ -713,7 +751,7 @@ mod tests {
             .expect("compile call");
         let script = compile.args.last().unwrap();
         assert!(script.contains("phase-functions.sh"));
-        assert!(script.contains("__ebuild_phase src_compile"));
+        assert!(script.contains("__ebuild_phase_with_hooks src_compile"));
         // Sandbox wrapper is the program.
         assert_eq!(compile.program, "sandbox");
         assert!(compile.env.contains_key("SANDBOX_WRITE"));
