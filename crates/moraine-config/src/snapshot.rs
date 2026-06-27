@@ -239,6 +239,10 @@ impl ResolvedConfig {
         if extra.is_empty() {
             return accept_keywords(keywords, &self.accepted_keywords, &self.arch);
         }
+        // Fold the per-package tokens onto the cloned accepted set with
+        // incremental semantics, mirroring `KeywordsManager._getEgroups`: `-*`
+        // clears the set, a `-keyword` token removes that keyword, and a plain
+        // keyword is added.
         let mut accepted = self.accepted_keywords.clone();
         for kw in extra {
             if kw.is_empty() {
@@ -252,6 +256,10 @@ impl ResolvedConfig {
                     .map(|k| format!("~{k}"))
                     .collect();
                 accepted.extend(testing);
+            } else if kw == "-*" {
+                accepted.clear();
+            } else if let Some(rest) = kw.strip_prefix('-') {
+                accepted.remove(rest);
             } else {
                 accepted.insert(kw.clone());
             }
@@ -361,6 +369,34 @@ mod tests {
         assert_eq!(
             cfg.keyword_result(&["~amd64".to_owned()], &[]),
             KeywordResult::NeedsKeyword
+        );
+    }
+
+    #[test]
+    fn negative_pkeyword_tokens_fold_incrementally() {
+        let cfg = ResolvedConfig::new(
+            ProfileStack::default(),
+            "amd64".to_owned(),
+            ["amd64".to_owned()].into_iter().collect(),
+            UseManager::default(),
+            MaskManager::new(),
+            LicenseManager::default(),
+            KeywordsManager::new(),
+            ProvidedManager::new(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(Interner::new()),
+        );
+        // `-* ~x86` clears the inherited amd64 acceptance, so a stable amd64
+        // build is rejected on keyword grounds.
+        assert_ne!(
+            cfg.keyword_result(&["amd64".to_owned()], &["-*".to_owned(), "~x86".to_owned()]),
+            KeywordResult::Accepted
+        );
+        // `-amd64` discards amd64, so a stable amd64 build is not accepted.
+        assert_ne!(
+            cfg.keyword_result(&["amd64".to_owned()], &["-amd64".to_owned()]),
+            KeywordResult::Accepted
         );
     }
 

@@ -905,6 +905,40 @@ mod tests {
     }
 
     #[test]
+    fn arch_conditional_reduces_to_edge_on_matching_profile() {
+        // The profile arch keyword flows into the resolved USE, so an
+        // arch-conditional dependency group is live on the matching profile.
+        let dep = NormAtom {
+            blocker: crate::depnode::BlockerKind::None,
+            cp: "dev-libs/arch-only".to_owned(),
+            version: None,
+            slot: None,
+            subslot: None,
+            slot_op: None,
+            use_deps: vec![],
+        };
+        let group = DepNode::Conditional {
+            flag: "amd64".to_owned(),
+            sense: true,
+            body: vec![DepNode::Leaf(dep)],
+        };
+
+        // On an amd64 profile the branch contributes its edge.
+        let on_amd64: BTreeSet<String> = ["amd64".to_owned()].into_iter().collect();
+        let mut atoms = Vec::new();
+        let mut groups = Vec::new();
+        reduce(&group, &on_amd64, &mut atoms, &mut groups);
+        assert!(atoms.iter().any(|a| a.cp == "dev-libs/arch-only"));
+
+        // On a non-amd64 profile the same group contributes no edge.
+        let other: BTreeSet<String> = BTreeSet::new();
+        let mut atoms = Vec::new();
+        let mut groups = Vec::new();
+        reduce(&group, &other, &mut atoms, &mut groups);
+        assert!(atoms.is_empty());
+    }
+
+    #[test]
     fn build_time_classification() {
         assert!(DepClass::Bdepend.is_build_time());
         assert!(DepClass::Depend.is_build_time());

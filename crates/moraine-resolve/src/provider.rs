@@ -272,3 +272,40 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::required_use::{RequiredUseOutcome, evaluate_required_use, parse_required_use};
+
+    #[test]
+    fn arch_gated_required_use_enforced_on_matching_arch() {
+        // The profile arch keyword is in the resolved USE, so an arch-gated
+        // REQUIRED_USE constraint is active rather than trivially satisfied.
+        let constraint = parse_required_use("x86? ( cpu_flags_x86_sse2 )");
+
+        // On an x86 profile the constraint is active and unsatisfied.
+        let on_x86: BTreeSet<String> = ["x86".to_owned()].into_iter().collect();
+        assert!(matches!(
+            evaluate_required_use(&constraint, &on_x86),
+            RequiredUseOutcome::Violated(_)
+        ));
+
+        // Enabling the required flag satisfies it.
+        let satisfied: BTreeSet<String> = ["x86".to_owned(), "cpu_flags_x86_sse2".to_owned()]
+            .into_iter()
+            .collect();
+        assert!(matches!(
+            evaluate_required_use(&constraint, &satisfied),
+            RequiredUseOutcome::Satisfied
+        ));
+
+        // Without the arch flag the conditional is inactive, so it is satisfied.
+        let off: BTreeSet<String> = BTreeSet::new();
+        assert!(matches!(
+            evaluate_required_use(&constraint, &off),
+            RequiredUseOutcome::Satisfied
+        ));
+    }
+}

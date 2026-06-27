@@ -25,7 +25,9 @@ use crate::license::LicenseManager;
 use crate::makeconf::VarMap;
 use crate::profile::ProfileStack;
 use crate::snapshot::{PkgBashrcEntry, PkgEnvEntry, ResolvedConfig};
-use crate::use_resolution::{PkgUseEntry, UseLayer, UseManager, global_use, iuse_effective};
+use crate::use_resolution::{
+    PkgUseEntry, ProfileUseNode, UseLayer, UseManager, global_use, iuse_effective,
+};
 use crate::visibility::{MaskBuilder, MaskPattern, ProvidedManager, parse_mask_pattern};
 
 /// A repository's masking input: its name (for `::repo` scoping), its default
@@ -65,24 +67,57 @@ pub fn resolve_config(
     let global = global_use(env);
     let features_test = features_contains(env, "test");
 
-    // USE masking/forcing fold across the profile stack.
-    let mut use_mask = StackSet::default();
-    let mut use_force = StackSet::default();
-    let mut use_stable_mask = StackSet::default();
+    // USE masking and forcing, kept per profile node so each node's global
+    // use.mask/use.force interleaves with that node's package.use.mask/
+    // package.use.force entries (and the stable variants), with /etc/portage as
+    // the final user node. The per-package files all share the `atom flag -flag`
+    // syntax of package.use.
+    type NodeAddFn = fn(&mut ProfileUseNode, PkgUseEntry);
+    let pkg_use_files: [(&str, NodeAddFn); 4] = [
+        ("package.use.mask", ProfileUseNode::add_pkg_mask),
+        ("package.use.force", ProfileUseNode::add_pkg_force),
+        (
+            "package.use.stable.mask",
+            ProfileUseNode::add_pkg_stable_mask,
+        ),
+        (
+            "package.use.stable.force",
+            ProfileUseNode::add_pkg_stable_force,
+        ),
+    ];
+    let mut use_nodes: Vec<ProfileUseNode> = Vec::new();
     for node in &profile.nodes {
-        use_mask.apply(&read_flag_file(&node.path.join("use.mask")));
-        use_force.apply(&read_flag_file(&node.path.join("use.force")));
-        // `use.stable.mask` is only honored from EAPI 5+ profile nodes.
+        let mut un = ProfileUseNode::new();
+        un.set_mask(read_flag_file(&node.path.join("use.mask")));
+        un.set_force(read_flag_file(&node.path.join("use.force")));
+        // The stable variants are only honored from EAPI 5+ profile nodes.
         if node_level(node) >= 5 {
-            use_stable_mask.apply(&read_flag_file(&node.path.join("use.stable.mask")));
+            un.set_stable_mask(read_flag_file(&node.path.join("use.stable.mask")));
+            un.set_stable_force(read_flag_file(&node.path.join("use.stable.force")));
+        }
+        for (name, add) in pkg_use_files {
+            for line in read_lines(&node.path.join(name)) {
+                if let Some(entry) = parse_pkg_use(&line, interner) {
+                    add(&mut un, entry);
+                }
+            }
+        }
+        use_nodes.push(un);
+    }
+    let mut user_node = ProfileUseNode::new();
+    for (name, add) in pkg_use_files {
+        for line in read_lines(&config_root.join("etc/portage").join(name)) {
+            if let Some(entry) = parse_pkg_use(&line, interner) {
+                add(&mut user_node, entry);
+            }
         }
     }
+    use_nodes.push(user_node);
 
     let mut use_manager = UseManager::new(global.enabled, global.hidden)
         .with_disabled(global.disabled)
-        .with_mask(use_mask.into_sorted())
-        .with_force(use_force.into_sorted())
-        .with_stable_mask(use_stable_mask.into_sorted(), true)
+        .with_arch(arch.clone())
+        .with_nodes(use_nodes)
         .with_features_test(features_test)
         .with_iuse_effective(iuse_effective(env));
 
@@ -104,31 +139,6 @@ pub fn resolve_config(
     for line in read_lines(&config_root.join("etc/portage/package.use")) {
         if let Some(entry) = parse_pkg_use(&line, interner) {
             use_manager.add_pkg_use(entry, UseLayer::User);
-        }
-    }
-
-    // Per-package USE masking and forcing across the profile stack (profile
-    // layer) then /etc/portage (user layer). Each file shares the
-    // `atom flag -flag` syntax of package.use.
-    type AddFn = fn(&mut UseManager, PkgUseEntry, UseLayer);
-    let pkg_use_files: [(&str, AddFn); 4] = [
-        ("package.use.mask", UseManager::add_pkg_mask),
-        ("package.use.force", UseManager::add_pkg_force),
-        ("package.use.stable.mask", UseManager::add_pkg_stable_mask),
-        ("package.use.stable.force", UseManager::add_pkg_stable_force),
-    ];
-    for (name, add) in pkg_use_files {
-        for node in &profile.nodes {
-            for line in read_lines(&node.path.join(name)) {
-                if let Some(entry) = parse_pkg_use(&line, interner) {
-                    add(&mut use_manager, entry, UseLayer::Profile);
-                }
-            }
-        }
-        for line in read_lines(&config_root.join("etc/portage").join(name)) {
-            if let Some(entry) = parse_pkg_use(&line, interner) {
-                add(&mut use_manager, entry, UseLayer::User);
-            }
         }
     }
 
@@ -1182,6 +1192,95 @@ mod tests {
             false,
         );
         assert!(!eff.enabled.contains("exp"));
+    }
+
+    #[test]
+    fn later_node_global_mask_pops_base_pkg_mask() {
+        // A base profile node masks `clang` for sys-libs/glibc via
+        // package.use.mask; a later child node's global use.mask `-clang` pops
+        // that mask, so clang is not masked.
+        let base = tempfile::tempdir().unwrap();
+        let child = tempfile::tempdir().unwrap();
+        std::fs::write(
+            base.path().join("package.use.mask"),
+            "sys-libs/glibc clang\n",
+        )
+        .unwrap();
+        std::fs::write(child.path().join("use.mask"), "-clang\n").unwrap();
+        let profile = ProfileStack {
+            nodes: vec![
+                crate::profile::ProfileNode {
+                    path: base.path().to_path_buf(),
+                    eapi: "8".to_owned(),
+                    is_user: false,
+                    formats: Vec::new(),
+                },
+                crate::profile::ProfileNode {
+                    path: child.path().to_path_buf(),
+                    eapi: "8".to_owned(),
+                    is_user: false,
+                    formats: Vec::new(),
+                },
+            ],
+        };
+        let mut env = VarMap::new();
+        env.set("USE".to_owned(), "clang".to_owned());
+        let interner = Arc::new(Interner::new());
+        let cfg = resolve_config(&profile, &env, base.path(), &[], vec![], vec![], &interner);
+        let version = Version::parse("2.0").unwrap();
+        let glibc = pref(&interner, "sys-libs", "glibc", &version);
+        assert!(
+            cfg.effective_use(&glibc, &[], false, false)
+                .enabled
+                .contains("clang")
+        );
+    }
+
+    #[test]
+    fn global_use_stable_force_applies_at_eapi_5_plus() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("use.stable.force"), "secure\n").unwrap();
+        let interner = Arc::new(Interner::new());
+        let version = Version::parse("1.0").unwrap();
+
+        // EAPI 8: forced for a stable package, not for a testing one.
+        let cfg8 = resolve_config(
+            &profile_with_eapi(dir.path(), "8"),
+            &VarMap::new(),
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        assert!(
+            cfg8.effective_use(&pref(&interner, "a", "b", &version), &[], true, false)
+                .enabled
+                .contains("secure")
+        );
+        assert!(
+            !cfg8
+                .effective_use(&pref(&interner, "a", "b", &version), &[], false, false)
+                .enabled
+                .contains("secure")
+        );
+
+        // EAPI 4: use.stable.force is ignored entirely.
+        let cfg4 = resolve_config(
+            &profile_with_eapi(dir.path(), "4"),
+            &VarMap::new(),
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        assert!(
+            !cfg4
+                .effective_use(&pref(&interner, "a", "b", &version), &[], true, false)
+                .enabled
+                .contains("secure")
+        );
     }
 
     #[test]
