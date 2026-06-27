@@ -298,7 +298,9 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
     for (k, v) in &pkg.reduced_meta {
         info.set(k.clone(), v.clone());
     }
-    for key in ["CFLAGS", "CXXFLAGS", "LDFLAGS", "CHOST", "CBUILD"] {
+    for key in [
+        "CFLAGS", "CXXFLAGS", "LDFLAGS", "CHOST", "CBUILD", "CC", "CXX", "CTARGET", "ASFLAGS",
+    ] {
         if let Some(v) = request.config.vars.get(key) {
             info.set(key, v.clone());
         }

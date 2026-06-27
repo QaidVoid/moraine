@@ -41,6 +41,9 @@ pub struct MergeOp {
     pub in_world: bool,
     /// The build-time elog messages to carry into the post-merge report.
     pub elog: Vec<crate::state::ElogRecord>,
+    /// The ebuild source bytes to copy into the dbdir as `<PF>.ebuild`, when
+    /// available.
+    pub ebuild: Option<Vec<u8>>,
 }
 
 /// An unmerge operation: the package to remove from the live root.

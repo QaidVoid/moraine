@@ -14,7 +14,9 @@ use moraine_atom::{Atom, SlotOp};
 use moraine_common::Interner;
 use moraine_eapi::PERMISSIVE;
 use moraine_vdb::contents::{Contents, Entry};
-use moraine_vdb::record::{Depend, DependKind, DependSet, EnvironmentRef, PackageRecord, Slot};
+use moraine_vdb::record::{
+    Depend, DependKind, DependSet, EnvironmentRef, PackageRecord, Slot, Toolchain,
+};
 use moraine_vdb::soname::{Provides, Requires, SonameEntry};
 use moraine_version::Version;
 
@@ -111,6 +113,10 @@ pub struct PackageState {
     pub keywords: Vec<String>,
     /// The recorded `LICENSE`.
     pub license: String,
+    /// The recorded `DESCRIPTION`.
+    pub description: String,
+    /// The recorded `HOMEPAGE`.
+    pub homepage: String,
     /// The recorded `PROPERTIES`.
     pub properties: String,
     /// The recorded `RESTRICT`.
@@ -139,6 +145,8 @@ pub struct PackageState {
     pub build_id: Option<u64>,
     /// The verbatim `NEEDED.ELF.2` lines from the post-build scan.
     pub needed: Vec<String>,
+    /// The recorded toolchain flag files.
+    pub toolchain: Toolchain,
 }
 
 impl PackageState {
@@ -212,6 +220,8 @@ impl PackageState {
             depends,
             keywords: self.keywords,
             license: self.license,
+            description: self.description,
+            homepage: self.homepage,
             properties: self.properties,
             restrict: self.restrict,
             repository: self.repository.as_deref().map(|r| interner.intern(r)),
@@ -228,6 +238,8 @@ impl PackageState {
             features: self.features,
             size: self.size,
             needed: self.needed,
+            toolchain: self.toolchain,
+            dbdir_mtime: 0,
         })
     }
 }

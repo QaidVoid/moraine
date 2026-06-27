@@ -77,6 +77,31 @@ impl DependKind {
     }
 }
 
+/// The recorded toolchain flag files copied into the dbdir build-info.
+///
+/// Each field is the verbatim value of the matching one-line aux file
+/// (`CBUILD`, `CC`, ...), kept so the exported dbdir is a faithful copy of the
+/// build environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Toolchain {
+    /// `CBUILD`: the build machine's CHOST.
+    pub cbuild: String,
+    /// `CC`: the C compiler.
+    pub cc: String,
+    /// `CFLAGS`: the C compiler flags.
+    pub cflags: String,
+    /// `CXX`: the C++ compiler.
+    pub cxx: String,
+    /// `CXXFLAGS`: the C++ compiler flags.
+    pub cxxflags: String,
+    /// `CTARGET`: the cross-compilation target CHOST.
+    pub ctarget: String,
+    /// `ASFLAGS`: the assembler flags.
+    pub asflags: String,
+    /// `LDFLAGS`: the linker flags.
+    pub ldflags: String,
+}
+
 /// A recorded `*DEPEND` field: the original string plus its parsed AST.
 #[derive(Debug, Clone)]
 pub struct Depend {
@@ -110,6 +135,10 @@ pub struct PackageRecord {
     pub keywords: Vec<String>,
     /// The recorded `LICENSE` string.
     pub license: String,
+    /// The recorded `DESCRIPTION` string.
+    pub description: String,
+    /// The recorded `HOMEPAGE` string.
+    pub homepage: String,
     /// The recorded `PROPERTIES` string.
     pub properties: String,
     /// The recorded `RESTRICT` string.
@@ -142,6 +171,12 @@ pub struct PackageRecord {
     pub size: Option<u64>,
     /// The verbatim `NEEDED.ELF.2` lines, preserving per-object linkage.
     pub needed: Vec<String>,
+    /// The recorded toolchain flag files.
+    pub toolchain: Toolchain,
+    /// The authoritative dbdir's modification time (whole seconds) when this
+    /// record was imported or exported, used to validate the derived cache. Zero
+    /// when unknown.
+    pub dbdir_mtime: i64,
 }
 
 /// The five `*DEPEND` fields kept together, addressable by [`DependKind`].

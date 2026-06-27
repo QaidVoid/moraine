@@ -94,6 +94,8 @@ fn state(cp: &str, version: &str, slot: &str) -> PackageState {
         depends: BTreeMap::new(),
         keywords: vec![],
         license: String::new(),
+        description: String::new(),
+        homepage: String::new(),
         properties: String::new(),
         restrict: String::new(),
         repository: None,
@@ -108,6 +110,7 @@ fn state(cp: &str, version: &str, slot: &str) -> PackageState {
         size: None,
         build_id: None,
         needed: vec![],
+        toolchain: Default::default(),
     }
 }
 
@@ -118,6 +121,7 @@ fn merge_op(image: PathBuf, st: PackageState, replaces: Option<&str>, in_world: 
         replaces: replaces.map(str::to_string),
         in_world,
         elog: Vec::new(),
+        ebuild: None,
     }))
 }
 
@@ -145,6 +149,49 @@ fn install_mask_filters_paths_before_contents() {
     let rec = &store.records()[0];
     assert!(rec.contents.owner("/usr/bin/keep").is_some());
     assert!(rec.contents.owner("/usr/share/doc/foo/readme").is_none());
+}
+
+#[test]
+fn low_counter_file_does_not_undercut_installed_counter() {
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Merge a first package, allocating counter 1.
+    let image1 = build_image(tmp.path().join("a").as_path(), &[("/usr/bin/a", b"a")]);
+    let engine = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()));
+    engine
+        .apply(&[merge_op(image1, state("cat/a", "1", "0"), None, false)])
+        .unwrap();
+
+    // Tamper the global counter file down below the highest installed COUNTER.
+    std::fs::write(sb.state.join("counter"), "0").unwrap();
+
+    // Merge a second package: its counter must rise above the installed maximum.
+    let image2 = build_image(tmp.path().join("b").as_path(), &[("/usr/bin/b", b"b")]);
+    let engine = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()));
+    engine
+        .apply(&[merge_op(image2, state("cat/b", "1", "0"), None, false)])
+        .unwrap();
+
+    let store = moraine_vdb::Store::load(moraine_vdb::StorePaths::in_dir(&sb.vdb)).unwrap();
+    let li = store.interner();
+    let a = store
+        .records()
+        .iter()
+        .find(|r| r.cpv(li) == "cat/a-1")
+        .unwrap();
+    let b = store
+        .records()
+        .iter()
+        .find(|r| r.cpv(li) == "cat/b-1")
+        .unwrap();
+    assert_eq!(a.counter, 1);
+    assert!(
+        b.counter > a.counter,
+        "second counter {} must exceed installed maximum {}",
+        b.counter,
+        a.counter
+    );
 }
 
 #[test]

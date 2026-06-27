@@ -304,15 +304,30 @@ impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
                 text: m.text.clone(),
             })
             .collect();
+        let ebuild = read_build_info_ebuild(&outcome.build_info_dir);
         let op = MergeOp {
             image_dir: outcome.image_dir,
             state,
             replaces: task.replaces.clone(),
             in_world: task.in_world,
             elog,
+            ebuild,
         };
         Ok(Realized::Apply(Operation::Merge(Box::new(op))))
     }
+}
+
+/// Read the ebuild copy the build placed in the build-info directory, so it can
+/// be re-exported into the dbdir as `<PF>.ebuild`. Returns `None` when absent.
+fn read_build_info_ebuild(build_info_dir: &Path) -> Option<Vec<u8>> {
+    let read = std::fs::read_dir(build_info_dir).ok()?;
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "ebuild") {
+            return std::fs::read(&path).ok();
+        }
+    }
+    None
 }
 
 /// Map a build `ElogLevel` to its lowercase elog class name.
@@ -386,6 +401,8 @@ fn state_from_request(
         depends,
         keywords: pkg.keywords.clone(),
         license: meta("LICENSE"),
+        description: meta("DESCRIPTION"),
+        homepage: meta("HOMEPAGE"),
         properties: meta("PROPERTIES"),
         restrict: pkg.restrict.join(" "),
         repository: Some(pkg.ident.repository.clone()),
@@ -410,6 +427,24 @@ fn state_from_request(
         size: Some(dir_size(&outcome.image_dir)),
         build_id: None,
         needed: render_needed_lines(&scan.needed_lines),
+        toolchain: toolchain_from_vars(&request.config.vars),
+    }
+}
+
+/// Read the recorded toolchain flag files from the resolved build configuration.
+fn toolchain_from_vars(
+    vars: &std::collections::BTreeMap<String, String>,
+) -> moraine_vdb::record::Toolchain {
+    let v = |key: &str| vars.get(key).cloned().unwrap_or_default();
+    moraine_vdb::record::Toolchain {
+        cbuild: v("CBUILD"),
+        cc: v("CC"),
+        cflags: v("CFLAGS"),
+        cxx: v("CXX"),
+        cxxflags: v("CXXFLAGS"),
+        ctarget: v("CTARGET"),
+        asflags: v("ASFLAGS"),
+        ldflags: v("LDFLAGS"),
     }
 }
 
@@ -555,6 +590,8 @@ pub fn realize_binpkg(
         in_world: task.in_world,
         // A binary package's stored build-time elog is not yet surfaced here.
         elog: Vec::new(),
+        // The ebuild copy from the binpkg is not surfaced on this path yet.
+        ebuild: None,
     };
     Ok(Realized::Apply(Operation::Merge(Box::new(op))))
 }
@@ -676,6 +713,8 @@ fn state_from_metadata(task: &InstallTask, meta: &MetadataMap) -> PackageState {
         depends,
         keywords: split("KEYWORDS"),
         license: scalar("LICENSE"),
+        description: scalar("DESCRIPTION"),
+        homepage: scalar("HOMEPAGE"),
         properties: scalar("PROPERTIES"),
         restrict: scalar("RESTRICT"),
         repository: meta.get_str("repository"),
@@ -692,6 +731,16 @@ fn state_from_metadata(task: &InstallTask, meta: &MetadataMap) -> PackageState {
         size: meta.get_str("SIZE").and_then(|s| s.trim().parse().ok()),
         build_id: meta.get_str("BUILD_ID").and_then(|s| s.trim().parse().ok()),
         needed: Vec::new(),
+        toolchain: moraine_vdb::record::Toolchain {
+            cbuild: scalar("CBUILD"),
+            cc: scalar("CC"),
+            cflags: scalar("CFLAGS"),
+            cxx: scalar("CXX"),
+            cxxflags: scalar("CXXFLAGS"),
+            ctarget: scalar("CTARGET"),
+            asflags: scalar("ASFLAGS"),
+            ldflags: scalar("LDFLAGS"),
+        },
     }
 }
 

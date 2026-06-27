@@ -84,13 +84,16 @@ impl MergeEngine {
         StorePaths::in_dir(&self.ctx.vdb_dir)
     }
 
-    /// Load the global counter, falling back to the store counter when no global
-    /// counter file exists yet.
+    /// Load the global counter as the maximum of the global counter file value
+    /// and the highest installed `COUNTER` (the loaded store's high-water mark),
+    /// so a missing, restored, or too-low counter file can never hand out a
+    /// counter that undercuts an existing package, matching `get_counter_tick_core`.
     fn load_counter(&self, store: &Store) -> u64 {
-        std::fs::read_to_string(self.ctx.counter_file())
+        let file_value = std::fs::read_to_string(self.ctx.counter_file())
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or_else(|| store.counter())
+            .unwrap_or(0);
+        file_value.max(store.counter())
     }
 
     /// Persist the global counter atomically.
@@ -194,10 +197,18 @@ impl MergeEngine {
         let contents = state::contents_from(entries);
         *counter += 1;
         let stamped = *counter;
-        let record = op.state.clone().into_record(&interner, contents, stamped)?;
+        let mut record = op.state.clone().into_record(&interner, contents, stamped)?;
         // Materialize the authoritative Portage-format dbdir, then update the
-        // derived `installed.mvdb` cache.
-        moraine_vdb::vardb::export_record(&self.ctx.vdb_dir, &record, &interner, None)?;
+        // derived `installed.mvdb` cache. Record the exported dbdir's mtime so the
+        // cache validates against the tree on the next load.
+        moraine_vdb::vardb::export_record(
+            &self.ctx.vdb_dir,
+            &record,
+            &interner,
+            op.ebuild.as_deref(),
+        )?;
+        let dbdir = moraine_vdb::vardb::record_dbdir(&self.ctx.vdb_dir, &record, &interner);
+        record.dbdir_mtime = moraine_vdb::vardb::dbdir_mtime(&dbdir);
         store.add(record)?;
 
         // A same-slot replacement supersedes the prior version's installed

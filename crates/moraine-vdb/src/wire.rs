@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The format version this build reads and writes.
-pub(crate) const FORMAT_VERSION: u32 = 2;
+pub(crate) const FORMAT_VERSION: u32 = 3;
 
 /// The complete primary store file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +120,19 @@ pub(crate) struct WireRecord {
     /// Verbatim `NEEDED.ELF.2` lines, preserving per-object linkage.
     #[serde(default)]
     pub needed: Vec<String>,
+    /// DESCRIPTION string.
+    #[serde(default)]
+    pub description: String,
+    /// HOMEPAGE string.
+    #[serde(default)]
+    pub homepage: String,
+    /// The eight toolchain flag strings in `Toolchain` field order: `CBUILD`,
+    /// `CC`, `CFLAGS`, `CXX`, `CXXFLAGS`, `CTARGET`, `ASFLAGS`, `LDFLAGS`.
+    #[serde(default)]
+    pub toolchain: [String; 8],
+    /// The authoritative dbdir's modification time (whole seconds).
+    #[serde(default)]
+    pub dbdir_mtime: i64,
 }
 
 /// A CONTENTS entry on disk.

@@ -71,8 +71,10 @@ fn collect_package_dirs(vdb_root: &Path) -> Result<Vec<PathBuf>, VdbError> {
     Ok(dirs)
 }
 
-/// Import one `<category>/<P-V>` directory into a record.
-fn import_package_dir(dir: &Path, interner: &Interner) -> Result<PackageRecord, VdbError> {
+/// Import one `<category>/<P-V>` directory into a record, interning into
+/// `interner`. Used both by the bulk import and by the per-package cache
+/// revalidation that re-imports a single dbdir whose mtime changed.
+pub fn import_package_dir(dir: &Path, interner: &Interner) -> Result<PackageRecord, VdbError> {
     let category = dir
         .parent()
         .and_then(|p| p.file_name())
@@ -170,6 +172,8 @@ fn import_package_dir(dir: &Path, interner: &Interner) -> Result<PackageRecord, 
             .map(|s| split_ws(&s))
             .unwrap_or_default(),
         license: read_aux("LICENSE")?.unwrap_or_default(),
+        description: read_aux("DESCRIPTION")?.unwrap_or_default(),
+        homepage: read_aux("HOMEPAGE")?.unwrap_or_default(),
         properties: read_aux("PROPERTIES")?.unwrap_or_default(),
         restrict: read_aux("RESTRICT")?.unwrap_or_default(),
         repository: read_line_file(dir, "repository")?
@@ -196,6 +200,17 @@ fn import_package_dir(dir: &Path, interner: &Interner) -> Result<PackageRecord, 
             .unwrap_or_default(),
         size: read_line_file(dir, "SIZE")?.and_then(|s| s.trim().parse().ok()),
         needed: read_needed_lines(dir)?,
+        toolchain: crate::record::Toolchain {
+            cbuild: read_aux("CBUILD")?.unwrap_or_default(),
+            cc: read_aux("CC")?.unwrap_or_default(),
+            cflags: read_aux("CFLAGS")?.unwrap_or_default(),
+            cxx: read_aux("CXX")?.unwrap_or_default(),
+            cxxflags: read_aux("CXXFLAGS")?.unwrap_or_default(),
+            ctarget: read_aux("CTARGET")?.unwrap_or_default(),
+            asflags: read_aux("ASFLAGS")?.unwrap_or_default(),
+            ldflags: read_aux("LDFLAGS")?.unwrap_or_default(),
+        },
+        dbdir_mtime: crate::vardb::dbdir_mtime(dir),
     })
 }
 

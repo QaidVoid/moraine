@@ -85,7 +85,10 @@ fn rewrite_tokens(raw: &str, f: impl Fn(&str) -> Option<String>) -> String {
 }
 
 /// Replace a `:old_slot` constraint with `:new_slot`, keeping any sub-slot,
-/// slot-operator, or USE-dep tail that follows the slot.
+/// slot-operator, or USE-dep tail that follows the slot. A sub-slot that equals
+/// `old_slot` is rewritten to `new_slot` as well (so `:0/0` becomes `:2/2` under
+/// `slotmove ... 0 2`); a sub-slot that differs is left verbatim, matching
+/// `update.py:update_dbentry`.
 fn replace_slot(token: &str, old_slot: &str, new_slot: &str) -> String {
     let needle = format!(":{old_slot}");
     if let Some(pos) = token.find(&needle) {
@@ -96,7 +99,20 @@ fn replace_slot(token: &str, old_slot: &str, new_slot: &str) -> String {
             out.push_str(&token[..pos]);
             out.push(':');
             out.push_str(new_slot);
-            out.push_str(after);
+            if let Some(sub_rest) = after.strip_prefix('/') {
+                // The sub-slot runs up to the next slot-op or USE-dep boundary.
+                let sub_end = sub_rest.find(['=', '*', '[']).unwrap_or(sub_rest.len());
+                let (sub, tail) = sub_rest.split_at(sub_end);
+                if sub == old_slot {
+                    out.push('/');
+                    out.push_str(new_slot);
+                    out.push_str(tail);
+                } else {
+                    out.push_str(after);
+                }
+            } else {
+                out.push_str(after);
+            }
             return out;
         }
     }
@@ -175,5 +191,26 @@ mod tests {
         let i = Interner::new();
         let out = rewrite_dep_slot("dev-libs/bar:0=", "dev-libs/bar", "0", "2", features(), &i);
         assert_eq!(out, "dev-libs/bar:2=");
+    }
+
+    #[test]
+    fn rewrites_matching_subslot() {
+        let i = Interner::new();
+        // A sub-slot equal to the old slot is rewritten too.
+        let out = rewrite_dep_slot("dev-libs/bar:0/0", "dev-libs/bar", "0", "2", features(), &i);
+        assert_eq!(out, "dev-libs/bar:2/2");
+        // A sub-slot that differs from the old slot is left verbatim.
+        let out = rewrite_dep_slot("dev-libs/bar:0/1", "dev-libs/bar", "0", "2", features(), &i);
+        assert_eq!(out, "dev-libs/bar:2/1");
+        // A matching sub-slot carrying a slot-operator tail keeps the tail.
+        let out = rewrite_dep_slot(
+            "dev-libs/bar:0/0=",
+            "dev-libs/bar",
+            "0",
+            "2",
+            features(),
+            &i,
+        );
+        assert_eq!(out, "dev-libs/bar:2/2=");
     }
 }

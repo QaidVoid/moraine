@@ -49,7 +49,7 @@ pub use engine::{MergeEngine, OperationOutcome};
 pub use error::MergeError;
 pub use plan::{MergeOp, Operation, UnmergeOp};
 pub use preserve::{PreservedEntry, PreservedLibs};
-pub use protect::ConfigProtect;
+pub use protect::{ConfigProtect, variant_name};
 pub use state::{ElogRecord, PackageState, PostMergeReport, rewrite_slot_operators};
 
 use std::path::{Path, PathBuf};

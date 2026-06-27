@@ -58,6 +58,8 @@ fn sample_record(interner: &Interner, version: &str) -> PackageRecord {
         depends,
         keywords: vec!["amd64".to_string()],
         license: "GPL-2".to_string(),
+        description: "A sample widget".to_string(),
+        homepage: "https://example.org".to_string(),
         properties: String::new(),
         restrict: "test".to_string(),
         repository: Some(interner.intern("gentoo")),
@@ -87,6 +89,11 @@ fn sample_record(interner: &Interner, version: &str) -> PackageRecord {
         features: vec!["userfetch".to_string()],
         size: Some(4096),
         needed: vec!["x86_64;/usr/lib/libwidget.so.1;libwidget.so.1;;libc.so.6".to_string()],
+        toolchain: moraine_vdb::record::Toolchain {
+            cflags: "-O2 -pipe".to_string(),
+            ..Default::default()
+        },
+        dbdir_mtime: 0,
     }
 }
 
@@ -207,6 +214,88 @@ fn vardb_export_round_trips_through_import() {
     // PROVIDES/REQUIRES are derived from the NEEDED line.
     assert!(r.provides.provides(li.intern("libwidget.so.1")));
     assert!(r.requires.sonames().any(|s| s == li.intern("libc.so.6")));
+}
+
+#[test]
+fn export_writes_description_homepage_toolchain_and_ebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let vdb = dir.path();
+    let interner = Interner::new();
+    let mut record = sample_record(&interner, "1.2.3");
+    record.environment = None;
+    record.toolchain = moraine_vdb::record::Toolchain {
+        cbuild: "x86_64-pc-linux-gnu".to_string(),
+        cc: "gcc".to_string(),
+        cflags: "-O2 -pipe".to_string(),
+        cxx: "g++".to_string(),
+        cxxflags: "-O2".to_string(),
+        ctarget: "x86_64-pc-linux-gnu".to_string(),
+        asflags: "--noexecstack".to_string(),
+        ldflags: "-Wl,-O1".to_string(),
+    };
+
+    let ebuild = b"EAPI=8\nDESCRIPTION=\"A sample widget\"\n";
+    moraine_vdb::vardb::export_record(vdb, &record, &interner, Some(ebuild)).unwrap();
+
+    let dbdir = vdb.join("app-misc/widget-1.2.3");
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("DESCRIPTION"))
+            .unwrap()
+            .trim(),
+        "A sample widget"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dbdir.join("HOMEPAGE"))
+            .unwrap()
+            .trim(),
+        "https://example.org"
+    );
+    for (file, want) in [
+        ("CBUILD", "x86_64-pc-linux-gnu"),
+        ("CC", "gcc"),
+        ("CFLAGS", "-O2 -pipe"),
+        ("CXX", "g++"),
+        ("CXXFLAGS", "-O2"),
+        ("CTARGET", "x86_64-pc-linux-gnu"),
+        ("ASFLAGS", "--noexecstack"),
+        ("LDFLAGS", "-Wl,-O1"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(dbdir.join(file)).unwrap().trim(),
+            want,
+            "{file}"
+        );
+    }
+    // The ebuild copy is written as <PF>.ebuild.
+    assert_eq!(
+        std::fs::read(dbdir.join("widget-1.2.3.ebuild")).unwrap(),
+        ebuild
+    );
+
+    // The new fields round-trip through a re-import.
+    let li = std::sync::Arc::new(Interner::new());
+    let records = moraine_vdb::import_vdb(vdb, &li).unwrap();
+    let r = &records[0];
+    assert_eq!(r.description, "A sample widget");
+    assert_eq!(r.homepage, "https://example.org");
+    assert_eq!(r.toolchain.cflags, "-O2 -pipe");
+    assert_eq!(r.toolchain.ldflags, "-Wl,-O1");
+}
+
+#[test]
+fn from_records_preserves_imported_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StorePaths::in_dir(dir.path());
+    let interner = std::sync::Arc::new(Interner::new());
+    let mut a = sample_record(&interner, "1");
+    a.counter = 42;
+    let mut b = sample_record(&interner, "2");
+    b.counter = 7;
+    let store = Store::from_records(paths, std::sync::Arc::clone(&interner), vec![a, b]);
+    // Each record keeps its imported COUNTER; the store counter is the maximum.
+    assert!(store.records().iter().any(|r| r.counter == 42));
+    assert!(store.records().iter().any(|r| r.counter == 7));
+    assert_eq!(store.counter(), 42);
 }
 
 #[test]
@@ -405,15 +494,21 @@ fn move_ent_renames_and_update_ents_rewrites_deps() {
     // Rename dev-util/foo -> dev-libs/foo.
     assert_eq!(
         store
-            .move_ent("dev-util/foo", "dev-libs/foo", None)
-            .unwrap(),
+            .move_ent("dev-util/foo", "dev-libs/foo", &|_| true)
+            .unwrap()
+            .len(),
         1
     );
     // Rewrite the dependency atoms referencing the old name everywhere.
     assert_eq!(
         store
-            .update_ents(&[("dev-util/foo".into(), "dev-libs/foo".into())], &[])
-            .unwrap(),
+            .update_ents(
+                &[("dev-util/foo".into(), "dev-libs/foo".into())],
+                &[],
+                &|_| true
+            )
+            .unwrap()
+            .len(),
         1
     );
     store.compact().unwrap();
@@ -456,7 +551,11 @@ fn update_ents_skips_self_blocker() {
         record_with(&i, "dev-libs/foo", "1", "!dev-util/foo"),
     );
     store
-        .update_ents(&[("dev-util/foo".into(), "dev-libs/foo".into())], &[])
+        .update_ents(
+            &[("dev-util/foo".into(), "dev-libs/foo".into())],
+            &[],
+            &|_| true,
+        )
         .unwrap();
     let rec = &store.records()[0];
     assert_eq!(
@@ -481,8 +580,9 @@ fn move_ent_skips_when_destination_exists() {
     // Destination dev-libs/foo-1 already exists: the move is skipped.
     assert_eq!(
         store
-            .move_ent("dev-util/foo", "dev-libs/foo", None)
-            .unwrap(),
+            .move_ent("dev-util/foo", "dev-libs/foo", &|_| true)
+            .unwrap()
+            .len(),
         0
     );
     assert!(
@@ -504,7 +604,10 @@ fn move_slot_ent_rewrites_recorded_slot() {
         record_with(&i, "dev-libs/bar", "1", "dev-libs/zlib"),
     );
     assert_eq!(
-        store.move_slot_ent("dev-libs/bar", "0", "2", None).unwrap(),
+        store
+            .move_slot_ent("dev-libs/bar", "0", "2", &|_| true)
+            .unwrap()
+            .len(),
         1
     );
     let rec = &store.records()[0];

@@ -117,7 +117,7 @@ fn whitespace_list(value: Option<&str>) -> Vec<String> {
 /// persisted when the store is writable (root) and otherwise kept in memory.
 pub(crate) fn load_installed_store(vdb_dir: &Path) -> Result<Store> {
     match Store::load(StorePaths::in_dir(vdb_dir)) {
-        Ok(store) if !store.records().is_empty() => Ok(store),
+        Ok(store) if !store.records().is_empty() => Ok(revalidate_cache(store, vdb_dir)),
         // An empty cache: derive it from the authoritative directory tree.
         Ok(store) => Ok(rebuild_cache_from_tree(vdb_dir)?.unwrap_or(store)),
         // The cache format changed: the `/var/db/pkg` tree is authoritative, so
@@ -135,6 +135,37 @@ pub(crate) fn load_installed_store(vdb_dir: &Path) -> Result<Store> {
         }
         Err(e) => Err(e).into_diagnostic(),
     }
+}
+
+/// Validate each cached record against its authoritative dbdir's modification
+/// time, re-importing any package whose dbdir changed and dropping any whose
+/// dbdir vanished, leaving unchanged packages served from the cache. Mirrors
+/// `aux_get`'s per-package `os.stat` comparison. On no change the store is
+/// returned untouched.
+fn revalidate_cache(store: Store, vdb_dir: &Path) -> Store {
+    let interner = store.interner().clone();
+    let mut stale = false;
+    let mut records = Vec::with_capacity(store.records().len());
+    for rec in store.records() {
+        let dir = moraine_vdb::vardb::record_dbdir(vdb_dir, rec, &interner);
+        if moraine_vdb::vardb::dbdir_mtime(&dir) == rec.dbdir_mtime {
+            records.push(rec.clone());
+            continue;
+        }
+        stale = true;
+        match moraine_vdb::import::import_package_dir(&dir, &interner) {
+            Ok(reimported) => records.push(reimported),
+            // The dbdir is gone (an external unmerge): drop the cache entry.
+            Err(_) => continue,
+        }
+    }
+    if !stale {
+        return store;
+    }
+    tracing::info!("revalidated vdb cache against changed dbdirs");
+    let imported = Store::from_records(StorePaths::in_dir(vdb_dir), interner, records);
+    let _ = imported.write_primary();
+    imported
 }
 
 /// Rebuild the `installed.mvdb` cache from the Portage-format `/var/db/pkg` tree.
@@ -432,12 +463,31 @@ fn apply_package_moves(
         .collect();
     let world_path = wr.state_dir.join("world");
     let config_dir = roots.config_dir().join("etc/portage");
+    let pkgdir = wr.eroot.join("var/cache/binpkgs");
     let mtime_path = wr.state_dir.join("package-move-mtimes");
     let mtimes = moraine_repo::load_mtimes(&mtime_path);
 
-    let report =
-        moraine_install::global_update(&mut store, &repos, &world_path, &config_dir, &mtimes)
-            .map_err(|e| miette!("{e}"))?;
+    // The configuration-protection policy for routing protected config rewrites.
+    let config_protect = match ConfigContext::load(roots) {
+        Ok(ctx) => ConfigProtect::with_root(
+            &wr.eroot,
+            ctx.config_protect.clone(),
+            ctx.config_protect_mask.clone(),
+        ),
+        Err(_) => ConfigProtect::default(),
+    };
+
+    let report = moraine_install::global_update(
+        &mut store,
+        &repos,
+        &world_path,
+        &config_dir,
+        &wr.vdb_dir,
+        Some(&pkgdir),
+        &config_protect,
+        &mtimes,
+    )
+    .map_err(|e| miette!("{e}"))?;
 
     // Commit the store, then record the new update-file mtimes (only after the
     // whole pass succeeds, so an interrupted pass re-runs the whole batch).
@@ -599,6 +649,53 @@ mod tests {
         assert!(cps.contains(&"dev-libs/a".to_owned()));
         assert!(cps.contains(&"dev-libs/b".to_owned()));
         assert!(cps.contains(&"sys-apps/c".to_owned()));
+    }
+
+    #[test]
+    fn changed_dbdir_reimports_only_that_package() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let vdb = dir.path();
+        // Two installed packages, both recorded as SLOT 0.
+        for pkg in ["a", "b"] {
+            let pdir = vdb.join("cat").join(format!("{pkg}-1"));
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::write(pdir.join("SLOT"), "0\n").unwrap();
+            std::fs::write(pdir.join("EAPI"), "8\n").unwrap();
+            std::fs::write(pdir.join("COUNTER"), "1\n").unwrap();
+        }
+
+        let interner = Arc::new(moraine_common::Interner::new());
+        let mut records = moraine_vdb::import_vdb(vdb, &interner).unwrap();
+        // Mark `cat/a-1` stale by storing a wrong dbdir mtime, and change its
+        // on-disk SLOT so a re-import is observable. `cat/b-1` keeps its correct
+        // mtime; its on-disk SLOT is changed too, so serving from cache (no
+        // re-import) is observable.
+        for rec in &mut records {
+            if rec.cpv(&interner) == "cat/a-1" {
+                rec.dbdir_mtime = 1;
+            }
+        }
+        std::fs::write(vdb.join("cat/a-1/SLOT"), "5\n").unwrap();
+        std::fs::write(vdb.join("cat/b-1/SLOT"), "9\n").unwrap();
+
+        let store = Store::from_records(StorePaths::in_dir(vdb), interner, records);
+        store.write_primary().unwrap();
+
+        let reloaded = load_installed_store(vdb).unwrap();
+        let li = reloaded.interner();
+        let slot_of = |cpv: &str| {
+            reloaded
+                .records()
+                .iter()
+                .find(|r| r.cpv(li) == cpv)
+                .map(|r| li.resolve(r.slot.slot).unwrap().to_string())
+                .unwrap()
+        };
+        // `cat/a-1` was re-imported from the changed dbdir.
+        assert_eq!(slot_of("cat/a-1"), "5");
+        // `cat/b-1` was served from the cache, not re-imported.
+        assert_eq!(slot_of("cat/b-1"), "0");
     }
 
     #[test]

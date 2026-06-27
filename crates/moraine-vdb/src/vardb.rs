@@ -46,6 +46,26 @@ pub fn export_record(
     Ok(())
 }
 
+/// The authoritative `<vdb_root>/<category>/<PF>/` dbdir path for `record`.
+pub fn record_dbdir(vdb_root: &Path, record: &PackageRecord, interner: &Interner) -> PathBuf {
+    let category = resolve(interner, record.category);
+    let package = resolve(interner, record.package);
+    vdb_root
+        .join(category)
+        .join(format!("{package}-{}", record.version.as_str()))
+}
+
+/// The modification time (whole seconds) of a dbdir, zero when it cannot be
+/// read. Used to validate the derived cache against the authoritative tree.
+pub fn dbdir_mtime(dir: &Path) -> i64 {
+    std::fs::metadata(dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Remove the Portage-format dbdir for `category/package-version` under
 /// `vdb_root`. A missing dbdir is not an error.
 pub fn remove_record(
@@ -94,8 +114,18 @@ fn write_aux_files(
         ("IUSE", record.iuse.join(" ")),
         ("KEYWORDS", record.keywords.join(" ")),
         ("LICENSE", record.license.clone()),
+        ("DESCRIPTION", record.description.clone()),
+        ("HOMEPAGE", record.homepage.clone()),
         ("PROPERTIES", record.properties.clone()),
         ("RESTRICT", record.restrict.clone()),
+        ("CBUILD", record.toolchain.cbuild.clone()),
+        ("CC", record.toolchain.cc.clone()),
+        ("CFLAGS", record.toolchain.cflags.clone()),
+        ("CXX", record.toolchain.cxx.clone()),
+        ("CXXFLAGS", record.toolchain.cxxflags.clone()),
+        ("CTARGET", record.toolchain.ctarget.clone()),
+        ("ASFLAGS", record.toolchain.asflags.clone()),
+        ("LDFLAGS", record.toolchain.ldflags.clone()),
         ("DEFINED_PHASES", record.defined_phases.join(" ")),
         ("INHERITED", record.inherited.join(" ")),
         ("FEATURES", record.features.join(" ")),

@@ -52,6 +52,7 @@ impl StepRunner for FakeRunner {
             replaces: task.replaces.clone(),
             in_world: task.in_world,
             elog: Vec::new(),
+            ebuild: None,
         };
         Ok(Realized::Apply(Operation::Merge(Box::new(op))))
     }
@@ -108,6 +109,8 @@ fn state_for(cpv: &str, cp: &str, slot: &str) -> PackageState {
         depends: Default::default(),
         keywords: Vec::new(),
         license: String::new(),
+        description: String::new(),
+        homepage: String::new(),
         properties: String::new(),
         restrict: String::new(),
         repository: None,
@@ -122,6 +125,7 @@ fn state_for(cpv: &str, cp: &str, slot: &str) -> PackageState {
         size: None,
         build_id: None,
         needed: Vec::new(),
+        toolchain: Default::default(),
     }
 }
 

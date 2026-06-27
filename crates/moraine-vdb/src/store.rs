@@ -52,6 +52,17 @@ impl StorePaths {
     }
 }
 
+/// A record changed by a global-update mutation, so the caller can mirror the
+/// change onto the authoritative `<vdb>/<category>/<PF>/` dbdir tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedRecord {
+    /// The old cpv whose dbdir must be removed when the change renamed the record
+    /// (a `move`). `None` for an in-place slot or dependency rewrite.
+    pub removed_cpv: Option<String>,
+    /// The cpv of the record to re-export from the cache to the dbdir.
+    pub cpv: String,
+}
+
 /// The loaded installed set, ready for queries.
 pub struct Store {
     paths: StorePaths,
@@ -78,26 +89,24 @@ impl Store {
     /// Create a store from records that were built against `interner`, adopting
     /// that interner so every record's [`Symbol`]s resolve.
     ///
-    /// Each record is stamped with an increasing counter. This is the path the
-    /// importer feeds: import produces records and one interner, then this builds
-    /// a store ready to [`compact`](Self::compact).
+    /// Each record keeps its imported `COUNTER` and the store counter is set to
+    /// the highest imported value, so a rebuild from the authoritative tree never
+    /// renumbers records and the high-water mark reflects the true maximum
+    /// installed counter. This is the path the importer feeds: import produces
+    /// records and one interner, then this builds a store ready to
+    /// [`compact`](Self::compact).
     pub fn from_records(
         paths: StorePaths,
         interner: Arc<Interner>,
         records: Vec<PackageRecord>,
     ) -> Self {
-        let mut store = Self {
+        let counter = records.iter().map(|r| r.counter).max().unwrap_or(0);
+        Self {
             paths,
             interner,
-            records: Vec::new(),
-            counter: 0,
-        };
-        for mut record in records {
-            store.counter += 1;
-            record.counter = store.counter;
-            store.records.push(record);
+            records,
+            counter,
         }
-        store
     }
 
     /// The interner backing every [`Symbol`] in the loaded records.
@@ -281,18 +290,11 @@ impl Store {
         format!("{cat}/{pkg}")
     }
 
-    /// Whether a record passes a repository filter (matches `repo_filter`, or no
-    /// filter is given).
-    fn repo_matches(&self, rec: &PackageRecord, repo_filter: Option<&str>) -> bool {
-        match repo_filter {
-            None => true,
-            Some(want) => {
-                rec.repository
-                    .and_then(|r| self.interner.resolve(r))
-                    .as_deref()
-                    == Some(want)
-            }
-        }
+    /// Whether a record passes the originating-repository gate `match_repo`,
+    /// which receives the record's repository name (`None` when unrecorded).
+    fn repo_allows(&self, rec: &PackageRecord, match_repo: &dyn Fn(Option<&str>) -> bool) -> bool {
+        let resolved = rec.repository.and_then(|r| self.interner.resolve(r));
+        match_repo(resolved.as_deref())
     }
 
     /// Stamp a record with the next counter and persist it as a journaled
@@ -304,24 +306,25 @@ impl Store {
     }
 
     /// Apply a `move` package rename to the installed store: rename every record
-    /// of `old_cp` (honoring `repo_filter`) to `new_cp`, skipping a record whose
-    /// destination cpv already exists. Returns the number renamed.
+    /// of `old_cp` (honoring the `match_repo` gate) to `new_cp`, skipping a record
+    /// whose destination cpv already exists. Returns the renamed records so the
+    /// caller can mirror the rename onto the authoritative dbdir tree.
     pub fn move_ent(
         &mut self,
         old_cp: &str,
         new_cp: &str,
-        repo_filter: Option<&str>,
-    ) -> Result<usize, VdbError> {
+        match_repo: &dyn Fn(Option<&str>) -> bool,
+    ) -> Result<Vec<ChangedRecord>, VdbError> {
         let Some((new_cat, new_pkg)) = new_cp.split_once('/') else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         let matches: Vec<PackageRecord> = self
             .records
             .iter()
-            .filter(|r| self.cp_string(r) == old_cp && self.repo_matches(r, repo_filter))
+            .filter(|r| self.cp_string(r) == old_cp && self.repo_allows(r, match_repo))
             .cloned()
             .collect();
-        let mut renamed = 0;
+        let mut changed = Vec::new();
         for rec in matches {
             let new_cpv = format!("{new_cp}-{}", rec.version.as_str());
             // "dest already exists; keep this puppy where it is" (vartree.py).
@@ -333,58 +336,73 @@ impl Store {
                 continue;
             }
             let version = rec.version.as_str().to_string();
+            let old_cpv = rec.cpv(&self.interner);
             self.remove(rec.category, rec.package, &version)?;
             let mut moved = rec;
             moved.category = self.interner.intern(new_cat);
             moved.package = self.interner.intern(new_pkg);
             self.journal_replace(moved)?;
-            renamed += 1;
+            changed.push(ChangedRecord {
+                removed_cpv: Some(old_cpv),
+                cpv: new_cpv,
+            });
         }
-        Ok(renamed)
+        Ok(changed)
     }
 
     /// Apply a `slotmove` to the installed store: rewrite the recorded `SLOT` of
-    /// every record of `atom_cp` currently at `old_slot` (honoring `repo_filter`)
-    /// to `new_slot`, preserving the recorded sub-slot (the new slot token carries
-    /// none). Returns the number changed.
+    /// every record of `atom_cp` currently at `old_slot` (honoring the
+    /// `match_repo` gate) to `new_slot`, preserving the recorded sub-slot (the new
+    /// slot token carries none). Returns the re-slotted records so the caller can
+    /// re-export their dbdirs.
     pub fn move_slot_ent(
         &mut self,
         atom_cp: &str,
         old_slot: &str,
         new_slot: &str,
-        repo_filter: Option<&str>,
-    ) -> Result<usize, VdbError> {
+        match_repo: &dyn Fn(Option<&str>) -> bool,
+    ) -> Result<Vec<ChangedRecord>, VdbError> {
         let matches: Vec<PackageRecord> = self
             .records
             .iter()
             .filter(|r| {
                 self.cp_string(r) == atom_cp
                     && self.interner.resolve(r.slot.slot).as_deref() == Some(old_slot)
-                    && self.repo_matches(r, repo_filter)
+                    && self.repo_allows(r, match_repo)
             })
             .cloned()
             .collect();
-        let mut changed = 0;
+        let mut changed = Vec::new();
         for mut rec in matches {
+            let cpv = rec.cpv(&self.interner);
             rec.slot.slot = self.interner.intern(new_slot);
             self.journal_replace(rec)?;
-            changed += 1;
+            changed.push(ChangedRecord {
+                removed_cpv: None,
+                cpv,
+            });
         }
         Ok(changed)
     }
 
-    /// Rewrite every record's `*DEPEND` atoms for the given cp `renames` and
+    /// Rewrite every gated record's `*DEPEND` atoms for the given cp `renames` and
     /// `slotmoves` (`(cp, old_slot, new_slot)`), updating both the verbatim `raw`
-    /// string and the re-parsed AST. Returns the number of records changed.
+    /// string and the re-parsed AST. Only records passing the `match_repo` gate
+    /// (applied to the record's own repository) are rewritten. Returns the changed
+    /// records so the caller can re-export their dbdirs.
     pub fn update_ents(
         &mut self,
         renames: &[(String, String)],
         slotmoves: &[(String, String, String)],
-    ) -> Result<usize, VdbError> {
+        match_repo: &dyn Fn(Option<&str>) -> bool,
+    ) -> Result<Vec<ChangedRecord>, VdbError> {
         use crate::record::{Depend, DependKind};
         let records = self.records.clone();
-        let mut changed = 0;
+        let mut changed = Vec::new();
         for rec in records {
+            if !self.repo_allows(&rec, match_repo) {
+                continue;
+            }
             let self_cp = self.cp_string(&rec);
             let features = moraine_eapi::features_for(&rec.eapi);
             let mut updated = rec.clone();
@@ -422,8 +440,12 @@ impl Store {
                 }
             }
             if dirty {
+                let cpv = updated.cpv(&self.interner);
                 self.journal_replace(updated)?;
-                changed += 1;
+                changed.push(ChangedRecord {
+                    removed_cpv: None,
+                    cpv,
+                });
             }
         }
         Ok(changed)

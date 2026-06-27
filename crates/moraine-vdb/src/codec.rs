@@ -12,7 +12,7 @@ use moraine_common::{Interner, Symbol};
 
 use crate::contents::{Contents, EntryKind};
 use crate::error::VdbError;
-use crate::record::{Depend, DependKind, EnvironmentRef, PackageRecord, Slot};
+use crate::record::{Depend, DependKind, EnvironmentRef, PackageRecord, Slot, Toolchain};
 use crate::soname::{Provides, Requires, SonameEntry};
 use crate::wire::{WireEntry, WireEntryKind, WireEnv, WireRecord};
 
@@ -131,6 +131,19 @@ pub(crate) fn encode_record(
         features: rec.features.clone(),
         size: rec.size,
         needed: rec.needed.clone(),
+        description: rec.description.clone(),
+        homepage: rec.homepage.clone(),
+        toolchain: [
+            rec.toolchain.cbuild.clone(),
+            rec.toolchain.cc.clone(),
+            rec.toolchain.cflags.clone(),
+            rec.toolchain.cxx.clone(),
+            rec.toolchain.cxxflags.clone(),
+            rec.toolchain.ctarget.clone(),
+            rec.toolchain.asflags.clone(),
+            rec.toolchain.ldflags.clone(),
+        ],
+        dbdir_mtime: rec.dbdir_mtime,
     }
 }
 
@@ -255,6 +268,8 @@ pub(crate) fn decode_record(
         depends,
         keywords: wire.keywords.clone(),
         license: wire.license.clone(),
+        description: wire.description.clone(),
+        homepage: wire.homepage.clone(),
         properties: wire.properties.clone(),
         restrict: wire.restrict.clone(),
         repository,
@@ -271,5 +286,16 @@ pub(crate) fn decode_record(
         features: wire.features.clone(),
         size: wire.size,
         needed: wire.needed.clone(),
+        toolchain: Toolchain {
+            cbuild: wire.toolchain[0].clone(),
+            cc: wire.toolchain[1].clone(),
+            cflags: wire.toolchain[2].clone(),
+            cxx: wire.toolchain[3].clone(),
+            cxxflags: wire.toolchain[4].clone(),
+            ctarget: wire.toolchain[5].clone(),
+            asflags: wire.toolchain[6].clone(),
+            ldflags: wire.toolchain[7].clone(),
+        },
+        dbdir_mtime: wire.dbdir_mtime,
     })
 }
