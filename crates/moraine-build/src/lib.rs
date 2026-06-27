@@ -27,6 +27,7 @@
 //! runner by reference, so the full pipeline can be driven against fakes.
 
 pub mod bashlib;
+pub mod depend;
 pub mod elf;
 pub mod env;
 pub mod error;
@@ -46,6 +47,7 @@ use std::path::PathBuf;
 
 use tracing::instrument;
 
+pub use depend::generate_metadata;
 pub use elf::{NeededLine, SonameScan, scan_image_sonames};
 pub use env::{ConfigEnv, EnvBuilder, PackageIdent, PhaseEnv};
 pub use error::{BuildError, PhaseKind, Result};
@@ -241,6 +243,12 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
         Err(e) => return Err(e),
     };
 
+    // 4b. Derive INHERITED/INHERIT provenance from the eclasses actually
+    // sourced, falling back to the cache token when the generator yields
+    // nothing (for example under a fake runner in tests).
+    let generated = depend::generate_metadata(runner, &library, &pkg.ebuild_path, env.base())
+        .unwrap_or_default();
+
     // 5. Drive phases.
     let report = driver.run_all()?;
 
@@ -261,7 +269,19 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
         "DEFINED_PHASES",
         pkg.defined_phases.iter().map(String::as_str),
     );
-    info.set_tokens("INHERITED", pkg.inherited.iter().map(String::as_str));
+    // INHERITED comes from the eclasses actually sourced when available,
+    // otherwise from the cache token the caller passed.
+    match generated.get("INHERITED").map(|s| s.trim()) {
+        Some(inherited) if !inherited.is_empty() => {
+            info.set("INHERITED", inherited);
+            if let Some(inherit) = generated.get("INHERIT").map(|s| s.trim())
+                && !inherit.is_empty()
+            {
+                info.set("INHERIT", inherit);
+            }
+        }
+        _ => info.set_tokens("INHERITED", pkg.inherited.iter().map(String::as_str)),
+    }
     info.set_tokens("KEYWORDS", pkg.keywords.iter().map(String::as_str));
     info.set_tokens("RESTRICT", pkg.restrict.iter().map(String::as_str));
     info.set("BUILD_TIME", build_time().to_string());

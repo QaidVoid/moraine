@@ -183,13 +183,18 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
         if self.defined_phases.iter().any(|p| p == short) {
             return true;
         }
-        // The literal "-" DEFINED_PHASES means no phases are defined; still run
-        // defaults for phases that do real default work.
+        // Run the EAPI default for every source phase even when the ebuild does
+        // not define it: src_prepare's default applies PATCHES and runs
+        // eapply_user (EAPI 6+), src_test's default runs the make check/test
+        // target, and the rest unpack/configure/compile/install. The pkg_*
+        // phases have no-op defaults when unlisted, so they stay skipped.
         matches!(
             phase,
             PhaseKind::SrcUnpack
+                | PhaseKind::SrcPrepare
                 | PhaseKind::SrcConfigure
                 | PhaseKind::SrcCompile
+                | PhaseKind::SrcTest
                 | PhaseKind::SrcInstall
         )
     }

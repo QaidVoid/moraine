@@ -65,6 +65,9 @@ pub const BIND_FUNC: &str = "__ebuild_phase_funcs";
 /// The hook-aware dispatcher the driver invokes per phase.
 pub const DISPATCH_FUNC: &str = "__ebuild_phase_with_hooks";
 
+/// The depend-phase metadata emitter (prints `MORAINE_META key=value` lines).
+pub const EMIT_FUNC: &str = "__emit_metadata";
+
 /// The vendored library scripts in the order a phase process must source them.
 const SCRIPT_ORDER: &[(&str, &str)] = &[
     ("eapi.sh", EAPI),

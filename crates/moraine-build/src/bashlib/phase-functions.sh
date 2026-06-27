@@ -182,6 +182,46 @@ __fold_eclass_metadata() {
     unset E_BDEPEND E_IDEPEND E_PROPERTIES E_RESTRICT
 }
 
+# Emit the package metadata after the ebuild has been sourced with a working
+# inherit, mirroring the stock `depend` phase (ebuild.sh:691-765). The folded
+# eclass metadata, the DEFINED_PHASES derived from the declared phase functions,
+# and INHERIT (the explicit inherit list) are printed as tagged `MORAINE_META
+# key=value` lines the Rust driver parses. Used to derive INHERITED provenance
+# and as the cache-miss metadata-regeneration fallback.
+__emit_metadata() {
+    __fold_eclass_metadata
+
+    local _valid _f
+    case ${EAPI} in
+        0|1) _valid="src_compile pkg_config pkg_info src_install pkg_nofetch
+            pkg_postinst pkg_postrm pkg_preinst pkg_prerm pkg_setup src_test
+            src_unpack" ;;
+        2|3) _valid="src_compile pkg_config src_configure pkg_info src_install
+            pkg_nofetch pkg_postinst pkg_postrm pkg_preinst src_prepare pkg_prerm
+            pkg_setup src_test src_unpack" ;;
+        *)   _valid="src_compile pkg_config src_configure pkg_info src_install
+            pkg_nofetch pkg_postinst pkg_postrm pkg_preinst src_prepare pkg_prerm
+            pkg_pretend pkg_setup src_test src_unpack" ;;
+    esac
+    DEFINED_PHASES=
+    for _f in ${_valid}; do
+        if declare -F ${_f} >/dev/null; then
+            _f=${_f#pkg_}
+            DEFINED_PHASES+=" ${_f#src_}"
+        fi
+    done
+    [[ -n ${DEFINED_PHASES} ]] || DEFINED_PHASES=-
+
+    INHERIT=${PORTAGE_EXPLICIT_INHERIT}
+
+    local k
+    for k in DEPEND RDEPEND BDEPEND PDEPEND IDEPEND SLOT SRC_URI RESTRICT \
+        HOMEPAGE LICENSE DESCRIPTION KEYWORDS INHERITED IUSE REQUIRED_USE \
+        PROPERTIES DEFINED_PHASES EAPI INHERIT; do
+        printf 'MORAINE_META %s=%s\n' "${k}" "$(echo ${!k})"
+    done
+}
+
 # Map an EBUILD_PHASE short name to its phase function (used by econf's QA
 # notice and __ebuild_phase_funcs callers).
 __ebuild_arg_to_phase() {
