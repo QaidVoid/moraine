@@ -8,6 +8,7 @@ rust-version.workspace = true
 moraine-common = { version = "0.1.0", path = "../moraine-common" }
 moraine-config = { version = "0.1.0", path = "../moraine-config" }
 moraine-repo = { version = "0.1.0", path = "../moraine-repo" }
+shlex = "2.0.1"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 

@@ -10,6 +10,7 @@
 //! successful, changed sync the engine records the head revision and triggers the
 //! post-sync metadata refresh and repository-level post-sync actions.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use moraine_repo::{RepoConfig, RepoSet};
@@ -164,6 +165,11 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
     fn run(&self, explicit: Option<&[String]>, history: &mut RevisionHistory) -> SyncReport {
         let mut report = SyncReport::default();
         let mut any_changed = false;
+        // Repositories whose `repo.postsync.d` hooks fired, so a changed master
+        // cascades its dependents' hooks. Repositories are processed master-first,
+        // so checking direct masters against this cumulative set captures the
+        // transitive cascade (Portage's `_master_hooks`).
+        let mut fired: HashSet<String> = HashSet::new();
         for cfg in self.repo_set.ordered() {
             let named = explicit.map(|names| names.iter().any(|n| n == &cfg.name));
             // When an explicit selection is given, only process named repos.
@@ -171,7 +177,7 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
                 continue;
             }
             let explicitly_named = named == Some(true);
-            let result = self.process_repo(cfg, explicitly_named, history);
+            let result = self.process_repo(cfg, explicitly_named, history, &mut fired);
             if let RepoResult::Synced { outcome, .. } = &result {
                 any_changed |= outcome.changed;
             }
@@ -191,6 +197,7 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
         cfg: &RepoConfig,
         explicitly_named: bool,
         history: &mut RevisionHistory,
+        fired: &mut HashSet<String>,
     ) -> RepoResult {
         let span = info_span!("sync_repo", repo = %cfg.name);
         let _enter = span.enter();
@@ -270,10 +277,17 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
             return RepoResult::Failed(e);
         }
 
-        // postsync.d / repo.postsync.d hooks fire after the refresh.
-        if let Err(e) =
-            self.run_postsync_hooks(&cfg.name, &options.uri, &cfg.location, outcome.changed)
-        {
+        // postsync.d / repo.postsync.d hooks fire after the refresh. A changed
+        // master cascades its dependents' hooks via `master_hooks`.
+        let master_hooks = cfg.masters.iter().any(|m| fired.contains(m));
+        if let Err(e) = self.run_postsync_hooks(
+            &cfg.name,
+            &options.uri,
+            &cfg.location,
+            outcome.changed,
+            master_hooks,
+            fired,
+        ) {
             return RepoResult::Failed(e);
         }
 
@@ -292,23 +306,31 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
 
     /// Run the per-repository `repo.postsync.d` hooks (argv `[name, uri,
     /// location]`) under `<config_root>/etc/portage/`, in sorted order. They run
-    /// when the tree `changed` or when `sync-hooks-only-on-change` is unset,
-    /// matching Portage's `perform_post_sync_hook(repo.name, ...)`. The global
-    /// `postsync.d` runs once after the whole run via [`Self::run_global_postsync_hooks`].
-    /// A hook failure is reported.
+    /// when the tree `changed`, when any of the repository's masters ran their
+    /// hooks (`master_hooks`), or when `sync-hooks-only-on-change` is unset,
+    /// matching Portage's `master_hooks or self.updatecache_flg or not
+    /// repo.sync_hooks_only_on_change`. When that gate passes the repository is
+    /// recorded in `fired` so its dependents cascade, even if the repository has
+    /// no hook executables. The global `postsync.d` runs once after the whole run
+    /// via [`Self::run_global_postsync_hooks`]. A hook failure is reported.
     fn run_postsync_hooks(
         &self,
         repo: &str,
         uri: &str,
         location: &Path,
         changed: bool,
+        master_hooks: bool,
+        fired: &mut HashSet<String>,
     ) -> Result<(), SyncError> {
+        if !(changed || master_hooks || !self.hooks_only_on_change) {
+            return Ok(());
+        }
+        // The hook gate passed: record the repository so its dependents cascade
+        // even when no hook executable exists, mirroring `_hooks_repos`.
+        fired.insert(repo.to_owned());
         let Some(root) = &self.config_root else {
             return Ok(());
         };
-        if !changed && self.hooks_only_on_change {
-            return Ok(());
-        }
         let portage = root.join("etc/portage");
         let location = location.to_string_lossy().into_owned();
         for hook in executable_hooks(&portage.join("repo.postsync.d")) {

@@ -39,6 +39,26 @@ impl<R: CommandRunner> GitBackend<R> {
         }
     }
 
+    /// The depth arguments for a fetch. When no depth is configured for a
+    /// volatile repository, the backend probes `git rev-parse
+    /// --is-shallow-repository` and omits `--depth` when the repository is not
+    /// already shallow, so a user-managed full clone is not truncated, mirroring
+    /// `GitSync.update`. All other cases follow [`Self::depth_args`].
+    fn fetch_depth_args(&self, ctx: &SyncContext<'_>) -> Result<Vec<String>, SyncError> {
+        if ctx.options.depth.is_none() && ctx.options.volatile {
+            let spec = CommandSpec::new("git")
+                .arg("-C")
+                .arg(ctx.location.to_string_lossy().into_owned())
+                .arg("rev-parse")
+                .arg("--is-shallow-repository");
+            let out = self.runner.run(&spec)?;
+            if out.success() && out.stdout.trim() == "false" {
+                return Ok(Vec::new());
+            }
+        }
+        Ok(self.depth_args(ctx))
+    }
+
     /// Mark the repository location as a safe git directory before operating on
     /// it, matching stock behavior for repositories owned by another user.
     fn set_safe_directory(&self, ctx: &SyncContext<'_>) -> Result<(), SyncError> {
@@ -175,10 +195,16 @@ impl<R: CommandRunner> Backend for GitBackend<R> {
     fn fetch(&self, ctx: &SyncContext<'_>) -> Result<SyncOutcome, SyncError> {
         let mut spec = CommandSpec::new("git")
             .arg("clone")
-            .args(self.depth_args(ctx));
+            .args(self.depth_args(ctx))
+            .args(ctx.options.git_clone_extra_opts.iter().cloned());
         spec = spec
             .arg(ctx.options.uri.clone())
             .arg(ctx.location.to_string_lossy().into_owned());
+        // `sync-git-env` plus `sync-git-clone-env` are injected into the clone
+        // environment, mirroring `GitSync.new`.
+        for (key, value) in ctx.options.git_env.iter().chain(&ctx.options.git_clone_env) {
+            spec = spec.env(key.clone(), value.clone());
+        }
         let out = self.runner.run(&spec)?;
         if !out.success() {
             return Err(SyncError::Transport {
@@ -216,7 +242,15 @@ impl<R: CommandRunner> Backend for GitBackend<R> {
             .arg("-C")
             .arg(ctx.location.to_string_lossy().into_owned())
             .arg("fetch");
-        fetch = fetch.args(self.depth_args(ctx)).arg("origin");
+        fetch = fetch
+            .args(self.fetch_depth_args(ctx)?)
+            .args(ctx.options.git_pull_extra_opts.iter().cloned())
+            .arg("origin");
+        // `sync-git-env` plus `sync-git-pull-env` are injected into the fetch
+        // environment, mirroring `GitSync.update`.
+        for (key, value) in ctx.options.git_env.iter().chain(&ctx.options.git_pull_env) {
+            fetch = fetch.env(key.clone(), value.clone());
+        }
         let out = self.runner.run(&fetch)?;
         if !out.success() {
             return Err(SyncError::Transport {

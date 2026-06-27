@@ -959,6 +959,7 @@ dependencies = [
  "moraine-config",
  "moraine-repo",
  "proptest",
+ "shlex",
  "tempfile",
  "thiserror",
  "tracing",

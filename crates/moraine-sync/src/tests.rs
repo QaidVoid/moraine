@@ -385,6 +385,7 @@ fn rsync_server_out_of_date_preserves_tree() {
         uri: "rsync://x".into(),
         auto_sync: true,
         timeout_secs: 5,
+        rsync_initial_timeout_secs: 15,
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
@@ -395,6 +396,11 @@ fn rsync_server_out_of_date_preserves_tree() {
         rsync_verify_max_age_days: 0,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
+        git_env: vec![],
+        git_clone_env: vec![],
+        git_pull_env: vec![],
+        git_clone_extra_opts: vec![],
+        git_pull_extra_opts: vec![],
         webrsync_verify_signature: false,
         webrsync_keep_snapshots: false,
         openpgp_key_path: None,
@@ -439,6 +445,7 @@ fn rsync_transfer_includes_standard_excludes_and_extra_opts() {
         uri: "rsync://mirror/gentoo".into(),
         auto_sync: true,
         timeout_secs: 30,
+        rsync_initial_timeout_secs: 15,
         retries: 1,
         depth: None,
         rsync_extra_opts: vec!["--bwlimit=1000".into()],
@@ -449,6 +456,11 @@ fn rsync_transfer_includes_standard_excludes_and_extra_opts() {
         rsync_verify_max_age_days: 0,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
+        git_env: vec![],
+        git_clone_env: vec![],
+        git_pull_env: vec![],
+        git_clone_extra_opts: vec![],
+        git_pull_extra_opts: vec![],
         webrsync_verify_signature: false,
         webrsync_keep_snapshots: false,
         openpgp_key_path: None,
@@ -519,6 +531,7 @@ fn rsync_verification_failure_preserves_prior_tree() {
         uri: "rsync://x".into(),
         auto_sync: true,
         timeout_secs: 5,
+        rsync_initial_timeout_secs: 15,
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
@@ -529,6 +542,11 @@ fn rsync_verification_failure_preserves_prior_tree() {
         rsync_verify_max_age_days: 0,
         git_verify_commit_signature: true,
         git_verify_max_age_days: 0,
+        git_env: vec![],
+        git_clone_env: vec![],
+        git_pull_env: vec![],
+        git_clone_extra_opts: vec![],
+        git_pull_extra_opts: vec![],
         webrsync_verify_signature: true,
         webrsync_keep_snapshots: false,
         openpgp_key_path: None,
@@ -644,6 +662,7 @@ fn rsync_verify_opts() -> SyncOptions {
         uri: "rsync://x".into(),
         auto_sync: true,
         timeout_secs: 5,
+        rsync_initial_timeout_secs: 15,
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
@@ -654,6 +673,11 @@ fn rsync_verify_opts() -> SyncOptions {
         rsync_verify_max_age_days: 0,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
+        git_env: vec![],
+        git_clone_env: vec![],
+        git_pull_env: vec![],
+        git_clone_extra_opts: vec![],
+        git_pull_extra_opts: vec![],
         webrsync_verify_signature: false,
         webrsync_keep_snapshots: false,
         openpgp_key_path: None,
@@ -834,6 +858,7 @@ fn git_opts(depth: Option<u32>) -> SyncOptions {
         uri: "https://example/repo.git".into(),
         auto_sync: true,
         timeout_secs: 30,
+        rsync_initial_timeout_secs: 15,
         retries: 1,
         depth,
         rsync_extra_opts: vec![],
@@ -844,6 +869,11 @@ fn git_opts(depth: Option<u32>) -> SyncOptions {
         rsync_verify_max_age_days: 0,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
+        git_env: vec![],
+        git_clone_env: vec![],
+        git_pull_env: vec![],
+        git_clone_extra_opts: vec![],
+        git_pull_extra_opts: vec![],
         webrsync_verify_signature: false,
         webrsync_keep_snapshots: false,
         openpgp_key_path: None,
@@ -876,6 +906,7 @@ fn webrsync_signature_rejection_is_verification_error() {
         uri: "https://x".into(),
         auto_sync: true,
         timeout_secs: 30,
+        rsync_initial_timeout_secs: 15,
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
@@ -886,6 +917,11 @@ fn webrsync_signature_rejection_is_verification_error() {
         rsync_verify_max_age_days: 0,
         git_verify_commit_signature: true,
         git_verify_max_age_days: 0,
+        git_env: vec![],
+        git_clone_env: vec![],
+        git_pull_env: vec![],
+        git_clone_extra_opts: vec![],
+        git_pull_extra_opts: vec![],
         webrsync_verify_signature: true,
         webrsync_keep_snapshots: false,
         openpgp_key_path: Some(key),
@@ -969,6 +1005,7 @@ fn webrsync_opts() -> SyncOptions {
         uri: "https://x".into(),
         auto_sync: true,
         timeout_secs: 30,
+        rsync_initial_timeout_secs: 15,
         retries: 1,
         depth: None,
         rsync_extra_opts: vec![],
@@ -979,6 +1016,11 @@ fn webrsync_opts() -> SyncOptions {
         rsync_verify_max_age_days: 0,
         git_verify_commit_signature: false,
         git_verify_max_age_days: 0,
+        git_env: vec![],
+        git_clone_env: vec![],
+        git_pull_env: vec![],
+        git_clone_extra_opts: vec![],
+        git_pull_extra_opts: vec![],
         webrsync_verify_signature: false,
         webrsync_keep_snapshots: false,
         openpgp_key_path: None,
@@ -1216,6 +1258,285 @@ fn webrsync_verify_with_present_key_invokes_helper() {
             .any(|(k, v)| k == "PORTAGE_SYNC_WEBRSYNC_GPG" && v == "1")
     );
     assert!(call.env.iter().any(|(k, _)| k == "PORTAGE_GPG_KEY"));
+}
+
+// --- sync-transport-backends additions --------------------------------------
+
+#[test]
+fn rsync_empty_server_timestamp_drives_full_transfer() {
+    // A mirror mid-regeneration serves an empty timestamp.chk: the probe succeeds
+    // but the file is unparseable, so the server timestamp is zero and a full
+    // transfer runs rather than a transport failure.
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    std::fs::create_dir_all(loc.join("metadata")).unwrap();
+    std::fs::write(
+        loc.join("metadata/timestamp.chk"),
+        "Mon, 22 Jun 2026 05:45:00 +0000\n",
+    )
+    .unwrap();
+    let staging = tmp.path().join("staging/g");
+    std::fs::create_dir_all(&staging).unwrap();
+
+    let staging_for_rule = staging.clone();
+    let runner = FakeRunner::new()
+        .rule(move |s| {
+            if s.program == "rsync" && s.args.iter().any(|a| a.contains("timestamp.chk")) {
+                std::fs::write(staging_for_rule.join("timestamp.chk"), "").ok();
+                Some(ok(""))
+            } else {
+                None
+            }
+        })
+        .rule(|s| {
+            (s.program == "rsync" && s.args.iter().any(|a| a == "--recursive")).then(|| ok(""))
+        });
+    let backend = RsyncBackend::new(&runner);
+    let mut opts = rsync_verify_opts();
+    opts.verify_metamanifest = false;
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    let outcome = backend
+        .update(&ctx)
+        .expect("an empty server timestamp must drive a transfer, not fail");
+    assert!(
+        outcome.changed,
+        "an empty server timestamp.chk forces a full transfer"
+    );
+}
+
+#[test]
+fn rsync_override_timeout_not_duplicated() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    let staging = tmp.path().join("staging/g");
+    std::fs::create_dir_all(&staging).unwrap();
+    let runner = FakeRunner::new().rule(|s| {
+        (s.program == "rsync" && s.args.iter().any(|a| a == "--recursive")).then(|| ok(""))
+    });
+    let backend = RsyncBackend::new(&runner);
+    let mut opts = rsync_verify_opts();
+    opts.verify_metamanifest = false;
+    opts.uri = "rsync://mirror/gentoo".into();
+    opts.rsync_opts_override = Some(vec![
+        "--recursive".into(),
+        "--times".into(),
+        "--timeout=900".into(),
+    ]);
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    backend.fetch(&ctx).unwrap();
+    let call = runner
+        .calls()
+        .into_iter()
+        .find(|c| c.args.iter().any(|a| a == "--recursive"))
+        .unwrap();
+    let timeouts = call
+        .args
+        .iter()
+        .filter(|a| a.starts_with("--timeout="))
+        .count();
+    assert_eq!(
+        timeouts, 1,
+        "a user-supplied --timeout must not be duplicated"
+    );
+    assert!(call.args.iter().any(|a| a == "--timeout=900"));
+}
+
+#[test]
+fn rsync_gentoo_portage_override_reinjects_compress_and_timeout() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    let staging = tmp.path().join("staging/g");
+    std::fs::create_dir_all(&staging).unwrap();
+    let runner = FakeRunner::new().rule(|s| {
+        (s.program == "rsync" && s.args.iter().any(|a| a == "--recursive")).then(|| ok(""))
+    });
+    let backend = RsyncBackend::new(&runner);
+    let mut opts = rsync_verify_opts();
+    opts.verify_metamanifest = false;
+    opts.uri = "rsync://rsync.gentoo.org/gentoo-portage".into();
+    opts.rsync_opts_override = Some(vec!["--recursive".into(), "--times".into()]);
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    backend.fetch(&ctx).unwrap();
+    let call = runner
+        .calls()
+        .into_iter()
+        .find(|c| c.args.iter().any(|a| a == "--recursive"))
+        .unwrap();
+    assert!(call.args.iter().any(|a| a == "--compress"));
+    assert!(call.args.iter().any(|a| a == "--whole-file"));
+    assert!(call.args.iter().any(|a| a.starts_with("--timeout=")));
+}
+
+#[test]
+fn git_volatile_non_shallow_fetches_full_history() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    std::fs::create_dir_all(loc.join(".git")).unwrap();
+    let staging = tmp.path().join("staging/g");
+    let runner = FakeRunner::new()
+        .rule(|s| {
+            (s.program == "git" && s.args.iter().any(|a| a == "--is-shallow-repository"))
+                .then(|| ok("false\n"))
+        })
+        .rule(|s| (s.program == "git").then(|| ok("h")));
+    let backend = GitBackend::new(&runner);
+    let mut opts = git_opts(None);
+    opts.volatile = true;
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    backend.update(&ctx).unwrap();
+    let fetch = runner
+        .calls()
+        .into_iter()
+        .find(|c| c.args.iter().any(|a| a == "fetch"))
+        .unwrap();
+    assert!(
+        !fetch.args.iter().any(|a| a.starts_with("--depth")),
+        "a volatile non-shallow repo fetches the full history"
+    );
+}
+
+#[test]
+fn git_env_applied_to_clone_and_fetch() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    std::fs::create_dir_all(loc.join(".git")).unwrap();
+    let staging = tmp.path().join("staging/g");
+    let runner = FakeRunner::new().rule(|s| (s.program == "git").then(|| ok("h")));
+    let backend = GitBackend::new(&runner);
+    let mut opts = git_opts(None);
+    opts.git_env = vec![(
+        "GIT_SSH_COMMAND".into(),
+        "ssh -i /home/u/.ssh/overlay_key".into(),
+    )];
+    opts.git_clone_extra_opts = vec!["--filter=blob:none".into()];
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    backend.fetch(&ctx).unwrap();
+    backend.update(&ctx).unwrap();
+    let clone = runner
+        .calls()
+        .into_iter()
+        .find(|c| c.args.iter().any(|a| a == "clone"))
+        .unwrap();
+    assert!(
+        clone.args.iter().any(|a| a == "--filter=blob:none"),
+        "sync-git-clone-extra-opts is appended to the clone"
+    );
+    assert!(
+        clone
+            .env
+            .iter()
+            .any(|(k, v)| k == "GIT_SSH_COMMAND" && v == "ssh -i /home/u/.ssh/overlay_key")
+    );
+    let fetch = runner
+        .calls()
+        .into_iter()
+        .find(|c| c.args.iter().any(|a| a == "fetch"))
+        .unwrap();
+    assert!(
+        fetch.env.iter().any(|(k, _)| k == "GIT_SSH_COMMAND"),
+        "sync-git-env is applied to the fetch too"
+    );
+}
+
+#[test]
+fn master_cascade_runs_unchanged_dependent_hooks() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = TempDir::new().unwrap();
+    let master = make_repo(tmp.path(), "gentoo", "");
+    let child = make_repo(tmp.path(), "overlay", "");
+    // The dependent's local timestamp matches the probed server timestamp, so it
+    // syncs unchanged.
+    std::fs::write(
+        child.join("metadata/timestamp.chk"),
+        "Sun, 21 Jun 2026 05:45:00 +0000\n",
+    )
+    .unwrap();
+    let set = discover_set(
+        tmp.path(),
+        &format!(
+            "[gentoo]\nlocation = {}\nsync-type = webrsync\nsync-uri = https://m\n\
+             [overlay]\nlocation = {}\nmasters = gentoo\nsync-type = rsync\nsync-uri = rsync://c\n",
+            master.display(),
+            child.display()
+        ),
+    );
+
+    let hooks = tmp.path().join("config/etc/portage/repo.postsync.d");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("10-notify");
+    std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let runner = FakeRunner::new()
+        .rule(|s| (s.program == "emerge-webrsync").then(|| ok("")))
+        .rule(|s| {
+            if s.program == "rsync" && s.args.iter().any(|a| a.contains("timestamp.chk")) {
+                if let Some(dst) = s.args.last() {
+                    let p = Path::new(dst);
+                    if let Some(parent) = p.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                    std::fs::write(p, "Sun, 21 Jun 2026 05:45:00 +0000\n").ok();
+                }
+                Some(ok(""))
+            } else {
+                None
+            }
+        })
+        .rule(|s| s.program.ends_with("10-notify").then(|| ok("")));
+    let registry = BackendRegistry::new(vec![
+        Box::new(WebrsyncBackend::new(&runner)),
+        Box::new(RsyncBackend::new(&runner)),
+    ]);
+    let refresher = FakeRefresher::new();
+    let staging = tmp.path().join("staging");
+    // `sync-hooks-only-on-change` is on by default, so only the master cascade can
+    // run the unchanged dependent's hooks.
+    let engine = SyncEngine::new(&set, &registry, &refresher, &runner, &staging)
+        .with_config_root(tmp.path().join("config"));
+
+    let mut history = RevisionHistory::new();
+    let report = engine.sync_all(&mut history);
+    // The dependent synced unchanged.
+    match report.get("overlay").unwrap() {
+        RepoResult::Synced { outcome, .. } => assert!(!outcome.changed),
+        other => panic!("expected unchanged overlay, got {other:?}"),
+    }
+    // The cascade still ran the dependent's hook.
+    let ran_for_overlay = runner
+        .calls()
+        .into_iter()
+        .filter(|c| c.program.ends_with("10-notify"))
+        .any(|c| c.args.first().map(|a| a == "overlay").unwrap_or(false));
+    assert!(
+        ran_for_overlay,
+        "a changed master must cascade its unchanged dependent's hooks"
+    );
 }
 
 // --- corpus-gated live test -------------------------------------------------

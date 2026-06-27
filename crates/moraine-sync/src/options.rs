@@ -46,6 +46,9 @@ impl KeyRefresh {
 pub struct SyncDefaults {
     /// The default freshness/connection timeout in seconds.
     pub timeout_secs: u64,
+    /// The default initial-connection timeout in seconds bounding the rsync
+    /// freshness probe (`PORTAGE_RSYNC_INITIAL_TIMEOUT`).
+    pub rsync_initial_timeout_secs: u64,
     /// The default number of transport retries.
     pub retries: u32,
     /// The default git fetch depth (`None` for the backend default of one).
@@ -63,6 +66,8 @@ impl Default for SyncDefaults {
         Self {
             // Portage hardcodes the rsync transfer `--timeout=180`.
             timeout_secs: 180,
+            // Portage defaults `PORTAGE_RSYNC_INITIAL_TIMEOUT` to 15 seconds.
+            rsync_initial_timeout_secs: 15,
             retries: 3,
             depth: None,
             key_refresh: KeyRefresh::WkdThenKeyserver,
@@ -83,6 +88,9 @@ pub struct SyncOptions {
     pub auto_sync: bool,
     /// The connection/freshness timeout in seconds.
     pub timeout_secs: u64,
+    /// The initial-connection timeout in seconds bounding the rsync freshness
+    /// probe (`PORTAGE_RSYNC_INITIAL_TIMEOUT`).
+    pub rsync_initial_timeout_secs: u64,
     /// The transport retry count.
     pub retries: u32,
     /// The git fetch depth; `Some(0)` requests full history.
@@ -105,6 +113,19 @@ pub struct SyncOptions {
     pub git_verify_commit_signature: bool,
     /// git `sync-git-verify-max-age-days`: reject a head older than this (0 = off).
     pub git_verify_max_age_days: u32,
+    /// git `sync-git-env`: `KEY=VALUE` environment assignments injected into both
+    /// the clone and the fetch.
+    pub git_env: Vec<(String, String)>,
+    /// git `sync-git-clone-env`: `KEY=VALUE` environment assignments injected into
+    /// the clone only.
+    pub git_clone_env: Vec<(String, String)>,
+    /// git `sync-git-pull-env`: `KEY=VALUE` environment assignments injected into
+    /// the fetch only.
+    pub git_pull_env: Vec<(String, String)>,
+    /// git `sync-git-clone-extra-opts`: extra arguments appended to the clone.
+    pub git_clone_extra_opts: Vec<String>,
+    /// git `sync-git-pull-extra-opts`: extra arguments appended to the fetch.
+    pub git_pull_extra_opts: Vec<String>,
     /// webrsync `sync-webrsync-verify-signature`: verify the snapshot signature.
     pub webrsync_verify_signature: bool,
     /// webrsync `sync-webrsync-keep-snapshots`: keep downloaded snapshots (`-k`).
@@ -163,6 +184,11 @@ impl SyncOptions {
             .or_else(|| parse_u64(get("sync-timeout").as_deref()))
             .unwrap_or(defaults.timeout_secs);
 
+        // `PORTAGE_RSYNC_INITIAL_TIMEOUT` bounds the freshness probe's initial
+        // connection. A missing or unparseable value falls back to the default.
+        let rsync_initial_timeout_secs = parse_u64(get("PORTAGE_RSYNC_INITIAL_TIMEOUT").as_deref())
+            .unwrap_or(defaults.rsync_initial_timeout_secs);
+
         // `PORTAGE_RSYNC_RETRIES` overrides `sync-retries` for rsync; a negative
         // value (Portage's default of -1, meaning "try every address") does not
         // parse and falls through to the general retry count.
@@ -176,11 +202,11 @@ impl SyncOptions {
             .unwrap_or(defaults.depth);
 
         let rsync_extra_opts = get("sync-rsync-extra-opts")
-            .map(|s| s.split_whitespace().map(str::to_owned).collect())
+            .map(|s| shlex_tokens(&s))
             .unwrap_or_default();
         let rsync_opts_override = get("PORTAGE_RSYNC_OPTS")
             .filter(|s| !s.is_empty())
-            .map(|s| s.split_whitespace().map(str::to_owned).collect());
+            .map(|s| shlex_tokens(&s));
         let rsync_vcs_ignore = matches!(
             get("sync-rsync-vcs-ignore").as_deref(),
             Some("yes") | Some("true") | Some("1")
@@ -207,6 +233,24 @@ impl SyncOptions {
         let git_verify_commit_signature = bool_key("sync-git-verify-commit-signature", false);
         let git_verify_max_age_days =
             parse_u32(get("sync-git-verify-max-age-days").as_deref()).unwrap_or(0);
+
+        // Each `sync-git-*-env` value is shlex-tokenized into `KEY=VALUE`
+        // assignments and the extra-opts values into argument lists.
+        let git_env = get("sync-git-env")
+            .map(|s| shlex_env(&s))
+            .unwrap_or_default();
+        let git_clone_env = get("sync-git-clone-env")
+            .map(|s| shlex_env(&s))
+            .unwrap_or_default();
+        let git_pull_env = get("sync-git-pull-env")
+            .map(|s| shlex_env(&s))
+            .unwrap_or_default();
+        let git_clone_extra_opts = get("sync-git-clone-extra-opts")
+            .map(|s| shlex_tokens(&s))
+            .unwrap_or_default();
+        let git_pull_extra_opts = get("sync-git-pull-extra-opts")
+            .map(|s| shlex_tokens(&s))
+            .unwrap_or_default();
         let webrsync_verify_signature = bool_key("sync-webrsync-verify-signature", false);
         let webrsync_keep_snapshots = bool_key("sync-webrsync-keep-snapshots", false);
 
@@ -243,6 +287,7 @@ impl SyncOptions {
             uri,
             auto_sync,
             timeout_secs,
+            rsync_initial_timeout_secs,
             retries,
             depth,
             rsync_extra_opts,
@@ -253,6 +298,11 @@ impl SyncOptions {
             rsync_verify_max_age_days,
             git_verify_commit_signature,
             git_verify_max_age_days,
+            git_env,
+            git_clone_env,
+            git_pull_env,
+            git_clone_extra_opts,
+            git_pull_extra_opts,
             webrsync_verify_signature,
             webrsync_keep_snapshots,
             openpgp_key_path,
@@ -269,6 +319,28 @@ impl SyncOptions {
     }
 }
 
+/// Tokenize a value with shell quoting rules, mirroring Portage's `shlex.split`.
+/// An unbalanced-quote value that cannot be tokenized yields no tokens.
+fn shlex_tokens(value: &str) -> Vec<String> {
+    shlex::split(value).unwrap_or_default()
+}
+
+/// Tokenize a value with shell quoting rules and split each token into a
+/// `KEY=VALUE` assignment on its first `=`, keeping only tokens with a non-empty
+/// key, mirroring Portage's `assignment.partition("=")` env parsing.
+fn shlex_env(value: &str) -> Vec<(String, String)> {
+    shlex_tokens(value)
+        .into_iter()
+        .filter_map(|token| {
+            let (key, val) = match token.split_once('=') {
+                Some((k, v)) => (k.to_owned(), v.to_owned()),
+                None => (token, String::new()),
+            };
+            (!key.is_empty()).then_some((key, val))
+        })
+        .collect()
+}
+
 fn parse_u64(value: Option<&str>) -> Option<u64> {
     value.and_then(|v| v.trim().parse().ok())
 }
@@ -283,7 +355,95 @@ fn parse_f64(value: Option<&str>) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::KeyRefresh;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use moraine_repo::RepoConfig;
+
+    use super::{KeyRefresh, SyncDefaults, SyncOptions};
+
+    /// Build a minimal `RepoConfig` with the given `sync-*` keys.
+    fn cfg_with(pairs: &[(&str, &str)]) -> RepoConfig {
+        let mut sync = BTreeMap::new();
+        sync.insert("sync-type".to_owned(), "rsync".to_owned());
+        sync.insert("sync-uri".to_owned(), "rsync://x".to_owned());
+        for (k, v) in pairs {
+            sync.insert((*k).to_owned(), (*v).to_owned());
+        }
+        RepoConfig {
+            name: "g".to_owned(),
+            location: PathBuf::from("/x"),
+            masters: vec![],
+            priority: 0,
+            aliases: vec![],
+            eclass_overrides: vec![],
+            cache_formats: vec![],
+            profile_formats: vec![],
+            manifest_hashes: vec![],
+            manifest_required_hashes: vec![],
+            thin_manifests: false,
+            sign_manifests: false,
+            use_manifests: true,
+            eapis_banned: vec![],
+            eapis_deprecated: vec![],
+            default_eapi: "0".to_owned(),
+            sync,
+        }
+    }
+
+    #[test]
+    fn rsync_extra_opts_tokenized_by_shell_rules() {
+        let cfg = cfg_with(&[("sync-rsync-extra-opts", "--rsh=\"ssh -p 2222\"")]);
+        let opts = SyncOptions::resolve(&cfg, &SyncDefaults::default()).unwrap();
+        assert_eq!(opts.rsync_extra_opts, vec!["--rsh=ssh -p 2222".to_owned()]);
+    }
+
+    #[test]
+    fn rsync_opts_override_tokenized_by_shell_rules() {
+        let cfg = cfg_with(&[("PORTAGE_RSYNC_OPTS", "--archive --rsh='ssh -p 2222'")]);
+        let opts = SyncOptions::resolve(&cfg, &SyncDefaults::default()).unwrap();
+        assert_eq!(
+            opts.rsync_opts_override,
+            Some(vec!["--archive".to_owned(), "--rsh=ssh -p 2222".to_owned()])
+        );
+    }
+
+    #[test]
+    fn initial_timeout_defaults_to_fifteen_and_parses_override() {
+        let cfg = cfg_with(&[]);
+        let opts = SyncOptions::resolve(&cfg, &SyncDefaults::default()).unwrap();
+        assert_eq!(opts.rsync_initial_timeout_secs, 15);
+
+        let cfg = cfg_with(&[("PORTAGE_RSYNC_INITIAL_TIMEOUT", "30")]);
+        let opts = SyncOptions::resolve(&cfg, &SyncDefaults::default()).unwrap();
+        assert_eq!(opts.rsync_initial_timeout_secs, 30);
+    }
+
+    #[test]
+    fn git_env_parsed_as_key_value_assignments() {
+        let cfg = cfg_with(&[(
+            "sync-git-env",
+            "GIT_SSH_COMMAND='ssh -i /home/u/.ssh/overlay_key'",
+        )]);
+        let opts = SyncOptions::resolve(&cfg, &SyncDefaults::default()).unwrap();
+        assert_eq!(
+            opts.git_env,
+            vec![(
+                "GIT_SSH_COMMAND".to_owned(),
+                "ssh -i /home/u/.ssh/overlay_key".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn git_clone_extra_opts_tokenized() {
+        let cfg = cfg_with(&[("sync-git-clone-extra-opts", "--filter=blob:none")]);
+        let opts = SyncOptions::resolve(&cfg, &SyncDefaults::default()).unwrap();
+        assert_eq!(
+            opts.git_clone_extra_opts,
+            vec!["--filter=blob:none".to_owned()]
+        );
+    }
 
     #[test]
     fn key_refresh_parse_maps_every_portage_value() {

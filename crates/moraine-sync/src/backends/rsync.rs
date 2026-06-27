@@ -40,8 +40,14 @@ pub enum Freshness {
     Older,
 }
 
-/// Compare a server timestamp to the local timestamp.
+/// Compare a server timestamp to the local timestamp. A server timestamp of
+/// zero (an empty or unparseable server `timestamp.chk`) always classifies as
+/// [`Freshness::Newer`] so it triggers a full transfer, matching Portage's
+/// `servertimestamp == 0 or servertimestamp > timestamp` branch.
 pub fn classify_freshness(server: i64, local: Option<i64>) -> Freshness {
+    if server == 0 {
+        return Freshness::Newer;
+    }
     match local {
         Some(local) if server == local => Freshness::Current,
         Some(local) if server < local => Freshness::Older,
@@ -60,42 +66,31 @@ impl<R: CommandRunner> RsyncBackend<R> {
         Self { runner }
     }
 
-    /// Build the timestamp-probe command: transfer only `metadata/timestamp.chk`
-    /// into the staging directory with a bounded connection timeout.
-    fn probe_command(&self, ctx: &SyncContext<'_>) -> CommandSpec {
-        let src = format!("{}/metadata/timestamp.chk", rsync_source(&ctx.options.uri));
-        let dst = ctx
-            .staging
-            .join("timestamp.chk")
-            .to_string_lossy()
-            .into_owned();
-        let mut cmd =
-            CommandSpec::new("rsync").arg(format!("--timeout={}", ctx.options.timeout_secs));
-        // `--contimeout` is a connection timeout that rsync accepts only when
-        // connecting to an rsync daemon, so it is added for `rsync://` sources
-        // only; a local `file://` or path source rejects it.
-        if ctx.options.uri.starts_with("rsync://") {
-            cmd = cmd.arg(format!("--contimeout={}", ctx.options.timeout_secs));
-        }
-        cmd.arg(src).arg(dst)
-    }
-
-    /// Build the tree-transfer command into the staging directory. The default
-    /// option set mirrors Portage's `_set_rsync_defaults`; a `PORTAGE_RSYNC_OPTS`
-    /// override replaces the defaults, with the required options re-injected. An
-    /// `addr` override substitutes a resolved mirror address for the host.
-    fn transfer_command(&self, ctx: &SyncContext<'_>, addr: Option<IpAddr>) -> CommandSpec {
-        let src = format!("{}/", source_with_addr(&ctx.options.uri, addr));
-        let dst = format!("{}/", ctx.staging.to_string_lossy());
-
+    /// Build the shared transport option set used by both the tree transfer and
+    /// the timestamp probe, so transport-affecting options such as `--rsh` and
+    /// `-4`/`-6` reach the probe too (Portage's `rsynccommand = [bin] +
+    /// self.rsync_opts + self.extra_rsync_opts`). The default option set mirrors
+    /// `_set_rsync_defaults`, carrying `--timeout=<timeout_secs>` inline. A
+    /// `PORTAGE_RSYNC_OPTS` override replaces the defaults and re-injects the
+    /// required options and excludes, adding `--timeout`/`--compress`/`--whole-file`
+    /// only for the official `gentoo-portage` host, matching `_validate_rsync_opts`.
+    fn transport_opts(&self, ctx: &SyncContext<'_>, timeout_secs: u64) -> Vec<String> {
         let mut opts: Vec<String> = match &ctx.options.rsync_opts_override {
             Some(over) => {
-                // `_validate_rsync_opts`: keep the user options, re-inject the
-                // required ones and the excludes that must always be present.
                 let mut o = over.clone();
                 for req in ["--recursive", "--times"] {
                     if !o.iter().any(|a| a == req) {
                         o.push(req.to_string());
+                    }
+                }
+                if is_gentoo_portage(&ctx.options.uri) {
+                    if !o.iter().any(|a| a.starts_with("--timeout=")) {
+                        o.push(format!("--timeout={timeout_secs}"));
+                    }
+                    for opt in ["--compress", "--whole-file"] {
+                        if !o.iter().any(|a| a == opt) {
+                            o.push(opt.to_string());
+                        }
                     }
                 }
                 o
@@ -116,16 +111,46 @@ impl<R: CommandRunner> RsyncBackend<R> {
             ]
             .iter()
             .map(|s| s.to_string())
+            .chain(std::iter::once(format!("--timeout={timeout_secs}")))
             .collect(),
         };
-        opts.push(format!("--timeout={}", ctx.options.timeout_secs));
         for exclude in STANDARD_EXCLUDES {
             if !opts.iter().any(|a| a == exclude) {
                 opts.push((*exclude).to_string());
             }
         }
         opts.extend(ctx.options.rsync_extra_opts.iter().cloned());
+        opts
+    }
 
+    /// Build the timestamp-probe command: transfer only `metadata/timestamp.chk`
+    /// into the staging directory, carrying the same transport options the tree
+    /// transfer uses but bounded by the shorter initial-connection timeout rather
+    /// than the full tree-transfer timeout.
+    fn probe_command(&self, ctx: &SyncContext<'_>) -> CommandSpec {
+        let src = format!("{}/metadata/timestamp.chk", rsync_source(&ctx.options.uri));
+        let dst = ctx
+            .staging
+            .join("timestamp.chk")
+            .to_string_lossy()
+            .into_owned();
+        let initial = ctx.options.rsync_initial_timeout_secs;
+        let mut opts = self.transport_opts(ctx, initial);
+        // `--contimeout` is a connection timeout that rsync accepts only when
+        // connecting to an rsync daemon, so it is added for `rsync://` sources
+        // only; a local `file://` or path source rejects it.
+        if ctx.options.uri.starts_with("rsync://") {
+            opts.push(format!("--contimeout={initial}"));
+        }
+        CommandSpec::new("rsync").args(opts).arg(src).arg(dst)
+    }
+
+    /// Build the tree-transfer command into the staging directory. An `addr`
+    /// override substitutes a resolved mirror address for the host.
+    fn transfer_command(&self, ctx: &SyncContext<'_>, addr: Option<IpAddr>) -> CommandSpec {
+        let src = format!("{}/", source_with_addr(&ctx.options.uri, addr));
+        let dst = format!("{}/", ctx.staging.to_string_lossy());
+        let opts = self.transport_opts(ctx, ctx.options.timeout_secs);
         CommandSpec::new("rsync").args(opts).arg(src).arg(dst)
     }
 
@@ -186,12 +211,11 @@ impl<R: CommandRunner> RsyncBackend<R> {
                 reason: format!("timestamp probe failed: {}", out.stderr.trim()),
             });
         }
-        let server = read_timestamp(&ctx.staging.join("timestamp.chk")).ok_or_else(|| {
-            SyncError::Transport {
-                repo: ctx.repo.to_owned(),
-                reason: "server timestamp.chk could not be read".to_owned(),
-            }
-        })?;
+        // A successfully transferred but empty or unparseable server timestamp is
+        // treated as zero, which `classify_freshness` turns into a full transfer,
+        // mirroring `_do_rsync` initializing `servertimestamp = 0`. Only a failed
+        // probe command (above) is a transport error.
+        let server = read_timestamp(&ctx.staging.join("timestamp.chk")).unwrap_or(0);
         let local = read_timestamp(&ctx.location.join("metadata/timestamp.chk"));
         Ok(classify_freshness(server, local))
     }
@@ -219,8 +243,7 @@ impl<R: CommandRunner> RsyncBackend<R> {
         }
 
         commit_staging(ctx.repo, ctx.staging, ctx.location)?;
-        let head =
-            read_timestamp(&ctx.location.join("metadata/timestamp.chk")).map(|ts| ts.to_string());
+        let head = read_commit(&ctx.location.join("metadata/timestamp.commit"));
         Ok(SyncOutcome::changed(kind, head))
     }
 }
@@ -250,8 +273,15 @@ impl<R: CommandRunner> Backend for RsyncBackend<R> {
     }
 
     fn retrieve_head(&self, ctx: &SyncContext<'_>) -> Result<Option<String>, SyncError> {
-        Ok(read_timestamp(&ctx.location.join("metadata/timestamp.chk")).map(|ts| ts.to_string()))
+        Ok(read_commit(&ctx.location.join("metadata/timestamp.commit")))
     }
+}
+
+/// Whether `uri`, with any trailing slash stripped, names the official
+/// `gentoo-portage` rsync host, matching `_validate_rsync_opts`.
+fn is_gentoo_portage(uri: &str) -> bool {
+    uri.trim_end_matches('/')
+        .ends_with(".gentoo.org/gentoo-portage")
 }
 
 /// Translate a `sync-uri` into an rsync source root: an `rsync://` URI is kept,
@@ -343,11 +373,20 @@ fn source_with_addr(uri: &str, addr: Option<IpAddr>) -> String {
 
 /// Read `metadata/timestamp.chk` and parse its first line as Portage's
 /// `TIMESTAMP_FORMAT` date string into a UTC epoch in seconds. Returns `None`
-/// when the file is absent or malformed, which classifies as out of date.
+/// when the file is absent or malformed; a missing server timestamp is treated
+/// as zero (a forced sync) by [`RsyncBackend::probe`].
 fn read_timestamp(path: &Path) -> Option<i64> {
     let content = std::fs::read_to_string(path).ok()?;
     let first = content.lines().next()?;
     crate::timestamp::parse_timestamp_format(first)
+}
+
+/// Read `metadata/timestamp.commit` and return its first whitespace-delimited
+/// token, the upstream commit hash recorded for the snapshot, mirroring
+/// `RsyncSync.retrieve_head`. Returns `None` when the file is absent or empty.
+fn read_commit(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    content.split_whitespace().next().map(str::to_owned)
 }
 
 /// Commit a staged tree into place by replacing the live location atomically on
@@ -453,5 +492,14 @@ mod tests {
     fn freshness_newer_when_server_ahead_or_no_local() {
         assert_eq!(classify_freshness(110, Some(100)), Freshness::Newer);
         assert_eq!(classify_freshness(110, None), Freshness::Newer);
+    }
+
+    #[test]
+    fn freshness_zero_server_always_syncs() {
+        // A blank or unparseable server timestamp (zero) forces a transfer even
+        // when the local copy is newer, never reporting current or out of date.
+        assert_eq!(classify_freshness(0, Some(100)), Freshness::Newer);
+        assert_eq!(classify_freshness(0, None), Freshness::Newer);
+        assert_eq!(classify_freshness(0, Some(0)), Freshness::Newer);
     }
 }
