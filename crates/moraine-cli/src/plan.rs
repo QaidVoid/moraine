@@ -58,7 +58,7 @@ fn build_entry<S: ResolveSource>(
         };
     }
 
-    let resolved = solution.package(&task.cp);
+    let resolved = solution.package_slot(&task.cp, &task.slot);
     let installed = source.installed(&task.cp);
     let installed_same_slot = installed.iter().find(|i| i.slot == task.slot);
 
@@ -182,13 +182,14 @@ fn use_diff(
     flags
 }
 
-/// The `category/package` values that pulled `cp` in, from the edges.
+/// The `category/package` values that pulled `cp` in, from the edges. Edge
+/// endpoints are slot-qualified, so they are compared and reported by their `cp`.
 fn parents_of(cp: &str, solution: &ResolvedSolution) -> Vec<String> {
     let mut parents: Vec<String> = solution
         .edges
         .iter()
-        .filter(|edge| edge.to == cp)
-        .map(|edge| edge.from.clone())
+        .filter(|edge| moraine_resolve::endpoint_cp(&edge.to) == cp)
+        .map(|edge| moraine_resolve::endpoint_cp(&edge.from).to_owned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();

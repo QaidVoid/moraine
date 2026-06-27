@@ -194,10 +194,15 @@ impl MergeGraph {
     /// edge whose target package is already installed at the same identity is
     /// marked `satisfied`.
     pub fn from_solution(solution: &ResolvedSolution) -> Self {
+        // Nodes are keyed by the slot-qualified `cp:slot` key, so two slots of one
+        // cp are distinct nodes that both reach the merge plan.
         let mut nodes: BTreeMap<String, MergeNode> = BTreeMap::new();
+        let mut by_cp: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for p in &solution.packages {
+            let key = crate::provider::package_key(&p.cp, &p.slot);
+            by_cp.entry(p.cp.as_str()).or_default().push(key.clone());
             nodes.insert(
-                p.cp.clone(),
+                key,
                 MergeNode {
                     cp: p.cp.clone(),
                     kind: NodeKind::Merge,
@@ -208,31 +213,40 @@ impl MergeGraph {
 
         let mut out: BTreeMap<String, Vec<(String, EdgeFlags)>> = BTreeMap::new();
         let mut incoming: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for cp in nodes.keys() {
-            out.entry(cp.clone()).or_default();
-            incoming.entry(cp.clone()).or_default();
+        for key in nodes.keys() {
+            out.entry(key.clone()).or_default();
+            incoming.entry(key.clone()).or_default();
         }
 
-        for edge in &solution.edges {
-            // Only edges between merged nodes participate.
-            if !nodes.contains_key(&edge.from) || !nodes.contains_key(&edge.to) {
-                continue;
+        // Resolve an edge endpoint to concrete node keys. A slot-qualified endpoint
+        // that is itself a node key resolves to that node; a bare `cp` endpoint
+        // (from a hand-built solution) expands to every slot-node of that cp.
+        let resolve_endpoint = |endpoint: &str| -> Vec<String> {
+            if nodes.contains_key(endpoint) {
+                vec![endpoint.to_owned()]
+            } else {
+                by_cp.get(endpoint).cloned().unwrap_or_default()
             }
-            // A package flagged for a slot-operator rebuild is reinstalled even
-            // though its version is unchanged, so an edge into it is real, not a
-            // no-op satisfied edge.
-            let satisfied = solution
-                .package(&edge.to)
-                .map(|p| p.already_installed && !p.subslot_rebuild)
-                .unwrap_or(false);
-            let flags = EdgeFlags::for_class(edge.class, edge.slot_op, edge.optional, satisfied);
-            out.entry(edge.from.clone())
-                .or_default()
-                .push((edge.to.clone(), flags));
-            incoming
-                .entry(edge.to.clone())
-                .or_default()
-                .insert(edge.from.clone());
+        };
+
+        for edge in &solution.edges {
+            for from in resolve_endpoint(&edge.from) {
+                for to in resolve_endpoint(&edge.to) {
+                    // A package flagged for a slot-operator rebuild is reinstalled
+                    // even though its version is unchanged, so an edge into it is
+                    // real, not a no-op satisfied edge.
+                    let satisfied = solution
+                        .package_by_key(&to)
+                        .map(|p| p.already_installed && !p.subslot_rebuild)
+                        .unwrap_or(false);
+                    let flags =
+                        EdgeFlags::for_class(edge.class, edge.slot_op, edge.optional, satisfied);
+                    out.entry(from.clone())
+                        .or_default()
+                        .push((to.clone(), flags));
+                    incoming.entry(to).or_default().insert(from.clone());
+                }
+            }
         }
 
         MergeGraph {

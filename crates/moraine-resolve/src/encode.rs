@@ -56,7 +56,7 @@ pub(crate) fn version_satisfies(atom: &NormAtom, candidate: &Version) -> bool {
             Op::LessEqual => candidate <= v,
             Op::Less => candidate < v,
             Op::Tilde => candidate.matches_any_revision(v),
-            Op::EqualGlob => candidate.as_str().starts_with(v.as_str()),
+            Op::EqualGlob => moraine_atom::version_glob_matches(candidate.as_str(), v.as_str()),
         },
     }
 }
@@ -171,12 +171,30 @@ fn reduce<'a>(
     }
 }
 
-/// The encoder over a single package's metadata and resolved USE.
-pub(crate) struct Encoder<'s, S: ResolveSource> {
-    pub source: &'s S,
+/// A recorded `||` any-of branch decision, used by the resolve layer to switch
+/// branches on a downstream conflict. The generic solver cannot relax the forced
+/// branch on its own, so the resolve layer masks the chosen branch's leader keys
+/// and re-encodes, forcing the next branch.
+#[derive(Debug, Clone)]
+pub(crate) struct BranchPoint {
+    /// The solver keys of the chosen branch's leading alternative. Masking these
+    /// drops the chosen branch from the next encoding so the next branch wins.
+    pub chosen_leader_keys: BTreeSet<String>,
+    /// Whether another non-masked branch is available to fall back to.
+    pub has_fallback: bool,
 }
 
-impl<'s, S: ResolveSource> Encoder<'s, S> {
+/// The encoder over a single package's metadata and resolved USE.
+pub(crate) struct Encoder<'a, S: ResolveSource> {
+    pub source: &'a S,
+    /// Branch-leader keys masked by the resolve layer's `||` fallback loop. A
+    /// branch whose leader keys are all masked is skipped when choosing.
+    pub branch_mask: &'a BTreeSet<String>,
+    /// Collector for the `||` branch decisions made during this encoding pass.
+    pub branch_points: &'a std::cell::RefCell<Vec<BranchPoint>>,
+}
+
+impl<'a, S: ResolveSource> Encoder<'a, S> {
     /// Validate that a package's dependency strings do not use EAPI features
     /// their EAPI lacks (the only check is strong blockers here, since the rest
     /// is enforced at parse time by `moraine-atom`).
@@ -481,9 +499,37 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 })
         });
 
-        // The chosen branch is the first after ordering: emit its full
+        // A branch's leader keys are the solver keys of its first required atom's
+        // alternatives. Masking those keys is how the resolve layer drops a branch.
+        let leader_keys = |atoms: &[Vec<Alt>]| -> BTreeSet<String> {
+            atoms
+                .first()
+                .map(|alts| alts.iter().map(|(k, _)| k.clone()).collect())
+                .unwrap_or_default()
+        };
+
+        // Drop branches the resolve layer has masked after a downstream conflict.
+        // A branch is masked once all of its leader keys are masked.
+        branches.retain(|(_, atoms, _)| {
+            let keys = leader_keys(atoms);
+            keys.is_empty() || keys.iter().any(|k| !self.branch_mask.contains(k))
+        });
+        if branches.is_empty() {
+            return Err("every any-of branch is masked by conflict fallback".to_owned());
+        }
+
+        // The chosen branch is the first after ordering and masking: emit its full
         // conjunction (every atom required) and assert its blockers.
         let (_, chosen_atoms, chosen_blockers) = &branches[0];
+        let chosen_leader_keys = leader_keys(chosen_atoms);
+        // Record the decision so the resolve layer can mask this branch and force
+        // the next one if the chosen branch conflicts downstream.
+        if !chosen_leader_keys.is_empty() {
+            self.branch_points.borrow_mut().push(BranchPoint {
+                chosen_leader_keys,
+                has_fallback: branches.len() > 1,
+            });
+        }
         for alts in chosen_atoms {
             self.push_disjunction(clauses, alts.clone());
         }
@@ -491,17 +537,6 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
             for alt in self.blocked_alternatives(blocker, Some(parent), parent_use, features) {
                 conflicts.push(alt);
             }
-        }
-
-        // Any-of fallback over every satisfiable branch's leading atom, so the
-        // solver can switch branches when the chosen one hits a learned conflict.
-        let leaders: Vec<Alt> = branches
-            .iter()
-            .filter_map(|(_, atoms, _)| atoms.first())
-            .flat_map(|alts| alts.iter().cloned())
-            .collect();
-        if leaders.len() > 1 {
-            clauses.push(Clause::any_of(leaders));
         }
         Ok(())
     }
@@ -714,6 +749,11 @@ impl<'s, S: ResolveSource> Encoder<'s, S> {
                 }
                 providers.extend(self.required_alternatives(pa, &vuse, features));
             }
+            // Only the highest visible matching virtual version endorses
+            // providers; lower versions are not offered as fallbacks, keeping the
+            // offered set consistent with the post-solve `emit_virtual_edges`,
+            // which records an edge only for the highest matching virtual.
+            break;
         }
         if providers.is_empty() {
             None
@@ -806,6 +846,62 @@ mod tests {
         // Level helper agrees.
         assert!(features_for_level(8).bdepend);
         assert!(!features_for_level(6).bdepend);
+    }
+
+    fn glob_atom(prefix: &str) -> NormAtom {
+        NormAtom {
+            blocker: crate::depnode::BlockerKind::None,
+            cp: "dev-lang/python".to_owned(),
+            version: Some((Op::EqualGlob, Version::parse(prefix).unwrap())),
+            slot: None,
+            subslot: None,
+            slot_op: None,
+            use_deps: vec![],
+        }
+    }
+
+    #[test]
+    fn equal_glob_matches_on_component_boundaries() {
+        // The resolver path must agree with the atom path: `=...*` stops at a
+        // version-component boundary, so a longer numeric component is not a match.
+        let one_two = glob_atom("1.2");
+        assert!(version_satisfies(&one_two, &Version::parse("1.2").unwrap()));
+        assert!(version_satisfies(
+            &one_two,
+            &Version::parse("1.2.3").unwrap()
+        ));
+        assert!(!version_satisfies(
+            &one_two,
+            &Version::parse("1.20").unwrap()
+        ));
+
+        let three_one = glob_atom("3.1");
+        assert!(version_satisfies(
+            &three_one,
+            &Version::parse("3.1").unwrap()
+        ));
+        assert!(!version_satisfies(
+            &three_one,
+            &Version::parse("3.10").unwrap()
+        ));
+        assert!(!version_satisfies(
+            &three_one,
+            &Version::parse("3.11").unwrap()
+        ));
+
+        // Non-digit-to-digit boundary and leading-zero normalization.
+        let one_alpha = glob_atom("1_alpha");
+        assert!(version_satisfies(
+            &one_alpha,
+            &Version::parse("1_alpha").unwrap()
+        ));
+        assert!(version_satisfies(
+            &one_alpha,
+            &Version::parse("1_alpha1").unwrap()
+        ));
+        let one = glob_atom("1");
+        assert!(!version_satisfies(&one, &Version::parse("10").unwrap()));
+        assert!(version_satisfies(&one, &Version::parse("1.5").unwrap()));
     }
 
     #[test]

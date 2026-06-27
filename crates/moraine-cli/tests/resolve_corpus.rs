@@ -73,4 +73,24 @@ fn resolves_an_atom_with_dependencies_from_corpus() {
         !order.is_empty(),
         "resolution should produce at least one task"
     );
+
+    // Two-slot collapse regression: whenever the solution co-installs more than
+    // one slot of a single cp, every one of those slots must reach the serialized
+    // plan as its own merge task rather than collapsing to one.
+    use std::collections::BTreeMap;
+    let mut slots_per_cp: BTreeMap<&str, std::collections::BTreeSet<&str>> = BTreeMap::new();
+    for p in &solution.packages {
+        slots_per_cp
+            .entry(p.cp.as_str())
+            .or_default()
+            .insert(p.slot.as_str());
+    }
+    for (cp, slots) in slots_per_cp.iter().filter(|(_, s)| s.len() > 1) {
+        let tasks_for_cp = order.iter().filter(|t| &t.cp == cp).count();
+        assert_eq!(
+            tasks_for_cp,
+            slots.len(),
+            "every co-installed slot of {cp} must produce its own merge task (slots {slots:?})"
+        );
+    }
 }

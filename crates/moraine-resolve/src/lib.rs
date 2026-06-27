@@ -34,6 +34,6 @@ pub use resolve::{Modifiers, resolve, resolve_with};
 pub use serialize::{Task, TaskKind, serialize};
 pub use solution::{
     AutounmaskChange, DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, Root,
-    SlotBinding,
+    SlotBinding, endpoint_cp,
 };
 pub use source::{AcceptChange, Acceptability, InstalledMeta, PackageMeta, ResolveSource};

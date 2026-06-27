@@ -134,7 +134,10 @@ fn schedule_blockers(
             // the same cp (another slot kept in the solution) makes the removal
             // safe; otherwise a dependent would be left unsatisfied.
             let has_surviving_provider = solution.packages.iter().any(|p| p.cp == victim.cp);
-            let has_dependent = solution.edges.iter().any(|e| e.to == victim.cp);
+            let has_dependent = solution
+                .edges
+                .iter()
+                .any(|e| crate::solution::endpoint_cp(&e.to) == victim.cp);
             if has_dependent && !has_surviving_provider {
                 return Err(MergeOrderError::UnsafeOperation(format!(
                     "blocker {} would uninstall {}, the sole provider a surviving package depends on",
@@ -291,8 +294,15 @@ fn emit_cycle(
 
 /// Collect the ASAP set: libc (expanded through virtuals from the graph), OS
 /// headers when a libc upgrade is present, and the package manager replacement.
+/// The set holds slot-qualified node keys, since the graph is keyed by `cp:slot`.
 fn collect_asap(solution: &ResolvedSolution, _graph: &MergeGraph) -> BTreeSet<String> {
     let mut asap = BTreeSet::new();
+    // Insert every selected slot of `cp` as a slot-qualified node key.
+    let mut insert_cp = |cp: &str| {
+        for p in solution.packages.iter().filter(|p| p.cp == cp) {
+            asap.insert(crate::provider::package_key(&p.cp, &p.slot));
+        }
+    };
     let libc_present =
         solution.package("sys-libs/glibc").is_some() || solution.package("sys-libs/musl").is_some();
     for cp in [
@@ -301,12 +311,10 @@ fn collect_asap(solution: &ResolvedSolution, _graph: &MergeGraph) -> BTreeSet<St
         "virtual/libc",
         "sys-apps/portage",
     ] {
-        if solution.package(cp).is_some() {
-            asap.insert(cp.to_owned());
-        }
+        insert_cp(cp);
     }
     if libc_present && solution.package("sys-kernel/linux-headers").is_some() {
-        asap.insert("sys-kernel/linux-headers".to_owned());
+        insert_cp("sys-kernel/linux-headers");
     }
     asap
 }
@@ -334,10 +342,10 @@ fn residual(graph: &MergeGraph) -> ResidualCycle {
     ResidualCycle { packages, edges }
 }
 
-/// Build the task for a node from the solution.
-fn build_task(solution: &ResolvedSolution, cp: &str) -> Task {
-    let pkg = solution.package(cp);
-    match pkg {
+/// Build the task for a node from the solution, looking the package up by its
+/// slot-qualified `cp:slot` key so the matching slot's version and USE are used.
+fn build_task(solution: &ResolvedSolution, key: &str) -> Task {
+    match solution.package_by_key(key) {
         Some(p) => Task {
             kind: TaskKind::Merge,
             cp: p.cp.clone(),
@@ -347,7 +355,7 @@ fn build_task(solution: &ResolvedSolution, cp: &str) -> Task {
         },
         None => Task {
             kind: TaskKind::Uninstall,
-            cp: cp.to_owned(),
+            cp: crate::solution::endpoint_cp(key).to_owned(),
             version: String::new(),
             slot: String::new(),
             use_enabled: Vec::new(),

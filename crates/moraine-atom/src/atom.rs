@@ -456,14 +456,43 @@ fn render_use_dep(out: &mut String, dep: &UseDep, resolve: &impl Fn(Symbol) -> S
 /// PMS treats the asterisk as wildcarding any further version components, so the
 /// match must end at a component boundary: `=1.2*` matches `1.2`, `1.2.3`, and
 /// `1.2_alpha`, but not `1.20` (the next character continues the same numeric
-/// component).
-fn version_glob_matches(candidate: &str, prefix: &str) -> bool {
-    candidate.starts_with(prefix)
-        && candidate
-            .as_bytes()
-            .get(prefix.len())
-            .map(|b| !b.is_ascii_digit())
-            .unwrap_or(true)
+/// component). The boundary holds when the character after the matched prefix is
+/// absent, is one of `._-`, or differs in digit-ness from the prefix's last
+/// character, so `=1_alpha*` matches `1_alpha1`. Both sides have their leading
+/// zeros normalized first, so `=1*` matches `01`. This mirrors Portage's `=*`
+/// branch in `dep/__init__.py` (bug 560466).
+///
+/// Both `candidate` and `prefix` are bare version strings (no `cat/pkg-`).
+pub fn version_glob_matches(candidate: &str, prefix: &str) -> bool {
+    let candidate = normalize_glob_zeros(candidate);
+    let prefix = normalize_glob_zeros(prefix);
+    if !candidate.starts_with(prefix.as_ref()) {
+        return false;
+    }
+    let prefix_last_digit = prefix
+        .as_bytes()
+        .last()
+        .map(u8::is_ascii_digit)
+        .unwrap_or(false);
+    match candidate.as_bytes().get(prefix.len()) {
+        None => true,
+        Some(&b) => b == b'.' || b == b'_' || b == b'-' || b.is_ascii_digit() != prefix_last_digit,
+    }
+}
+
+/// Normalize a version string's leading zeros the way Portage's `=*` match does:
+/// strip leading `0`s, and re-prepend a single `0` when the result is empty or no
+/// longer starts with a digit, so `01` becomes `1` and `0` stays `0`.
+fn normalize_glob_zeros(version: &str) -> std::borrow::Cow<'_, str> {
+    let stripped = version.trim_start_matches('0');
+    if stripped.len() == version.len() {
+        return std::borrow::Cow::Borrowed(version);
+    }
+    if stripped.is_empty() || !stripped.as_bytes()[0].is_ascii_digit() {
+        std::borrow::Cow::Owned(format!("0{stripped}"))
+    } else {
+        std::borrow::Cow::Owned(stripped.to_owned())
+    }
 }
 
 fn parse_operator(s: &str) -> (Option<Operator>, &str) {
@@ -753,4 +782,35 @@ fn parse_repo(
         return Err(err("invalid repository name"));
     }
     Ok(interner.intern(s))
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::version_glob_matches;
+
+    #[test]
+    fn matches_on_component_boundaries() {
+        assert!(version_glob_matches("1.2", "1.2"));
+        assert!(version_glob_matches("1.2.3", "1.2"));
+        assert!(version_glob_matches("1.2_alpha", "1.2"));
+        assert!(!version_glob_matches("1.20", "1.2"));
+        assert!(!version_glob_matches("3.10", "3.1"));
+        assert!(!version_glob_matches("3.11", "3.1"));
+        assert!(!version_glob_matches("10", "1"));
+        assert!(version_glob_matches("1.5", "1"));
+    }
+
+    #[test]
+    fn matches_non_digit_to_digit_boundary() {
+        assert!(version_glob_matches("1_alpha", "1_alpha"));
+        assert!(version_glob_matches("1_alpha1", "1_alpha"));
+        assert!(version_glob_matches("1_alpha2", "1_alpha"));
+    }
+
+    #[test]
+    fn normalizes_leading_zeros() {
+        assert!(version_glob_matches("01", "1"));
+        assert!(version_glob_matches("1", "01"));
+        assert!(version_glob_matches("0", "0"));
+    }
 }

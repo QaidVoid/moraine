@@ -10,7 +10,10 @@ pub mod depspec;
 mod error;
 pub mod rewrite;
 
-pub use atom::{Atom, Blocker, Operator, PackageRef, SlotOp, UseDep, UseDepKind, UseRequirement};
+pub use atom::{
+    Atom, Blocker, Operator, PackageRef, SlotOp, UseDep, UseDepKind, UseRequirement,
+    version_glob_matches,
+};
 pub use depspec::DepSpec;
 pub use error::{AtomError, DepError};
 pub use rewrite::{rewrite_dep_cp, rewrite_dep_slot};

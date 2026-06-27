@@ -281,11 +281,12 @@ fn leaf_query_ignores_soft_edges() {
         autounmask: Vec::new(),
     };
     let graph = MergeGraph::from_solution(&solution);
-    // At tier 0 (ignore nothing), cat/a is not a leaf (has a runtime_post edge).
+    // Nodes are keyed by the slot-qualified `cp:slot` key. At tier 0 (ignore
+    // nothing), cat/a is not a leaf (has a runtime_post edge).
     let leaves0 = graph.leaves(0, Range::Normal);
-    assert!(leaves0.contains(&"cat/b".to_owned()));
-    assert!(!leaves0.contains(&"cat/a".to_owned()));
+    assert!(leaves0.contains(&"cat/b:0".to_owned()));
+    assert!(!leaves0.contains(&"cat/a:0".to_owned()));
     // At a tier that ignores runtime_post, cat/a becomes a leaf.
     let leaves = graph.leaves(2, Range::Normal);
-    assert!(leaves.contains(&"cat/a".to_owned()));
+    assert!(leaves.contains(&"cat/a:0".to_owned()));
 }

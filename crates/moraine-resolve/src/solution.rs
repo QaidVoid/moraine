@@ -100,9 +100,13 @@ pub struct RecordedBlocker {
 /// A class-tagged dependency edge between two packages in the solution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepEdge {
-    /// The dependent package, as `category/package`.
+    /// The dependent package, as a slot-qualified `category/package:slot` key, so
+    /// an edge from a `cp` co-installed in two slots names the specific slot the
+    /// dependency was declared by. Use [`endpoint_cp`] to recover the bare `cp`.
     pub from: String,
-    /// The depended-upon package, as `category/package`.
+    /// The depended-upon package, as a slot-qualified `category/package:slot` key,
+    /// so an edge into a `cp` co-installed in two slots targets the specific slot
+    /// the dependency resolved against. Use [`endpoint_cp`] to recover the `cp`.
     pub to: String,
     /// The dependency class of the edge.
     pub class: DepClass,
@@ -175,8 +179,32 @@ pub struct ResolvedSolution {
 }
 
 impl ResolvedSolution {
-    /// Look up a resolved package by its `category/package`.
+    /// Look up a resolved package by its `category/package`, returning the first
+    /// matching slot. Use this for `cp`-level membership checks (for example,
+    /// whether any slot of a `cp` is being merged); use [`Self::package_slot`] or
+    /// [`Self::package_by_key`] when the specific slot matters.
     pub fn package(&self, cp: &str) -> Option<&ResolvedPackage> {
         self.packages.iter().find(|p| p.cp == cp)
     }
+
+    /// Look up a resolved package by its exact `(category/package, slot)`.
+    pub fn package_slot(&self, cp: &str, slot: &str) -> Option<&ResolvedPackage> {
+        self.packages.iter().find(|p| p.cp == cp && p.slot == slot)
+    }
+
+    /// Look up a resolved package by a slot-qualified `category/package:slot` key.
+    /// A bare `cp` key (no slot separator) falls back to the first matching slot,
+    /// so hand-built solutions whose edges name bare `cp`s still resolve.
+    pub fn package_by_key(&self, key: &str) -> Option<&ResolvedPackage> {
+        match key.split_once(':') {
+            Some((cp, slot)) => self.package_slot(cp, slot),
+            None => self.package(key),
+        }
+    }
+}
+
+/// Recover the bare `category/package` from a slot-qualified `cp:slot` edge
+/// endpoint or node key. A key without a slot separator is returned unchanged.
+pub fn endpoint_cp(key: &str) -> &str {
+    key.split_once(':').map(|(cp, _)| cp).unwrap_or(key)
 }

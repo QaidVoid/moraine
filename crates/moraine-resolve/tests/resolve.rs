@@ -88,7 +88,13 @@ fn dependency_classes_get_correct_roots() {
 
     let sol = resolve(&f, &["cat/main"]).expect("resolves");
 
-    let edge = |to: &str| sol.edges.iter().find(|e| e.to == to).unwrap().clone();
+    let edge = |to: &str| {
+        sol.edges
+            .iter()
+            .find(|e| moraine_resolve::endpoint_cp(&e.to) == to)
+            .unwrap()
+            .clone()
+    };
 
     let bd = edge("cat/buildtool");
     assert_eq!(bd.class, DepClass::Bdepend);
@@ -128,7 +134,11 @@ fn depend_root_without_bdepend_is_running_root() {
     f.add(pkg("cat/header", "1"));
 
     let sol = resolve(&f, &["cat/main"]).expect("resolves");
-    let dep = sol.edges.iter().find(|e| e.to == "cat/header").unwrap();
+    let dep = sol
+        .edges
+        .iter()
+        .find(|e| moraine_resolve::endpoint_cp(&e.to) == "cat/header")
+        .unwrap();
     assert_eq!(dep.class, DepClass::Depend);
     assert_eq!(dep.root, Root::BuildHost);
 }
@@ -430,6 +440,50 @@ fn package_provided_satisfies_without_install() {
 }
 
 #[test]
+fn any_of_falls_back_to_a_branch_that_resolves() {
+    // The leftmost `||` branch (cat/a) is individually satisfiable but forces
+    // cat/lib-1, which conflicts with cat/main's hard =cat/lib-2. Only the cat/b
+    // branch is consistent. The resolver must switch branches rather than report
+    // the request unsatisfiable.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/main",
+        version: "1",
+        depend: "=cat/lib-2",
+        rdepend: "|| ( cat/a cat/b )",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "cat/a",
+        version: "1",
+        depend: "=cat/lib-1",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "cat/b",
+        version: "1",
+        depend: "=cat/lib-2",
+        ..Default::default()
+    });
+    f.add(pkg("cat/lib", "1"));
+    f.add(pkg("cat/lib", "2"));
+
+    let sol = resolve(&f, &["cat/main"]).expect("resolves to the consistent branch");
+    assert!(
+        sol.package("cat/b").is_some(),
+        "the cat/b branch must be selected: {:?}",
+        sol.packages
+    );
+    assert!(
+        sol.package("cat/a").is_none(),
+        "the conflicting cat/a branch must not be selected"
+    );
+    // cat/lib-2 (not cat/lib-1) is the consistent choice.
+    let lib = sol.package("cat/lib").expect("cat/lib selected");
+    assert_eq!(lib.version.as_str(), "2");
+}
+
+#[test]
 fn virtual_expands_to_provider() {
     let mut f = Fixture::new();
     f.add(PkgSpec {
@@ -465,6 +519,46 @@ fn virtual_expands_to_provider() {
     assert!(
         sol.package("virtual/foo").is_some(),
         "the virtual node is retained in the install set"
+    );
+}
+
+#[test]
+fn virtual_expansion_offers_only_the_selected_version_providers() {
+    // The highest visible virtual (x-2) endorses prov-a or prov-c; the lower
+    // virtual (x-1) endorses prov-a or prov-b. Expansion must offer only the
+    // selected (highest) virtual's providers, so prov-b is never reachable.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/main",
+        version: "1",
+        rdepend: "virtual/x",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "virtual/x",
+        version: "2",
+        rdepend: "|| ( cat/prov-a cat/prov-c )",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "virtual/x",
+        version: "1",
+        rdepend: "|| ( cat/prov-a cat/prov-b )",
+        ..Default::default()
+    });
+    // prov-a is absent, so a correct expansion of x-2 must fall to prov-c. If the
+    // lower virtual's providers leaked in, the solver could instead pick prov-b.
+    f.add(pkg("cat/prov-b", "1"));
+    f.add(pkg("cat/prov-c", "1"));
+
+    let sol = resolve(&f, &["cat/main"]).expect("resolves");
+    assert!(
+        sol.package("cat/prov-c").is_some(),
+        "the selected virtual's provider prov-c should be installed"
+    );
+    assert!(
+        sol.package("cat/prov-b").is_none(),
+        "a lower virtual version's provider must never be offered"
     );
 }
 
@@ -623,6 +717,45 @@ fn two_slots_of_one_cp_coinstall() {
     assert_eq!(pythons.len(), 2, "both slots co-install: {pythons:?}");
     assert!(pythons.iter().any(|p| p.slot == "3.11"));
     assert!(pythons.iter().any(|p| p.slot == "3.12"));
+}
+
+#[test]
+fn two_slots_of_one_cp_serialize_to_two_tasks() {
+    // The slot-keyed solution must survive serialization: both slots reach the
+    // merge plan as their own task rather than collapsing to one.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "dev-lang/python",
+        version: "3.11",
+        slot: "3.11",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "dev-lang/python",
+        version: "3.12",
+        slot: "3.12",
+        ..Default::default()
+    });
+
+    let sol = resolve(&f, &["dev-lang/python:3.11", "dev-lang/python:3.12"]).expect("resolves");
+    let tasks = moraine_resolve::serialize(&sol).expect("serializes");
+    let python_tasks: Vec<_> = tasks.iter().filter(|t| t.cp == "dev-lang/python").collect();
+    assert_eq!(
+        python_tasks.len(),
+        2,
+        "both slots produce a merge task: {python_tasks:?}"
+    );
+    let task_311 = python_tasks
+        .iter()
+        .find(|t| t.slot == "3.11")
+        .expect("3.11 task");
+    let task_312 = python_tasks
+        .iter()
+        .find(|t| t.slot == "3.12")
+        .expect("3.12 task");
+    // Each task carries its own slot's version, not the other slot's.
+    assert_eq!(task_311.version, "3.11");
+    assert_eq!(task_312.version, "3.12");
 }
 
 #[test]

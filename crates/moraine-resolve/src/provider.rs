@@ -53,6 +53,10 @@ pub struct GentooProvider<'s, S: ResolveSource> {
     source: &'s S,
     request: Vec<crate::depnode::NormAtom>,
     modifiers: crate::resolve::Modifiers,
+    /// `||` branch-leader keys masked by the resolve layer's fallback loop.
+    branch_mask: BTreeSet<String>,
+    /// The `||` branch decisions made during the most recent encoding pass.
+    branch_points: std::cell::RefCell<Vec<crate::encode::BranchPoint>>,
 }
 
 impl<'s, S: ResolveSource> GentooProvider<'s, S> {
@@ -63,21 +67,31 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
             source,
             request: Vec::new(),
             modifiers: crate::resolve::Modifiers::default(),
+            branch_mask: BTreeSet::new(),
+            branch_points: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     /// Create a provider whose synthetic root depends on the given request
-    /// atoms.
+    /// atoms, masking the given `||` branch-leader keys.
     pub(crate) fn with_request(
         source: &'s S,
         request: Vec<crate::depnode::NormAtom>,
         modifiers: crate::resolve::Modifiers,
+        branch_mask: BTreeSet<String>,
     ) -> Self {
         GentooProvider {
             source,
             request,
             modifiers,
+            branch_mask,
+            branch_points: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// The `||` branch decisions recorded during the most recent solve.
+    pub(crate) fn branch_points(&self) -> Vec<crate::encode::BranchPoint> {
+        self.branch_points.borrow().clone()
     }
 
     /// Borrow the underlying source.
@@ -196,6 +210,8 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
         if package == REQUEST_CP {
             let encoder = Encoder {
                 source: self.source,
+                branch_mask: &self.branch_mask,
+                branch_points: &self.branch_points,
             };
             return Dependencies::Known(encoder.request_requirements(&self.request));
         }
@@ -212,6 +228,8 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
         // Validate strong blockers against the EAPI feature table.
         let encoder = Encoder {
             source: self.source,
+            branch_mask: &self.branch_mask,
+            branch_points: &self.branch_points,
         };
         let nodes: [&DepNode; 5] = [
             &meta.bdepend,

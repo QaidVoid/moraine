@@ -13,7 +13,7 @@ use crate::depnode::{BlockerKind, DepNode, NormAtom, SlotOpKind};
 use crate::encode::{CLASSES, root_for, slot_matches, use_deps_satisfied, version_satisfies};
 use crate::error::ResolveError;
 use crate::normalize::normalize_atom;
-use crate::provider::{GentooProvider, REQUEST_CP, split_key};
+use crate::provider::{GentooProvider, REQUEST_CP, package_key, split_key};
 use crate::solution::{
     AutounmaskChange, BlockVictim, DepClass, DepEdge, RecordedBlocker, ResolvedPackage,
     ResolvedSolution, SlotBinding,
@@ -83,20 +83,52 @@ pub fn resolve_with<S: ResolveSource>(
     // to guarantee termination (Portage's `_slot_operator_update_backtrack` /
     // `_need_restart`).
     const MAX_SLOT_RESTARTS: u32 = 8;
+    // Bound on the number of `||` branch-fallback re-solves, so a pathological
+    // graph cannot loop forever. Each fallback masks at least one new branch
+    // leader, so the number of distinct fallbacks is finite regardless.
+    const MAX_BRANCH_FALLBACKS: u32 = 64;
     let mut requested_cps: BTreeSet<String> = request_atoms.iter().map(|a| a.cp.clone()).collect();
     let mut extra_atoms: Vec<NormAtom> = Vec::new();
     let mut restarts = 0u32;
+    // `||` branch-leader keys masked so far, and a count of the fallback re-solves.
+    let mut branch_mask: BTreeSet<String> = BTreeSet::new();
+    let mut branch_fallbacks = 0u32;
 
     loop {
         let mut all_atoms = request_atoms.clone();
         all_atoms.extend(extra_atoms.iter().cloned());
-        let provider = GentooProvider::with_request(source, all_atoms, modifiers);
+        let provider =
+            GentooProvider::with_request(source, all_atoms, modifiers, branch_mask.clone());
 
         let (solution, stats) =
             solve_with_stats(&provider, REQUEST_CP.to_owned(), root_version.clone());
         let decisions = match solution {
             Ok(map) => map,
             Err(failure) => {
+                // A `||` group's forced branch may have created the conflict. If a
+                // recorded branch decision is implicated in the failure and has an
+                // unmasked fallback branch, mask its leader and re-solve, mirroring
+                // Portage's `dep_zapdeps` + backtracking switching branches.
+                if branch_fallbacks < MAX_BRANCH_FALLBACKS {
+                    let mut conflict_keys = BTreeSet::new();
+                    collect_conflict_keys(&failure.explanation, &mut conflict_keys);
+                    let next = provider.branch_points().into_iter().find(|bp| {
+                        bp.has_fallback
+                            && bp
+                                .chosen_leader_keys
+                                .iter()
+                                .any(|k| conflict_keys.contains(k))
+                            && bp
+                                .chosen_leader_keys
+                                .iter()
+                                .any(|k| !branch_mask.contains(k))
+                    });
+                    if let Some(bp) = next {
+                        branch_mask.extend(bp.chosen_leader_keys);
+                        branch_fallbacks += 1;
+                        continue;
+                    }
+                }
                 return Err(ResolveError::Unsatisfiable {
                     explanation: render_explanation(&failure.explanation),
                 });
@@ -104,7 +136,9 @@ pub fn resolve_with<S: ResolveSource>(
         };
 
         let mut resolved = assemble_solution(source, &decisions, modifiers)?;
-        resolved.backtracks = stats.backtracks + restarts;
+        // Fold the `||` branch-fallback and slot-restart re-solves into the
+        // reported count, distinct from the solver's inner backjumps (`stats`).
+        resolved.backtracks = stats.backtracks + restarts + branch_fallbacks;
 
         if restarts < MAX_SLOT_RESTARTS {
             let pulled = rebuild_consumers(source, &resolved, &requested_cps);
@@ -297,13 +331,16 @@ fn assemble_solution<S: ResolveSource>(
                 (&meta.idepend, DepClass::Idepend),
             ];
 
+            // The edge's source is this specific `(cp, slot)`, so two slots of one
+            // cp record their own outgoing edges rather than collapsing.
+            let from_key = package_key(cp, &meta.slot);
             for (node, class) in class_nodes {
                 let mut atoms: Vec<(&NormAtom, bool)> = Vec::new();
                 collect_atoms(node, &resolved_use, false, &mut atoms);
                 for (atom, optional) in atoms {
                     emit_edge_for_atom(
                         source,
-                        cp,
+                        &from_key,
                         atom,
                         class,
                         optional,
@@ -685,7 +722,9 @@ fn emit_edge_for_atom<S: ResolveSource>(
             return;
         }
         blockers.push(RecordedBlocker {
-            blocker: from.to_owned(),
+            // The blocking package is identified by its `cp` for display and the
+            // safety checks, not by its slot-qualified edge key.
+            blocker: crate::solution::endpoint_cp(from).to_owned(),
             blocked_atom: render_atom(atom),
             strong: atom.blocker == BlockerKind::Strong,
             victims,
@@ -702,12 +741,12 @@ fn emit_edge_for_atom<S: ResolveSource>(
         return;
     }
 
-    // Find the selected provider satisfying this atom.
-    if find_provider(selected, atom).is_some() {
+    // Find the selected provider satisfying this atom, and target its slot.
+    if let Some((_, dep_meta)) = find_provider(selected, atom) {
         let slot_op = atom.slot_op.is_some();
         edges.push(DepEdge {
             from: from.to_owned(),
-            to: atom.cp.clone(),
+            to: package_key(&atom.cp, &dep_meta.slot),
             class,
             root,
             build_time: class.is_build_time(),
@@ -794,11 +833,11 @@ fn emit_virtual_edges<S: ResolveSource>(
     edges: &mut Vec<DepEdge>,
 ) {
     let root = root_for(class, features);
-    // Edge to the virtual itself if it is selected.
-    if find_provider(selected, atom).is_some() {
+    // Edge to the virtual itself if it is selected, targeting its slot.
+    if let Some((_, vmeta)) = find_provider(selected, atom) {
         edges.push(DepEdge {
             from: from.to_owned(),
-            to: atom.cp.clone(),
+            to: package_key(&atom.cp, &vmeta.slot),
             class,
             root,
             build_time: class.is_build_time(),
@@ -821,10 +860,10 @@ fn emit_virtual_edges<S: ResolveSource>(
                 emit_virtual_edges(source, from, patom, class, true, features, selected, edges);
                 continue;
             }
-            if find_provider(selected, patom).is_some() {
+            if let Some((_, pmeta)) = find_provider(selected, patom) {
                 edges.push(DepEdge {
                     from: from.to_owned(),
-                    to: patom.cp.clone(),
+                    to: package_key(&patom.cp, &pmeta.slot),
                     class,
                     root,
                     build_time: class.is_build_time(),
@@ -948,6 +987,23 @@ fn op_str(op: crate::depnode::Op) -> &'static str {
         Greater => ">",
         Less => "<",
         Tilde => "~",
+    }
+}
+
+/// Collect every solver package key that appears anywhere in a failure
+/// explanation tree, used to find which `||` branch decision was implicated.
+fn collect_conflict_keys(node: &Explanation<String, Version>, out: &mut BTreeSet<String>) {
+    match node {
+        Explanation::External { terms, .. } => {
+            out.extend(terms.iter().map(|(p, _)| p.clone()));
+        }
+        Explanation::Derived { terms, causes, .. } => {
+            out.extend(terms.iter().map(|(p, _)| p.clone()));
+            for cause in causes {
+                collect_conflict_keys(cause, out);
+            }
+        }
+        Explanation::Shared(_) => {}
     }
 }
 

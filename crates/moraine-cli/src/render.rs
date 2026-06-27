@@ -41,14 +41,16 @@ pub fn render_autounmask(
         })
         .collect();
 
-    // `child cp -> requirer cps`, from the dependency edges.
+    // `child cp -> requirer cps`, from the dependency edges. Edge endpoints are
+    // slot-qualified, so the reason chain keys on their bare `cp`.
     let mut parents: HashMap<&str, Vec<&str>> = HashMap::new();
     for e in edges {
-        if e.from != e.to {
-            parents
-                .entry(e.to.as_str())
-                .or_default()
-                .push(e.from.as_str());
+        let (from, to) = (
+            moraine_resolve::endpoint_cp(&e.from),
+            moraine_resolve::endpoint_cp(&e.to),
+        );
+        if from != to {
+            parents.entry(to).or_default().push(from);
         }
     }
 
