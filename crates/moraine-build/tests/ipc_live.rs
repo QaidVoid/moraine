@@ -32,7 +32,9 @@ struct FixtureStore {
 
 impl FixtureStore {
     fn cp_matches<'a>(&'a self, atom: &'a str) -> impl Iterator<Item = &'a String> {
-        let cp = atom.trim_start_matches(['>', '<', '=', '~', '!']).to_owned();
+        let cp = atom
+            .trim_start_matches(['>', '<', '=', '~', '!'])
+            .to_owned();
         self.installed
             .iter()
             .filter(move |cpv| cpv.starts_with(&cp))
@@ -76,12 +78,7 @@ fn run_with_responder(backend: &FixtureStore, ebuild_body: &str) -> (String, boo
 /// Source the library and ebuild, bind the EAPI defaults, and dispatch
 /// `pkg_setup`, with the IPC helper exported. Modeled on the bash fixture in
 /// `bashlib_fixture.rs`.
-fn run_phase(
-    library: &PhaseLibrary,
-    root: &Path,
-    ebuild: &Path,
-    helper: &str,
-) -> (String, bool) {
+fn run_phase(library: &PhaseLibrary, root: &Path, ebuild: &Path, helper: &str) -> (String, bool) {
     let w = |p: &Path| p.to_string_lossy().into_owned();
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in [
@@ -177,7 +174,10 @@ fn absent_package_returns_one_without_dying() {
     );
     // has_version exited 1 (not a die), and best_version exited 0 with no output.
     assert!(ok, "absent query aborted the phase: {out}");
-    assert!(out.contains("ABSENT"), "has_version did not report absent: {out}");
+    assert!(
+        out.contains("ABSENT"),
+        "has_version did not report absent: {out}"
+    );
     assert!(
         out.contains("BEST=[]"),
         "best_version for an absent package should be empty: {out}"

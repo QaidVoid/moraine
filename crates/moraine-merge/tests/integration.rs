@@ -115,11 +115,12 @@ fn state(cp: &str, version: &str, slot: &str) -> PackageState {
 }
 
 fn merge_op(image: PathBuf, st: PackageState, replaces: Option<&str>, in_world: bool) -> Operation {
+    let world_atom = in_world.then(|| format!("{}/{}", st.category, st.package));
     Operation::Merge(Box::new(MergeOp {
         image_dir: image,
         state: st,
         replaces: replaces.map(str::to_string),
-        in_world,
+        world_atom,
         elog: Vec::new(),
         ebuild: None,
     }))

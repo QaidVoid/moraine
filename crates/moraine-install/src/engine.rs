@@ -32,8 +32,8 @@ pub struct TaskOutcome {
 pub struct TransactionReport {
     /// The per-task outcomes, in apply order.
     pub applied: Vec<TaskOutcome>,
-    /// The explicit `category/package` of merged packages that should join the
-    /// world set.
+    /// The resolved world atoms of merged packages that should join the world
+    /// set, slot-qualified or repo-qualified when the request was that precise.
     pub world_additions: Vec<String>,
     /// Pending CONFIG_PROTECT variant paths left by the transaction.
     pub config_updates: Vec<String>,
@@ -103,8 +103,8 @@ impl<'a, S: StepRunner, A: Applier> TransactionEngine<'a, S, A> {
                         messages: outcome.report.elog.clone(),
                     });
                 }
-                if task.in_world {
-                    report.world_additions.push(task.cp.clone());
+                if let Some(atom) = &task.world_atom {
+                    report.world_additions.push(atom.clone());
                 }
             }
             report.applied.push(applied);

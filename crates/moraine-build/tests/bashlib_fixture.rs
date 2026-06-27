@@ -565,9 +565,8 @@ fn fperms_routes_options_and_symbolic_mode() {
     }
     // `-R` must be forwarded as an option to chmod, `0755` taken as the mode, and
     // only the path prefixed; `-x` must be treated as the mode, not an option.
-    let eb = fx.ebuild(
-        "EAPI=8\nsrc_install() { fperms -R 0755 some/dir; fperms -x some/loose; }\n",
-    );
+    let eb =
+        fx.ebuild("EAPI=8\nsrc_install() { fperms -R 0755 some/dir; fperms -x some/loose; }\n");
     let (out, ok) = fx.run_phase("8", &eb, "src_install", &[]);
     assert!(ok, "fperms aborted: {out}");
     #[cfg(unix)]
@@ -654,11 +653,7 @@ fn fowners_resolves_owner_against_target_root() {
         "root:x:0:0:root:/root:/bin/bash\nmessagebus:x:101:102:System Message Bus:/dev/null:/sbin/nologin\n",
     )
     .unwrap();
-    std::fs::write(
-        target.join("etc/group"),
-        "root:x:0:\nmessagebus:x:102:\n",
-    )
-    .unwrap();
+    std::fs::write(target.join("etc/group"), "root:x:0:\nmessagebus:x:102:\n").unwrap();
     let t = target.to_string_lossy().into_owned();
 
     // A non-root target resolves the symbolic owner to numeric uid:gid from the
@@ -671,7 +666,12 @@ fn fowners_resolves_owner_against_target_root() {
         "8",
         &eb,
         "src_install",
-        &[("ROOT", &t), ("SYSROOT", &t), ("ESYSROOT", &t), ("EROOT", &t)],
+        &[
+            ("ROOT", &t),
+            ("SYSROOT", &t),
+            ("ESYSROOT", &t),
+            ("EROOT", &t),
+        ],
     );
     assert!(ok, "cross-root fowners aborted: {out}");
     assert!(

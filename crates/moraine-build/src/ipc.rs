@@ -629,11 +629,15 @@ mod tests {
             }
         }
         let handler = IpcHandler::new(&Invalid);
-        let r = handler.handle_line("has_version host dev-libs/foo[").unwrap();
+        let r = handler
+            .handle_line("has_version host dev-libs/foo[")
+            .unwrap();
         assert_eq!(r.code, 2);
         assert_eq!(r.value, None);
         // A valid atom still answers normally.
-        let ok = handler.handle_line("has_version host dev-libs/foo").unwrap();
+        let ok = handler
+            .handle_line("has_version host dev-libs/foo")
+            .unwrap();
         assert_eq!(ok.code, 0);
     }
 

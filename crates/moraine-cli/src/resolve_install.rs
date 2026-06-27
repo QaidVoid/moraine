@@ -33,7 +33,8 @@ use moraine_install::{
 use moraine_repo::store::{StoredEntry, read_entries};
 use moraine_repo::{LoadedStore, RepoIndex, RepoSet, RepoStore, build_index_with, discover};
 use moraine_resolve::{
-    Modifiers, RealSource, Task, TaskKind as ResolveTaskKind, resolve_with, serialize,
+    Modifiers, RealSource, ResolveSource, Task, TaskKind as ResolveTaskKind, resolve_with,
+    serialize,
 };
 use moraine_vdb::store::Store;
 use moraine_version::Version;
@@ -248,14 +249,16 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         return Ok(());
     }
 
-    // Convert to orchestrator tasks, choosing source or binary per task.
-    let explicit = explicit_heads(cli);
+    // Convert to orchestrator tasks, choosing source or binary per task. The
+    // world-atom inputs mirror `create_world_atom`: the requesting argument's
+    // repo and precision, the slotted `cp`s, and the system set.
+    let world_inputs = WorldAtomInputs::compute(&qualified, &source, &installed, ctx, &interner);
     let tasks: Vec<InstallTask> = order
         .iter()
         .map(|task| {
             to_install_task(
                 task,
-                &explicit,
+                &world_inputs,
                 &prefs,
                 cli.oneshot,
                 &pkgdir,
@@ -741,7 +744,7 @@ fn usepkgonly_unsatisfiable(tasks: &[InstallTask]) -> Vec<String> {
 
 fn to_install_task(
     task: &Task,
-    explicit: &BTreeSet<String>,
+    world: &WorldAtomInputs,
     prefs: &BinaryPrefs,
     oneshot: bool,
     pkgdir: &Path,
@@ -767,9 +770,120 @@ fn to_install_task(
         } else {
             SourceKind::Source
         },
-        in_world: explicit.contains(&task.cp) && !oneshot,
+        world_atom: world.world_atom(task, oneshot),
         replaces: None,
     }
+}
+
+/// What a requesting command-line argument named beyond its `category/package`,
+/// used to compute the world atom in the shape of `create_world_atom`.
+struct ArgDetail {
+    /// The repository qualifier the argument carried (`::repo`), if any.
+    repo: Option<String>,
+    /// Whether the argument was precise enough to identify a single slot, that is
+    /// it carried a version operator, version, or slot.
+    precise: bool,
+}
+
+/// The inputs needed to compute a world atom for a resolved task, mirroring
+/// `lib/_emerge/create_world_atom.py`: the requesting argument detail keyed by
+/// `cp`, the slotted `cp`s, and the `category/package` heads of the system set.
+struct WorldAtomInputs {
+    args: HashMap<String, ArgDetail>,
+    slotted: HashSet<String>,
+    system: BTreeSet<String>,
+}
+
+impl WorldAtomInputs {
+    /// Build the world-atom inputs from the qualified targets, the resolver
+    /// source (for repository slots), the installed-version map (for installed
+    /// slots), and the configuration.
+    fn compute<S: ResolveSource>(
+        qualified: &[String],
+        source: &S,
+        installed: &HashMap<String, Vec<(String, String)>>,
+        ctx: &ConfigContext,
+        interner: &Interner,
+    ) -> WorldAtomInputs {
+        let mut args: HashMap<String, ArgDetail> = HashMap::new();
+        for target in qualified {
+            if target.starts_with('@') {
+                continue;
+            }
+            let cp = cp_of_atom(target);
+            let detail = match moraine_atom::Atom::parse(target, moraine_eapi::PERMISSIVE, interner)
+            {
+                Ok(atom) => ArgDetail {
+                    repo: atom
+                        .repo()
+                        .and_then(|r| interner.resolve(r))
+                        .map(|s| s.to_owned()),
+                    precise: atom.version().is_some() || atom.slot().is_some(),
+                },
+                Err(_) => ArgDetail {
+                    repo: None,
+                    precise: false,
+                },
+            };
+            args.insert(cp, detail);
+        }
+        let slotted: HashSet<String> = args
+            .keys()
+            .filter(|cp| is_slotted(cp, source, installed))
+            .cloned()
+            .collect();
+        let system: BTreeSet<String> = ctx.system.iter().map(|a| cp_of_atom(a)).collect();
+        WorldAtomInputs {
+            args,
+            slotted,
+            system,
+        }
+    }
+
+    /// The world atom to record for a resolved task, or `None` when it should not
+    /// join world. Mirrors `create_world_atom`: a dependency-only task or a
+    /// `--oneshot` target never joins; an unslotted system member (other than a
+    /// `virtual/*`) is omitted; a slotted package whose argument identifies a
+    /// single slot records `cp:slot`; the `::repo` qualifier is preserved.
+    fn world_atom(&self, task: &Task, oneshot: bool) -> Option<String> {
+        if oneshot {
+            return None;
+        }
+        let arg = self.args.get(&task.cp)?;
+        let slotted = self.slotted.contains(&task.cp);
+        if !slotted
+            && arg.repo.is_none()
+            && self.system.contains(&task.cp)
+            && !task.cp.starts_with("virtual/")
+        {
+            return None;
+        }
+        let mut atom = if slotted && arg.precise {
+            format!("{}:{}", task.cp, task.slot)
+        } else {
+            task.cp.clone()
+        };
+        if let Some(repo) = &arg.repo {
+            atom.push_str("::");
+            atom.push_str(repo);
+        }
+        Some(atom)
+    }
+}
+
+/// Whether `cp` is slotted: the available slots across the repository candidates
+/// and the installed versions number more than one, or the single slot is not
+/// `0`. Mirrors the `slotted` computation in `create_world_atom`.
+fn is_slotted<S: ResolveSource>(
+    cp: &str,
+    source: &S,
+    installed: &HashMap<String, Vec<(String, String)>>,
+) -> bool {
+    let mut slots: BTreeSet<String> = source.versions_of(cp).into_iter().map(|m| m.slot).collect();
+    if let Some(versions) = installed.get(cp) {
+        slots.extend(versions.iter().map(|(_, slot)| slot.clone()));
+    }
+    slots.len() > 1 || (slots.len() == 1 && !slots.contains("0"))
 }
 
 /// The binary candidates available for selection plus the target configuration
@@ -1275,16 +1389,6 @@ fn installed_versions(vdb: &Store) -> HashMap<String, Vec<(String, String)>> {
     map
 }
 
-/// The `category/package` heads explicitly named on the command line (excluding
-/// `@`-sets), which become world members.
-fn explicit_heads(cli: &Cli) -> BTreeSet<String> {
-    cli.targets
-        .iter()
-        .filter(|t| !t.starts_with('@'))
-        .map(|t| cp_of_atom(t))
-        .collect()
-}
-
 /// Compute the `@preserved-rebuild` set: installed packages requiring a soname
 /// kept alive only by a preserved library, minus the preserved libraries' own
 /// owners. Returns empty when the registry has no preserved libraries.
@@ -1534,7 +1638,7 @@ mod tests {
             slot: "0".to_owned(),
             kind,
             source,
-            in_world: false,
+            world_atom: None,
             replaces: None,
         };
         let tasks = vec![

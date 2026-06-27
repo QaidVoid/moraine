@@ -57,19 +57,53 @@ pub fn depclean_orphans(installed: &[InstalledPackage], roots: &BTreeSet<String>
     RemovalSet { cpvs }
 }
 
-/// Compute the prune set: for each `(cp, slot)` keep the highest installed
-/// version and remove the rest. The highest version of every slot is always
-/// retained, so no `cp` is ever fully removed.
-pub fn prune_superseded(installed: &[InstalledPackage]) -> RemovalSet {
-    let mut by_slot: BTreeMap<(String, String), Vec<&InstalledPackage>> = BTreeMap::new();
+/// Compute the orphan set for a targeted depclean, restricting removal to
+/// packages whose `cp` is named in `targets`.
+///
+/// Every installed package whose `cp` is not named is protected by seeding it
+/// into the reachability roots, and the named keys are dropped from `roots`. A
+/// package is returned as an orphan only when its `cp` is named and is not
+/// reachable from the protected set, so a named package is removed only when no
+/// protected package still requires it, and every unmatched package is kept.
+/// Mirrors Portage's `protected_set` construction for an args-restricted
+/// depclean.
+pub fn depclean_targeted(
+    installed: &[InstalledPackage],
+    roots: &BTreeSet<String>,
+    targets: &BTreeSet<String>,
+) -> RemovalSet {
+    let mut protected: BTreeSet<String> = roots
+        .iter()
+        .filter(|cp| !targets.contains(*cp))
+        .cloned()
+        .collect();
     for pkg in installed {
-        by_slot
-            .entry((pkg.cp.clone(), pkg.slot.clone()))
-            .or_default()
-            .push(pkg);
+        if !targets.contains(&pkg.cp) {
+            protected.insert(pkg.cp.clone());
+        }
+    }
+    let reachable = reachable_cps(installed, &protected);
+    let mut cpvs: Vec<String> = installed
+        .iter()
+        .filter(|pkg| targets.contains(&pkg.cp) && !reachable.contains(&pkg.cp))
+        .map(|pkg| pkg.cpv.clone())
+        .collect();
+    cpvs.sort();
+    RemovalSet { cpvs }
+}
+
+/// Compute the prune set: for each `category/package` keep the single highest
+/// installed version across all slots and remove the lower versions. The highest
+/// version of every `category/package` is always retained, so no package is ever
+/// fully removed. A lower version still required by a retained package is kept by
+/// the caller's [`would_break_retained`] guard.
+pub fn prune_superseded(installed: &[InstalledPackage]) -> RemovalSet {
+    let mut by_cp: BTreeMap<&str, Vec<&InstalledPackage>> = BTreeMap::new();
+    for pkg in installed {
+        by_cp.entry(pkg.cp.as_str()).or_default().push(pkg);
     }
     let mut cpvs = Vec::new();
-    for group in by_slot.values() {
+    for group in by_cp.values() {
         let Some(highest) = group.iter().map(|p| &p.version).max() else {
             continue;
         };
@@ -180,14 +214,80 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_highest_per_slot() {
+    fn prune_keeps_highest_per_cp_across_slots() {
         let installed = vec![
             pkg("lib/a-1", "lib/a", "0", "1", &[]),
             pkg("lib/a-2", "lib/a", "0", "2", &[]),
             pkg("lib/a-3", "lib/a", "1", "3", &[]),
         ];
         let set = prune_superseded(&installed);
-        assert_eq!(set.cpvs, vec!["lib/a-1".to_owned()]);
+        assert_eq!(set.cpvs, vec!["lib/a-1".to_owned(), "lib/a-2".to_owned()]);
+    }
+
+    #[test]
+    fn prune_across_slots_keeps_highest_version() {
+        let installed = vec![
+            pkg(
+                "dev-lang/python-3.10",
+                "dev-lang/python",
+                "3.10",
+                "3.10",
+                &[],
+            ),
+            pkg(
+                "dev-lang/python-3.11",
+                "dev-lang/python",
+                "3.11",
+                "3.11",
+                &[],
+            ),
+        ];
+        let set = prune_superseded(&installed);
+        assert_eq!(set.cpvs, vec!["dev-lang/python-3.10".to_owned()]);
+    }
+
+    #[test]
+    fn build_only_dependency_retained_when_included() {
+        // `app/top` build-depends on `dev-build/cmake`. With the build edge in
+        // the dependency set, cmake is reachable and kept; without it, cmake is
+        // an orphan and removed.
+        let with_build = vec![
+            pkg("app/top-1", "app/top", "0", "1", &["dev-build/cmake"]),
+            pkg("dev-build/cmake-1", "dev-build/cmake", "0", "1", &[]),
+        ];
+        assert!(depclean_orphans(&with_build, &roots(&["app/top"])).is_empty());
+
+        let without_build = vec![
+            pkg("app/top-1", "app/top", "0", "1", &[]),
+            pkg("dev-build/cmake-1", "dev-build/cmake", "0", "1", &[]),
+        ];
+        let set = depclean_orphans(&without_build, &roots(&["app/top"]));
+        assert_eq!(set.cpvs, vec!["dev-build/cmake-1".to_owned()]);
+    }
+
+    #[test]
+    fn targeted_depclean_removes_named_protects_unmatched() {
+        let installed = vec![
+            pkg("app/named-1", "app/named", "0", "1", &[]),
+            pkg("misc/orphan-1", "misc/orphan", "0", "1", &[]),
+        ];
+        let targets = roots(&["app/named"]);
+        let set = depclean_targeted(&installed, &roots(&[]), &targets);
+        // The named package is removed; the unmatched orphan is protected.
+        assert_eq!(set.cpvs, vec!["app/named-1".to_owned()]);
+    }
+
+    #[test]
+    fn targeted_depclean_keeps_named_still_required() {
+        let installed = vec![
+            pkg("app/top-1", "app/top", "0", "1", &["lib/dep"]),
+            pkg("lib/dep-1", "lib/dep", "0", "1", &[]),
+        ];
+        // `lib/dep` is named but `app/top` (unmatched, protected) still requires
+        // it, so it is not removed.
+        let targets = roots(&["lib/dep"]);
+        let set = depclean_targeted(&installed, &roots(&["app/top"]), &targets);
+        assert!(set.is_empty());
     }
 
     #[test]

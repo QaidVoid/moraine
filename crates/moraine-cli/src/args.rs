@@ -119,6 +119,12 @@ pub struct Cli {
     #[arg(long = "ignore-default-opts")]
     pub ignore_default_opts: bool,
 
+    /// Control whether build-time dependencies are considered during removal.
+    /// Only the value `n` is removal-relevant: it excludes DEPEND and BDEPEND
+    /// from depclean and prune reachability, matching `emerge --with-bdeps=n`.
+    #[arg(long, value_name = "y|n|auto")]
+    pub with_bdeps: Option<String>,
+
     /// Emit a per-phase resolution timing breakdown.
     #[arg(long)]
     pub timing: bool,

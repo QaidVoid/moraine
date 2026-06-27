@@ -72,7 +72,7 @@ fn install_then_unmerge_round_trip() {
 
     let mut task = InstallTask::merge("app-misc/hello-1.0", "app-misc/hello", "0");
     task.source = SourceKind::Binary;
-    task.in_world = true;
+    task.world_atom = Some("app-misc/hello".to_owned());
     let report = engine.run(&Transaction::new(vec![task])).unwrap();
     assert_eq!(report.applied.len(), 1);
 

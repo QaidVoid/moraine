@@ -218,8 +218,8 @@ impl MergeEngine {
         }
 
         // World update happens only after the record is committed.
-        if op.in_world {
-            self.add_to_world(&op.state.category, &op.state.package)?;
+        if let Some(atom) = &op.world_atom {
+            self.add_to_world(atom)?;
         }
 
         // Commit point reached: clear the in-progress marker.
@@ -366,12 +366,13 @@ impl MergeEngine {
         Ok(Some(marker))
     }
 
-    /// Add `category/package` to the world file, keeping it sorted and unique.
-    fn add_to_world(&self, category: &str, package: &str) -> Result<(), MergeError> {
-        let cp = format!("{category}/{package}");
+    /// Add the resolved world `atom` to the world file, keeping it sorted and
+    /// unique. The atom is written verbatim, so a slot-qualified (`cp:slot`) or
+    /// repo-qualified (`::repo`) atom round-trips.
+    fn add_to_world(&self, atom: &str) -> Result<(), MergeError> {
         let path = self.ctx.world_file();
         let mut set = read_world(&path)?;
-        set.insert(cp);
+        set.insert(atom.to_owned());
         write_world(&path, &set)
     }
 

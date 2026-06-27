@@ -11,10 +11,11 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, Result, miette};
+use moraine_atom::{Atom, PackageRef};
 use moraine_install::{
-    BinpkgRunner, EngineApplier, InstallTask, LocalPkgdir, PendingUpdate, Realized, Resolution,
-    StepRunner, Transaction, TransactionEngine, depclean_orphans, prune_superseded, resolve_update,
-    would_break_retained,
+    BinpkgRunner, EngineApplier, InstallTask, InstalledPackage, LocalPkgdir, PendingUpdate,
+    Realized, Resolution, StepRunner, Transaction, TransactionEngine, WorldUpdate,
+    depclean_orphans, depclean_targeted, prune_superseded, resolve_update, would_break_retained,
 };
 use moraine_merge::{ConfigProtect, Features, MergeContext};
 use moraine_vdb::record::DependKind;
@@ -43,7 +44,11 @@ struct Installed {
     cp: String,
     slot: String,
     version: Version,
+    /// The `category/package` of each runtime dependency (RDEPEND, PDEPEND,
+    /// IDEPEND).
     runtime_deps: Vec<String>,
+    /// The `category/package` of each build dependency (DEPEND, BDEPEND).
+    build_deps: Vec<String>,
 }
 
 /// The live-system roots the write actions operate against.
@@ -201,9 +206,19 @@ fn read_installed(vdb_dir: &Path) -> Result<Vec<Installed>> {
             .map(|s| s.to_string())
             .unwrap_or_default();
         let mut runtime_deps = Vec::new();
-        for kind in [DependKind::RDepend, DependKind::PDepend] {
+        for kind in [
+            DependKind::RDepend,
+            DependKind::PDepend,
+            DependKind::IDepend,
+        ] {
             if let Some(dep) = record.depends.get(kind) {
                 runtime_deps.extend(dep_cps(&dep.raw));
+            }
+        }
+        let mut build_deps = Vec::new();
+        for kind in [DependKind::Depend, DependKind::BDepend] {
+            if let Some(dep) = record.depends.get(kind) {
+                build_deps.extend(dep_cps(&dep.raw));
             }
         }
         out.push(Installed {
@@ -212,27 +227,32 @@ fn read_installed(vdb_dir: &Path) -> Result<Vec<Installed>> {
             slot,
             version: record.version.clone(),
             runtime_deps,
+            build_deps,
         });
     }
     Ok(out)
 }
 
 /// Run a removal transaction over the given uninstall tasks.
-fn run_removal(cli: &Cli, ctx: &ConfigContext, wr: &WriteRoots, cpvs: &[String]) -> Result<()> {
+///
+/// Returns `true` only when packages were actually unmerged, that is not under
+/// `--pretend`, not cancelled, and not an empty set. The caller uses this to
+/// gate the world-set deselection.
+fn run_removal(cli: &Cli, ctx: &ConfigContext, wr: &WriteRoots, cpvs: &[String]) -> Result<bool> {
     if cpvs.is_empty() {
         println!("Nothing to remove.");
-        return Ok(());
+        return Ok(false);
     }
     println!("The following packages would be unmerged:");
     for cpv in cpvs {
         println!("  {cpv}");
     }
     if cli.pretend {
-        return Ok(());
+        return Ok(false);
     }
     if !confirm(cli.ask) {
         println!("Operation cancelled.");
-        return Ok(());
+        return Ok(false);
     }
 
     let tasks: Vec<InstallTask> = cpvs
@@ -252,7 +272,7 @@ fn run_removal(cli: &Cli, ctx: &ConfigContext, wr: &WriteRoots, cpvs: &[String])
         .run(&Transaction::new(tasks))
         .map_err(|e| miette!("unmerge failed: {e}"))?;
     println!("Removed {} package(s).", cpvs.len());
-    Ok(())
+    Ok(true)
 }
 
 /// Resume the unfinished portion of the most recent transaction.
@@ -279,43 +299,69 @@ pub fn resume(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
 }
 
 /// Unmerge explicitly named packages.
+///
+/// Each target is parsed as a precise atom and matched against the installed
+/// records, honoring the version operator, version, and slot, so `=cat/pkg-1.2`
+/// removes only that version and `cat/pkg:2` removes only slot `2`, while a bare
+/// `cat/pkg` still matches every installed version. Mirrors Portage's
+/// `vartree.dbapi.match` selection.
 pub fn unmerge(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let wr = WriteRoots::from(roots);
-    let installed = read_installed(&wr.vdb_dir)?;
-    let wanted: BTreeSet<String> = cli.targets.iter().map(|t| cp_of_atom(t)).collect();
-    let matched: Vec<String> = installed
+    let store = load_installed_store(&wr.vdb_dir)?;
+    let interner = store.interner();
+    // Parse each target against the store interner so its symbols compare equal
+    // to the records'.
+    let atoms: Vec<Atom> = cli
+        .targets
         .iter()
-        .filter(|p| wanted.contains(&p.cp))
-        .map(|p| p.cpv.clone())
+        .filter_map(|t| Atom::parse(t, moraine_eapi::PERMISSIVE, interner).ok())
+        .collect();
+    let matched: Vec<String> = store
+        .records()
+        .iter()
+        .filter(|record| {
+            let pref = PackageRef {
+                category: record.category,
+                package: record.package,
+                version: &record.version,
+                slot: Some(record.slot.slot),
+                subslot: record.slot.subslot,
+                repo: record.repository,
+            };
+            atoms.iter().any(|atom| atom.matches(&pref))
+        })
+        .map(|record| record.cpv(interner))
         .collect();
     if matched.is_empty() {
         println!("No installed packages matched.");
         return Ok(());
     }
-    run_removal(cli, ctx, &wr, &matched)
+    run_removal(cli, ctx, &wr, &matched)?;
+    Ok(())
 }
 
 /// Remove packages not needed by the world or system sets.
+///
+/// Reachability spans each retained package's runtime and build dependencies by
+/// default; `--with-bdeps=n` excludes the build dependencies. When target atoms
+/// are named, removal is restricted to the named `category/package` keys and
+/// every unmatched installed package is protected.
 pub fn depclean(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let wr = WriteRoots::from(roots);
     let installed = read_installed(&wr.vdb_dir)?;
-    let pkgs: Vec<moraine_install::InstalledPackage> = installed
-        .iter()
-        .map(|p| moraine_install::InstalledPackage {
-            cpv: p.cpv.clone(),
-            cp: p.cp.clone(),
-            slot: p.slot.clone(),
-            version: p.version.clone(),
-            deps: p.runtime_deps.clone(),
-        })
-        .collect();
+    let pkgs = installed_packages(&installed, with_bdeps(cli));
     let roots_set: BTreeSet<String> = ctx
         .world
         .iter()
         .chain(ctx.system.iter())
         .map(|a| cp_of_atom(a))
         .collect();
-    let orphans = depclean_orphans(&pkgs, &roots_set);
+    let orphans = if cli.targets.is_empty() {
+        depclean_orphans(&pkgs, &roots_set)
+    } else {
+        let targets: BTreeSet<String> = cli.targets.iter().map(|t| cp_of_atom(t)).collect();
+        depclean_targeted(&pkgs, &roots_set, &targets)
+    };
 
     let removed: BTreeSet<String> = orphans.cpvs.iter().cloned().collect();
     if would_break_retained(&pkgs, &removed) {
@@ -323,25 +369,98 @@ pub fn depclean(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
             "refusing depclean: removal would leave a retained package unsatisfied"
         ));
     }
-    run_removal(cli, ctx, &wr, &orphans.cpvs)
+    if run_removal(cli, ctx, &wr, &orphans.cpvs)? {
+        deselect_removed(&wr, &pkgs, &orphans.cpvs)?;
+    }
+    Ok(())
 }
 
-/// Remove installed versions superseded within a slot.
+/// Remove installed versions superseded by a higher version of the same
+/// `category/package`, keeping the single highest version across all slots.
 pub fn prune(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let wr = WriteRoots::from(roots);
     let installed = read_installed(&wr.vdb_dir)?;
-    let pkgs: Vec<moraine_install::InstalledPackage> = installed
-        .iter()
-        .map(|p| moraine_install::InstalledPackage {
-            cpv: p.cpv.clone(),
-            cp: p.cp.clone(),
-            slot: p.slot.clone(),
-            version: p.version.clone(),
-            deps: p.runtime_deps.clone(),
+    let pkgs = installed_packages(&installed, with_bdeps(cli));
+    let superseded = prune_superseded(&pkgs);
+    // Keep any lower version whose removal would leave a retained package with an
+    // unsatisfied dependency.
+    let to_remove: Vec<String> = superseded
+        .cpvs
+        .into_iter()
+        .filter(|cpv| {
+            let one: BTreeSet<String> = std::iter::once(cpv.clone()).collect();
+            !would_break_retained(&pkgs, &one)
         })
         .collect();
-    let superseded = prune_superseded(&pkgs);
-    run_removal(cli, ctx, &wr, &superseded.cpvs)
+    if run_removal(cli, ctx, &wr, &to_remove)? {
+        deselect_removed(&wr, &pkgs, &to_remove)?;
+    }
+    Ok(())
+}
+
+/// Whether build-time dependencies are considered during removal. They are by
+/// default and excluded only by `--with-bdeps=n`, matching Portage's
+/// `bdeps=auto` for the removal actions.
+fn with_bdeps(cli: &Cli) -> bool {
+    cli.with_bdeps.as_deref() != Some("n")
+}
+
+/// Map the installed packages into the removal planner's model, building each
+/// package's dependency set from its runtime dependencies plus, unless excluded,
+/// its build dependencies.
+fn installed_packages(installed: &[Installed], with_bdeps: bool) -> Vec<InstalledPackage> {
+    installed
+        .iter()
+        .map(|p| {
+            let mut deps = p.runtime_deps.clone();
+            if with_bdeps {
+                deps.extend(p.build_deps.iter().cloned());
+            }
+            InstalledPackage {
+                cpv: p.cpv.clone(),
+                cp: p.cp.clone(),
+                slot: p.slot.clone(),
+                version: p.version.clone(),
+                deps,
+            }
+        })
+        .collect()
+}
+
+/// Deselect from the world set each removed package's `category/package` that has
+/// no surviving installed version, mirroring `cleanPackage`. A pruned lower
+/// version is never deselected because its higher version survives.
+fn deselect_removed(wr: &WriteRoots, pkgs: &[InstalledPackage], removed: &[String]) -> Result<()> {
+    let remove = world_deselect(pkgs, removed);
+    if remove.is_empty() {
+        return Ok(());
+    }
+    WorldUpdate {
+        add: Vec::new(),
+        remove,
+    }
+    .apply(&wr.state_dir.join("world"), false)
+    .map_err(|e| miette!("world update failed: {e}"))?;
+    Ok(())
+}
+
+/// The `category/package` keys to drop from the world set after a removal: each
+/// removed package's key that has no surviving installed version.
+fn world_deselect(pkgs: &[InstalledPackage], removed: &[String]) -> Vec<String> {
+    let removed_set: BTreeSet<&str> = removed.iter().map(String::as_str).collect();
+    let surviving: BTreeSet<&str> = pkgs
+        .iter()
+        .filter(|p| !removed_set.contains(p.cpv.as_str()))
+        .map(|p| p.cp.as_str())
+        .collect();
+    let mut out: Vec<String> = pkgs
+        .iter()
+        .filter(|p| removed_set.contains(p.cpv.as_str()) && !surviving.contains(p.cp.as_str()))
+        .map(|p| p.cp.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Resolve pending CONFIG_PROTECT updates left under the live root.
@@ -696,6 +815,26 @@ mod tests {
         assert_eq!(slot_of("cat/a-1"), "5");
         // `cat/b-1` was served from the cache, not re-imported.
         assert_eq!(slot_of("cat/b-1"), "0");
+    }
+
+    #[test]
+    fn world_deselect_drops_sole_version_keeps_surviving() {
+        let mk = |cpv: &str, cp: &str, ver: &str| InstalledPackage {
+            cpv: cpv.to_owned(),
+            cp: cp.to_owned(),
+            slot: "0".to_owned(),
+            version: Version::parse(ver).unwrap(),
+            deps: Vec::new(),
+        };
+        let pkgs = vec![
+            mk("dev-lang/python-3.10", "dev-lang/python", "3.10"),
+            mk("dev-lang/python-3.11", "dev-lang/python", "3.11"),
+            mk("app/sole-1", "app/sole", "1"),
+        ];
+        // Removing the sole version of `app/sole` deselects it; removing the
+        // lower python slot does not, because a higher version survives.
+        let removed = vec!["app/sole-1".to_owned(), "dev-lang/python-3.10".to_owned()];
+        assert_eq!(world_deselect(&pkgs, &removed), vec!["app/sole".to_owned()]);
     }
 
     #[test]

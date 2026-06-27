@@ -50,7 +50,7 @@ impl StepRunner for FakeRunner {
             image_dir: std::path::PathBuf::from("/nonexistent"),
             state: state_for(&task.cpv, &task.cp, &task.slot),
             replaces: task.replaces.clone(),
-            in_world: task.in_world,
+            world_atom: task.world_atom.clone(),
             elog: Vec::new(),
             ebuild: None,
         };
@@ -223,7 +223,7 @@ fn resume_without_journal_is_a_noop() {
 fn world_additions_track_explicit_targets() {
     let dir = tempfile::tempdir().unwrap();
     let mut tasks = tx();
-    tasks.tasks[0].in_world = true;
+    tasks.tasks[0].world_atom = Some("app/a".to_owned());
     let runner = FakeRunner::new();
     let applier = FakeApplier::new();
     let engine = TransactionEngine::new(&runner, &applier, dir.path());

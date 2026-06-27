@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 
 use moraine_binpkg::greenfield::WriteOptions;
 use moraine_binpkg::{MetadataMap, read_package_with_policy};
-use moraine_build::{BuildOutcome, BuildRequest, CommandRunner, QueryRoot, VersionQuery, build_package};
+use moraine_build::{
+    BuildOutcome, BuildRequest, CommandRunner, QueryRoot, VersionQuery, build_package,
+};
 use moraine_merge::state::PackageState;
 use moraine_merge::{MergeOp, Operation};
 use moraine_vdb::record::PackageRecord;
@@ -329,12 +331,13 @@ impl<'r, P: BuildPlanner, R: CommandRunner> SourceRunner<'r, P, R> {
 impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
     fn realize(&self, task: &InstallTask) -> Result<Realized> {
         let request = self.planner.plan(task)?;
-        let outcome = build_package(&request, self.runner, Some(self.version_query)).map_err(|e| {
-            InstallError::Realize {
-                cpv: task.cpv.clone(),
-                reason: format!("build failed: {e}"),
-            }
-        })?;
+        let outcome =
+            build_package(&request, self.runner, Some(self.version_query)).map_err(|e| {
+                InstallError::Realize {
+                    cpv: task.cpv.clone(),
+                    reason: format!("build failed: {e}"),
+                }
+            })?;
 
         // Scan the staged image and read BUILD_TIME once, feeding both the binary
         // package metadata and the recorded installed state.
@@ -382,7 +385,7 @@ impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
             image_dir: outcome.image_dir,
             state,
             replaces: task.replaces.clone(),
-            in_world: task.in_world,
+            world_atom: task.world_atom.clone(),
             elog,
             ebuild,
         };
@@ -660,7 +663,7 @@ pub fn realize_binpkg(
         image_dir,
         state,
         replaces: task.replaces.clone(),
-        in_world: task.in_world,
+        world_atom: task.world_atom.clone(),
         // A binary package's stored build-time elog is not yet surfaced here.
         elog: Vec::new(),
         // The ebuild copy from the binpkg is not surfaced on this path yet.
@@ -857,14 +860,14 @@ mod tests {
         let task = {
             let mut t = InstallTask::merge("app/foo-1.2", "app/foo", "0");
             t.source = SourceKind::Binary;
-            t.in_world = true;
+            t.world_atom = Some("app/foo".to_owned());
             t
         };
         let realized = realize_binpkg(&bytes, &task, dir.path(), None, Default::default()).unwrap();
         let Realized::Apply(Operation::Merge(op)) = realized else {
             panic!("expected a merge op");
         };
-        assert!(op.in_world);
+        assert_eq!(op.world_atom.as_deref(), Some("app/foo"));
         assert_eq!(op.state.version, "1.2");
         assert_eq!(
             op.state.use_flags,

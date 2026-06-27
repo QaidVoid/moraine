@@ -41,7 +41,8 @@ pub use realize::{
     SourceRunner, StoreVersionQuery, locate_local_gpkg, realize_binpkg,
 };
 pub use remove::{
-    InstalledPackage, RemovalSet, depclean_orphans, prune_superseded, would_break_retained,
+    InstalledPackage, RemovalSet, depclean_orphans, depclean_targeted, prune_superseded,
+    would_break_retained,
 };
 pub use step::{Applier, StepRunner};
 pub use task::{InstallTask, Realized, SourceKind, TaskKind, Transaction};

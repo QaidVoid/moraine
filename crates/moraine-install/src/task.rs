@@ -39,8 +39,10 @@ pub struct InstallTask {
     pub kind: TaskKind,
     /// For a merge, where the image comes from.
     pub source: SourceKind,
-    /// Whether this package was explicitly requested and so joins `@world`.
-    pub in_world: bool,
+    /// The resolved world atom to record when the package joins `@world`, or
+    /// `None` when it does not (a dependency, a `--oneshot` target, or an
+    /// unslotted system member).
+    pub world_atom: Option<String>,
     /// The `category/package-version` of a prior version replaced in the same
     /// slot, if any.
     pub replaces: Option<String>,
@@ -55,7 +57,7 @@ impl InstallTask {
             slot: slot.into(),
             kind: TaskKind::Merge,
             source: SourceKind::Source,
-            in_world: false,
+            world_atom: None,
             replaces: None,
         }
     }
@@ -72,7 +74,7 @@ impl InstallTask {
             slot: slot.into(),
             kind: TaskKind::Uninstall,
             source: SourceKind::Source,
-            in_world: false,
+            world_atom: None,
             replaces: None,
         }
     }

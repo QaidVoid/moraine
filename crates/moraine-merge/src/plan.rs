@@ -37,8 +37,10 @@ pub struct MergeOp {
     /// The `category/package-version` of a prior version being replaced in the
     /// same slot, if this merge replaces one.
     pub replaces: Option<String>,
-    /// Whether the package was explicitly requested and so joins `@world`.
-    pub in_world: bool,
+    /// The resolved world atom to record when the package joins `@world`, or
+    /// `None` when it does not. Carries a slot-qualified (`cp:slot`) or
+    /// repo-qualified (`::repo`) atom when the request was that precise.
+    pub world_atom: Option<String>,
     /// The build-time elog messages to carry into the post-merge report.
     pub elog: Vec<crate::state::ElogRecord>,
     /// The ebuild source bytes to copy into the dbdir as `<PF>.ebuild`, when
