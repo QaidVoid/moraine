@@ -33,6 +33,7 @@ pub mod env;
 pub mod error;
 pub mod fetch;
 pub mod ipc;
+pub mod isolation;
 pub mod layout;
 pub mod manifest;
 pub mod metadata;
@@ -55,6 +56,7 @@ pub use fetch::{
     CustomMirrors, FetchConfig, FetchStatus, FetchedFile, Fetcher, MirrorLayout, RestrictFlags,
 };
 pub use ipc::{IpcHandler, Query, QueryRoot, Response as IpcResponse, VersionQuery};
+pub use isolation::{Isolation, PrivilegeDrop};
 pub use layout::BuildLayout;
 pub use manifest::{Manifest, ManifestType, VerifyOutcome, verify_package};
 pub use metadata::BuildInfo;
@@ -213,6 +215,13 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
         pkg.restrict.iter().map(String::as_str),
         request.namespace_support,
     );
+    // PROPERTIES drives the network exemption (`live` unpack, `test_network`
+    // test); it comes from the USE-conditional-reduced metadata.
+    let properties: Vec<String> = pkg
+        .reduced_meta
+        .get("PROPERTIES")
+        .map(|p| p.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
     let driver = PhaseDriver::new(
         runner,
         &env,
@@ -222,6 +231,7 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
         &pkg.ebuild_path,
         pkg.defined_phases.clone(),
         request.run_tests,
+        properties,
         None,
     );
 

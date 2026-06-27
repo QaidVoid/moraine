@@ -58,6 +58,8 @@ pub fn generate_metadata<R: CommandRunner>(
         // Capture stdout directly rather than into a log file so the tagged
         // metadata lines can be parsed.
         log_path: None,
+        // Metadata generation runs no build phase, so it needs no isolation.
+        isolation: crate::isolation::Isolation::default(),
     };
 
     let output = runner

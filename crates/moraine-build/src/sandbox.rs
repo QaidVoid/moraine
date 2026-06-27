@@ -169,12 +169,13 @@ impl SandboxSelector {
         let mut wrapper = Vec::new();
         let mut sandbox_vars = Vec::new();
 
-        // Privilege mode.
+        // Privilege mode. `fakeroot` is enforced through the wrapper command, so
+        // it is reported at plan time; `userpriv` is reported only once the
+        // runner confirms the privilege drop, so it is not pushed here.
         let privilege = if is_install && self.use_fakeroot {
             applied.push("fakeroot".to_string());
             PrivilegeMode::Fakeroot
         } else if self.use_userpriv {
-            applied.push("userpriv".to_string());
             PrivilegeMode::UserPriv
         } else {
             PrivilegeMode::Direct
@@ -211,11 +212,12 @@ impl SandboxSelector {
             && !self.restrict_network_sandbox
             && self.support.network;
 
-        // Namespace selection.
+        // Namespace selection. The namespaces are computed here but reported as
+        // applied only after the runner confirms the unshare, so they are not
+        // pushed into `applied_features` at plan time.
         let mut namespaces = Vec::new();
         if network_isolated {
             namespaces.push(Namespace::Network);
-            applied.push("network-sandbox".to_string());
         }
         for (enabled, ns) in [
             (self.mount_sandbox, Namespace::Mount),
@@ -224,7 +226,6 @@ impl SandboxSelector {
         ] {
             if enabled && self.support.supports(ns) {
                 namespaces.push(ns);
-                applied.push(ns.feature().to_string());
             }
         }
 
@@ -294,7 +295,8 @@ mod tests {
             SandboxSelector::from_config(&cfg(&["userpriv"]), [], NamespaceSupport::default());
         let plan = sel.plan(PhaseKind::SrcCompile, &root(), false);
         assert_eq!(plan.privilege, PrivilegeMode::UserPriv);
-        assert!(plan.applied_features.contains(&"userpriv".to_string()));
+        // `userpriv` is reported as applied only by the runner, not at plan time.
+        assert!(!plan.applied_features.contains(&"userpriv".to_string()));
     }
 
     #[test]

@@ -778,11 +778,74 @@ __eapi8_src_prepare() {
 # These call the moraine IPC helper, which writes a request to the FIFO under
 # .ipc and reads the response. The Rust manager answers from the installed store
 # and repository. The helper path is exported by the driver as MORAINE_IPC_HELPER.
+# The request is "<op> <root> <atom> <USE...>"; the caller USE lets the manager
+# evaluate USE-conditional dependencies in the atom. This mirrors
+# ___best_version_and_has_version_common in stock Portage.
+
+___moraine_best_version_and_has_version_common() {
+    local atom root root_arg
+
+    case $1 in
+        --host-root|-r|-d|-b)
+            root_arg=$1
+            shift ;;
+    esac
+    atom=$1
+    shift
+    [[ $# -gt 0 ]] && die "${FUNCNAME[1]}: unused argument(s): $*"
+
+    case ${root_arg} in
+        "")
+            if ___eapi_has_prefix_variables; then
+                root=${ROOT%/}/${EPREFIX#/}
+            else
+                root=${ROOT}
+            fi ;;
+        --host-root)
+            if ! ___eapi_best_version_and_has_version_support_--host-root; then
+                die "${FUNCNAME[1]}: option ${root_arg} is not supported with EAPI ${EAPI}"
+            fi
+            if ___eapi_has_prefix_variables; then
+                root=/${BROOT#/}
+            else
+                root=/
+            fi ;;
+        -r|-d|-b)
+            if ! ___eapi_best_version_and_has_version_support_-b_-d_-r; then
+                die "${FUNCNAME[1]}: option ${root_arg} is not supported with EAPI ${EAPI}"
+            fi
+            if ___eapi_has_prefix_variables; then
+                case ${root_arg} in
+                    -r) root=${ROOT%/}/${EPREFIX#/} ;;
+                    -d) root=${ESYSROOT:-/} ;;
+                    -b) root=/${BROOT#/} ;;
+                esac
+            else
+                case ${root_arg} in
+                    -r) root=${ROOT:-/} ;;
+                    -d) root=${SYSROOT:-/} ;;
+                    -b) root=/ ;;
+                esac
+            fi ;;
+    esac
+
+    "${MORAINE_IPC_HELPER}" "${FUNCNAME[1]}" "${root}" "${atom}" ${USE}
+    local retval=$?
+
+    case "${retval}" in
+        0|1)
+            return ${retval} ;;
+        2)
+            die "${FUNCNAME[1]}: invalid atom: ${atom}" ;;
+        *)
+            die "${FUNCNAME[1]}: unexpected helper exit code: ${retval}" ;;
+    esac
+}
 
 has_version() {
-    "${MORAINE_IPC_HELPER}" has_version "$@"
+    ___moraine_best_version_and_has_version_common "$@"
 }
 
 best_version() {
-    "${MORAINE_IPC_HELPER}" best_version "$@"
+    ___moraine_best_version_and_has_version_common "$@"
 }

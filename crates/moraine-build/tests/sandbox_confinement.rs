@@ -52,3 +52,23 @@ fn real_sandbox_denies_out_of_tree_write() {
     // for that lives with the corpus fixtures; this test is the seam.
     eprintln!("MORAINE_CORPUS set: real sandbox confinement would be exercised here");
 }
+
+#[test]
+fn real_namespace_and_userpriv_enforcement() {
+    if std::env::var_os("MORAINE_CORPUS").is_none() {
+        // No real enforcement assertion without the corpus opt-in.
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if !rustix::process::getuid().is_root() {
+        // Unsharing namespaces and dropping to the build user needs root.
+        eprintln!("MORAINE_CORPUS set but not root: skipping enforcement assertion");
+        return;
+    }
+    // With MORAINE_CORPUS set and running as root, a real run would build a
+    // package with FEATURES="network-sandbox userpriv" and assert the phase
+    // executes in an unshared network namespace as the build user, and that a
+    // src_test without PROPERTIES=test_network has no network access. The corpus
+    // fixtures drive that end to end; this test is the seam.
+    eprintln!("MORAINE_CORPUS set: real namespace/userpriv enforcement would be exercised here");
+}

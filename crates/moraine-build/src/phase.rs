@@ -16,9 +16,10 @@ use tracing::{info, instrument};
 use crate::bashlib::{self, PhaseLibrary};
 use crate::env::{EnvBuilder, filter_saved_env};
 use crate::error::{BuildError, PhaseKind, Result};
+use crate::isolation::{Isolation, PrivilegeDrop, resolve_build_user};
 use crate::layout::BuildLayout;
 use crate::runner::{CommandOutput, CommandRunner, CommandSpec};
-use crate::sandbox::{SandboxPlan, SandboxSelector};
+use crate::sandbox::{PrivilegeMode, SandboxPlan, SandboxSelector};
 
 /// The severity of a captured elog message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +115,9 @@ pub struct PhaseDriver<'a, R: CommandRunner> {
     ebuild_path: PathBuf,
     defined_phases: Vec<String>,
     run_tests: bool,
+    properties: Vec<String>,
     ipc_helper: Option<PathBuf>,
+    userpriv_target: Option<PrivilegeDrop>,
 }
 
 impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
@@ -122,8 +125,15 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
     ///
     /// `defined_phases` is the package's `DEFINED_PHASES` token list (short
     /// names like `compile`). `run_tests` controls whether `src_test` runs.
-    /// `ipc_helper`, when set, is the path the bash helper invokes for version
-    /// queries and is exported as `MORAINE_IPC_HELPER`.
+    /// `properties` is the package's `PROPERTIES` token list, consulted for the
+    /// network exemption (`live` unpack, `test_network` test). `ipc_helper`, when
+    /// set, is the path the bash helper invokes for version queries and is
+    /// exported as `MORAINE_IPC_HELPER`.
+    ///
+    /// The build-user privilege drop target for `userpriv` is resolved here, in
+    /// the parent, only when the engine runs as root: the configured
+    /// `PORTAGE_USERNAME`/`PORTAGE_GRPNAME` (default `portage`) are looked up in
+    /// the local `/etc/passwd` and `/etc/group`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         runner: &'a R,
@@ -134,8 +144,10 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
         ebuild_path: impl Into<PathBuf>,
         defined_phases: Vec<String>,
         run_tests: bool,
+        properties: Vec<String>,
         ipc_helper: Option<PathBuf>,
     ) -> Self {
+        let userpriv_target = resolve_userpriv_target(env);
         PhaseDriver {
             runner,
             env,
@@ -145,7 +157,9 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
             ebuild_path: ebuild_path.into(),
             defined_phases,
             run_tests,
+            properties,
             ipc_helper,
+            userpriv_target,
         }
     }
 
@@ -200,9 +214,16 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
     }
 
     /// Whether a phase needs network access (so the network sandbox exempts it).
+    ///
+    /// Mirrors `doebuild`: `src_unpack` is exempt only when `PROPERTIES`
+    /// contains `live`, `src_test` only when `PROPERTIES` contains
+    /// `test_network`, and every other phase is isolated.
     fn network_needed(&self, phase: PhaseKind) -> bool {
-        // src_unpack may fetch live sources; src_test commonly needs the network.
-        matches!(phase, PhaseKind::SrcUnpack | PhaseKind::SrcTest)
+        match phase {
+            PhaseKind::SrcUnpack => self.properties.iter().any(|p| p == "live"),
+            PhaseKind::SrcTest => self.properties.iter().any(|p| p == "test_network"),
+            _ => false,
+        }
     }
 
     /// Run all phases in order, carrying state forward and capturing logs.
@@ -266,12 +287,21 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
 
         let new_carried = self.read_saved_env(carried)?;
         info!(phase = %phase, "phase completed");
+        // Report the wrapper-level features from the plan merged with the
+        // isolation the runner actually enforced, so `applied_features` reflects
+        // only what was applied.
+        let mut applied_features = plan.applied_features.clone();
+        for token in &output.applied_isolation {
+            if !applied_features.contains(token) {
+                applied_features.push(token.clone());
+            }
+        }
         Ok((
             PhaseRun {
                 phase,
                 invoked: true,
                 status: Some(output.status),
-                applied_features: plan.applied_features.clone(),
+                applied_features,
             },
             new_carried,
         ))
@@ -317,12 +347,25 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
         args.push("-c".to_string());
         args.push(script);
 
+        // The isolation the runner enforces in the child: the planned namespaces
+        // plus the build-user drop when `userpriv` is selected and enforceable.
+        let privilege = if plan.privilege == PrivilegeMode::UserPriv {
+            self.userpriv_target.clone()
+        } else {
+            None
+        };
+        let isolation = Isolation {
+            namespaces: plan.namespaces.clone(),
+            privilege,
+        };
+
         Ok(CommandSpec {
             program,
             args,
             env,
             cwd: self.layout.workdir.clone(),
             log_path: Some(self.layout.build_log.clone()),
+            isolation,
         })
     }
 
@@ -436,6 +479,29 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
         }
         Ok(())
     }
+}
+
+/// Resolve the `userpriv` build-user drop target from the configured
+/// `PORTAGE_USERNAME`/`PORTAGE_GRPNAME`, only when the engine runs as root.
+///
+/// When not root the privilege drop is a no-op and `userpriv` is not reported as
+/// applied, matching Portage's `uid == 0` guard. Returns `None` when not root or
+/// when the build user cannot be resolved.
+fn resolve_userpriv_target(env: &EnvBuilder) -> Option<PrivilegeDrop> {
+    #[cfg(target_os = "linux")]
+    if !rustix::process::getuid().is_root() {
+        return None;
+    }
+    let vars = &env.config().vars;
+    let username = vars
+        .get("PORTAGE_USERNAME")
+        .map(String::as_str)
+        .unwrap_or("portage");
+    let groupname = vars
+        .get("PORTAGE_GRPNAME")
+        .map(String::as_str)
+        .unwrap_or("portage");
+    resolve_build_user(username, groupname)
 }
 
 /// Quote a string for safe inclusion in a single-quoted bash context.
@@ -566,6 +632,7 @@ mod tests {
             &fx.ebuild,
             defined,
             false,
+            Vec::new(),
             None,
         );
         let report = driver.run_all().unwrap();
@@ -599,6 +666,7 @@ mod tests {
             &fx.ebuild,
             vec!["prepare".into(), "configure".into(), "compile".into()],
             false,
+            Vec::new(),
             None,
         );
         let report = driver.run_all().unwrap();
@@ -626,6 +694,7 @@ mod tests {
             &fx.ebuild,
             vec!["compile".into()],
             false,
+            Vec::new(),
             None,
         );
         let report = driver.run_all().unwrap();
@@ -657,6 +726,7 @@ mod tests {
             &fx.ebuild,
             vec!["setup".into(), "compile".into()],
             false,
+            Vec::new(),
             None,
         );
         let err = driver.run_all();
@@ -684,6 +754,7 @@ mod tests {
             &fx.ebuild,
             vec!["compile".into()],
             false,
+            Vec::new(),
             None,
         );
         let report = driver.run_all().unwrap();
@@ -721,6 +792,7 @@ mod tests {
             &fx.ebuild,
             vec!["compile".into()],
             false,
+            Vec::new(),
             None,
         );
         let carried = BTreeMap::new();
@@ -746,6 +818,7 @@ mod tests {
             &fx.ebuild,
             vec!["compile".into()],
             false,
+            Vec::new(),
             None,
         );
         driver.run_all().unwrap();
@@ -760,5 +833,89 @@ mod tests {
         // Sandbox wrapper is the program.
         assert_eq!(compile.program, "sandbox");
         assert!(compile.env.contains_key("SANDBOX_WRITE"));
+    }
+
+    #[test]
+    fn network_needed_follows_properties() {
+        let fx = fixture();
+        let cfg = ConfigEnv::rooted([]);
+        let env = EnvBuilder::new(ident("8"), cfg, &fx.layout).unwrap();
+        let sel = selector(&[]);
+        let runner = FakeRunner::always_ok();
+
+        let make = |props: Vec<String>| {
+            PhaseDriver::new(
+                &runner,
+                &env,
+                &fx.layout,
+                &fx.library,
+                &sel,
+                &fx.ebuild,
+                vec!["compile".into()],
+                false,
+                props,
+                None,
+            )
+        };
+
+        let live = make(vec!["live".into()]);
+        assert!(live.network_needed(PhaseKind::SrcUnpack));
+        assert!(!live.network_needed(PhaseKind::SrcTest));
+
+        let test_net = make(vec!["test_network".into()]);
+        assert!(test_net.network_needed(PhaseKind::SrcTest));
+        assert!(!test_net.network_needed(PhaseKind::SrcUnpack));
+
+        let plain = make(Vec::new());
+        assert!(!plain.network_needed(PhaseKind::SrcUnpack));
+        assert!(!plain.network_needed(PhaseKind::SrcTest));
+        assert!(!plain.network_needed(PhaseKind::SrcCompile));
+    }
+
+    #[test]
+    fn isolation_reaches_command_spec_and_applied_features() {
+        let fx = fixture();
+        let cfg = ConfigEnv::rooted(["mount-sandbox".to_string()]);
+        let env = EnvBuilder::new(ident("8"), cfg, &fx.layout).unwrap();
+        let sel = selector(&["mount-sandbox"]);
+        let runner = FakeRunner::always_ok();
+        let driver = PhaseDriver::new(
+            &runner,
+            &env,
+            &fx.layout,
+            &fx.library,
+            &sel,
+            &fx.ebuild,
+            vec!["compile".into()],
+            false,
+            Vec::new(),
+            None,
+        );
+        let report = driver.run_all().unwrap();
+
+        // The planned namespace reaches the spec the runner received.
+        let calls = runner.calls();
+        let compile = calls
+            .iter()
+            .find(|c| c.args.iter().any(|a| a.contains("src_compile")))
+            .expect("compile call");
+        assert!(
+            compile
+                .isolation
+                .namespaces
+                .contains(&crate::sandbox::Namespace::Mount)
+        );
+
+        // applied_features reflects only the runner-reported enforced isolation.
+        let compile_run = report
+            .runs
+            .iter()
+            .find(|r| r.phase == PhaseKind::SrcCompile && r.invoked)
+            .expect("compile run");
+        assert!(
+            compile_run
+                .applied_features
+                .contains(&"mount-sandbox".to_string())
+        );
     }
 }

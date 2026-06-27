@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::isolation::Isolation;
+
 /// A command to run: a program, its arguments, environment, and working
 /// directory, plus where to direct captured output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,10 +32,13 @@ pub struct CommandSpec {
     /// A file to which combined stdout and stderr are appended, if any. When
     /// `None`, output is captured into [`CommandOutput::stdout`].
     pub log_path: Option<PathBuf>,
+    /// The build isolation to enforce in the spawned child: the namespaces to
+    /// unshare and an optional privilege drop. Empty when no isolation applies.
+    pub isolation: Isolation,
 }
 
 impl CommandSpec {
-    /// Construct a command with empty args, env, and no log.
+    /// Construct a command with empty args, env, no log, and no isolation.
     pub fn new(program: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         CommandSpec {
             program: program.into(),
@@ -41,7 +46,14 @@ impl CommandSpec {
             env: BTreeMap::new(),
             cwd: cwd.into(),
             log_path: None,
+            isolation: Isolation::default(),
         }
+    }
+
+    /// Set the isolation to enforce in the spawned child.
+    pub fn with_isolation(mut self, isolation: Isolation) -> Self {
+        self.isolation = isolation;
+        self
     }
 
     /// Append an argument.
@@ -81,6 +93,10 @@ pub struct CommandOutput {
     /// Captured stdout (and stderr when no log file was given). Empty when a log
     /// file captured the output.
     pub stdout: Vec<u8>,
+    /// The isolation FEATURES the runner actually enforced for this process, as
+    /// the tokens [`Isolation::applied_tokens`] yields. Empty when no isolation
+    /// was requested or it could not be applied.
+    pub applied_isolation: Vec<String>,
 }
 
 impl CommandOutput {
@@ -129,14 +145,34 @@ impl CommandRunner for SystemRunner {
             cmd.env(k, v);
         }
 
+        // Enforce the requested isolation in the forked child before exec. The
+        // isolation is cloned into the closure so it owns the vectors the
+        // async-signal-safe child code iterates. A failure inside the closure
+        // fails the spawn, which surfaces as a `RunError`.
+        let applied = if spec.isolation.is_empty() {
+            Vec::new()
+        } else {
+            use std::os::unix::process::CommandExt as _;
+            let iso = spec.isolation.clone();
+            unsafe {
+                cmd.pre_exec(move || crate::isolation::apply_in_child(&iso));
+            }
+            spec.isolation.applied_tokens()
+        };
+
         match &spec.log_path {
-            Some(path) => run_logged(cmd, &spec.program, path),
-            None => run_captured(cmd, &spec.program),
+            Some(path) => run_logged(cmd, &spec.program, path, applied),
+            None => run_captured(cmd, &spec.program, applied),
         }
     }
 }
 
-fn run_logged(mut cmd: Command, program: &str, log_path: &Path) -> Result<CommandOutput, RunError> {
+fn run_logged(
+    mut cmd: Command,
+    program: &str,
+    log_path: &Path,
+    applied: Vec<String>,
+) -> Result<CommandOutput, RunError> {
     use std::process::Stdio;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -159,10 +195,15 @@ fn run_logged(mut cmd: Command, program: &str, log_path: &Path) -> Result<Comman
     Ok(CommandOutput {
         status: status.code().unwrap_or(-1),
         stdout: Vec::new(),
+        applied_isolation: applied,
     })
 }
 
-fn run_captured(mut cmd: Command, program: &str) -> Result<CommandOutput, RunError> {
+fn run_captured(
+    mut cmd: Command,
+    program: &str,
+    applied: Vec<String>,
+) -> Result<CommandOutput, RunError> {
     let output = cmd.output().map_err(|e| RunError {
         program: program.to_string(),
         reason: e.to_string(),
@@ -172,6 +213,7 @@ fn run_captured(mut cmd: Command, program: &str) -> Result<CommandOutput, RunErr
     Ok(CommandOutput {
         status: output.status.code().unwrap_or(-1),
         stdout,
+        applied_isolation: applied,
     })
 }
 
@@ -242,6 +284,9 @@ pub mod testing {
     impl CommandRunner for FakeRunner {
         fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, RunError> {
             self.calls.lock().unwrap().push(spec.clone());
+            // The fake echoes the requested isolation as applied, so tests can
+            // assert the plan-to-spec wiring without root.
+            let applied = spec.isolation.applied_tokens();
             let mut responses = self.responses.lock().unwrap();
             let response = if responses.is_empty() {
                 Response::Output {
@@ -270,11 +315,13 @@ pub mod testing {
                         Ok(CommandOutput {
                             status,
                             stdout: Vec::new(),
+                            applied_isolation: applied,
                         })
                     } else {
                         Ok(CommandOutput {
                             status,
                             stdout: bytes,
+                            applied_isolation: applied,
                         })
                     }
                 }
@@ -293,6 +340,7 @@ pub mod testing {
                     Ok(CommandOutput {
                         status,
                         stdout: Vec::new(),
+                        applied_isolation: applied,
                     })
                 }
                 Response::Fail(reason) => Err(RunError {
@@ -301,5 +349,43 @@ pub mod testing {
                 }),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::FakeRunner;
+    use super::*;
+    use crate::isolation::{Isolation, PrivilegeDrop};
+    use crate::sandbox::Namespace;
+
+    #[test]
+    fn fake_runner_echoes_requested_isolation() {
+        let runner = FakeRunner::always_ok();
+        let iso = Isolation {
+            namespaces: vec![Namespace::Network, Namespace::Ipc],
+            privilege: Some(PrivilegeDrop {
+                uid: 250,
+                gid: 250,
+                groups: vec![250],
+                umask: 0o22,
+            }),
+        };
+        let spec = CommandSpec::new("bash", "/tmp").with_isolation(iso);
+        let out = runner.run(&spec).unwrap();
+        assert!(
+            out.applied_isolation
+                .contains(&"network-sandbox".to_string())
+        );
+        assert!(out.applied_isolation.contains(&"ipc-sandbox".to_string()));
+        assert!(out.applied_isolation.contains(&"userpriv".to_string()));
+    }
+
+    #[test]
+    fn no_isolation_reports_none() {
+        let runner = FakeRunner::always_ok();
+        let spec = CommandSpec::new("bash", "/tmp");
+        let out = runner.run(&spec).unwrap();
+        assert!(out.applied_isolation.is_empty());
     }
 }

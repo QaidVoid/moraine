@@ -46,11 +46,11 @@ struct StoreQuery {
 }
 
 impl VersionQuery for StoreQuery {
-    fn has_version(&self, _root: QueryRoot, atom: &str) -> bool {
+    fn has_version(&self, _root: QueryRoot, atom: &str, _caller_use: &[String]) -> bool {
         !self.index.match_atom_str(atom).is_empty()
     }
 
-    fn best_version(&self, _root: QueryRoot, atom: &str) -> Option<String> {
+    fn best_version(&self, _root: QueryRoot, atom: &str, _caller_use: &[String]) -> Option<String> {
         let candidates = self.index.match_atom_str(atom);
         // match_atom_str returns ascending version order; the best is last.
         candidates.last().map(|c| {

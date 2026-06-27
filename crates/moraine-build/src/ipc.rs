@@ -6,12 +6,19 @@
 //! plus a small line-oriented request framing both ends own. The phase driver
 //! enables the channel only for the phases stock Portage enables it for.
 //!
-//! The framing is a single request line `op root atom`, where `op` is
+//! The framing is a single request line `op root atom use...`, where `op` is
 //! `has_version` or `best_version`, `root` is one of `host`, `target`, or
-//! `build` selecting `ROOT`, `ESYSROOT`, or `BROOT`, and `atom` is the dependency
-//! atom. The response is `0` plus an optional value line on success, or `1` on a
-//! negative match, mirroring the stock `QueryCommand` exit codes.
+//! `build` selecting `ROOT`, `ESYSROOT`, or `BROOT`, `atom` is the dependency
+//! atom, and any trailing tokens are the calling package's resolved `USE`.
+//! `has_version` answers `0` on a match and `1` otherwise. `best_version`
+//! answers `0` in both cases, with the best matching `cpv` on a value line when
+//! it matches and empty output when it does not, mirroring the stock
+//! `QueryCommand` exit codes.
 
+use std::collections::HashSet;
+
+use moraine_atom::Atom;
+use moraine_common::{Interner, Symbol};
 use tracing::instrument;
 
 /// Which root an IPC query targets, mapping to a path variable.
@@ -46,6 +53,9 @@ pub enum Query {
         root: QueryRoot,
         /// The dependency atom.
         atom: String,
+        /// The calling package's resolved `USE`, for evaluating USE-conditional
+        /// dependencies in the atom.
+        caller_use: Vec<String>,
     },
     /// `best_version <atom>` against a root.
     BestVersion {
@@ -53,6 +63,9 @@ pub enum Query {
         root: QueryRoot,
         /// The dependency atom.
         atom: String,
+        /// The calling package's resolved `USE`, for evaluating USE-conditional
+        /// dependencies in the atom.
+        caller_use: Vec<String>,
     },
 }
 
@@ -78,27 +91,84 @@ impl Response {
 
 /// The query backend the IPC handler answers from. The orchestrator implements
 /// this over `moraine-repo` and the installed store; tests substitute a fake.
+///
+/// `atom` reaches the backend with its USE-conditional dependencies already
+/// evaluated against `caller_use`; the caller's `USE` is also passed so a
+/// USE-aware store can honor concrete USE requirements.
 pub trait VersionQuery: Send + Sync {
     /// Whether any package matching `atom` is installed under `root`.
-    fn has_version(&self, root: QueryRoot, atom: &str) -> bool;
+    fn has_version(&self, root: QueryRoot, atom: &str, caller_use: &[String]) -> bool;
 
     /// The best matching installed `cpv` under `root`, if any.
-    fn best_version(&self, root: QueryRoot, atom: &str) -> Option<String>;
+    fn best_version(&self, root: QueryRoot, atom: &str, caller_use: &[String]) -> Option<String>;
 }
 
 /// Parse a request line into a [`Query`].
 ///
-/// The grammar is `op root atom`. Returns `None` for a malformed line.
+/// The grammar is `op root atom use...`, where any trailing tokens are the
+/// caller's resolved `USE`. Returns `None` for a malformed line.
 pub fn parse_request(line: &str) -> Option<Query> {
     let mut parts = line.split_whitespace();
     let op = parts.next()?;
     let root = QueryRoot::parse(parts.next()?)?;
     let atom = parts.next()?.to_string();
+    let caller_use: Vec<String> = parts.map(str::to_string).collect();
     match op {
-        "has_version" => Some(Query::HasVersion { root, atom }),
-        "best_version" => Some(Query::BestVersion { root, atom }),
+        "has_version" => Some(Query::HasVersion {
+            root,
+            atom,
+            caller_use,
+        }),
+        "best_version" => Some(Query::BestVersion {
+            root,
+            atom,
+            caller_use,
+        }),
         _ => None,
     }
+}
+
+/// Resolve an atom's USE-conditional dependencies against the caller's `USE`,
+/// returning the atom with its conditional `[...]` group rewritten to concrete
+/// USE requirements, reproducing `Atom.evaluate_conditionals(use)`.
+///
+/// The atom is returned unchanged when it has no USE dependencies or cannot be
+/// parsed, leaving the backend to handle it.
+fn resolve_atom_use(atom: &str, caller_use: &[String]) -> String {
+    let interner = Interner::new();
+    let Ok(parsed) = Atom::parse(atom, moraine_eapi::PERMISSIVE, &interner) else {
+        return atom.to_string();
+    };
+    if parsed.use_deps().is_empty() {
+        return atom.to_string();
+    }
+    let parent: HashSet<Symbol> = caller_use.iter().map(|u| interner.intern(u)).collect();
+    let reqs = parsed.evaluate_use(&parent);
+
+    let (Some(open), Some(close)) = (atom.find('['), atom.rfind(']')) else {
+        return atom.to_string();
+    };
+    if close < open {
+        return atom.to_string();
+    }
+    let base = &atom[..open];
+    let tail = &atom[close + 1..];
+    if reqs.is_empty() {
+        return format!("{base}{tail}");
+    }
+    let mut deps = String::new();
+    for (i, req) in reqs.iter().enumerate() {
+        if i > 0 {
+            deps.push(',');
+        }
+        if !req.enabled {
+            deps.push('-');
+        }
+        if let Some(flag) = interner.resolve(req.flag) {
+            deps.push_str(&flag);
+        }
+    }
+    format!("{base}[{deps}]{tail}")
 }
 
 /// The manager-side IPC handler.
@@ -113,27 +183,43 @@ impl<'a, Q: VersionQuery> IpcHandler<'a, Q> {
     }
 
     /// Answer one parsed query.
+    ///
+    /// USE-conditional dependencies in the atom are evaluated against the
+    /// caller's `USE` before matching. `best_version` returns success with empty
+    /// output on no match, matching the stock `QueryCommand`.
     #[instrument(name = "ipc_query", skip(self))]
     pub fn answer(&self, query: &Query) -> Response {
         match query {
-            Query::HasVersion { root, atom } => {
-                let code = if self.backend.has_version(*root, atom) {
+            Query::HasVersion {
+                root,
+                atom,
+                caller_use,
+            } => {
+                let resolved = resolve_atom_use(atom, caller_use);
+                let code = if self.backend.has_version(*root, &resolved, caller_use) {
                     0
                 } else {
                     1
                 };
                 Response { code, value: None }
             }
-            Query::BestVersion { root, atom } => match self.backend.best_version(*root, atom) {
-                Some(cpv) => Response {
-                    code: 0,
-                    value: Some(cpv),
-                },
-                None => Response {
-                    code: 1,
-                    value: None,
-                },
-            },
+            Query::BestVersion {
+                root,
+                atom,
+                caller_use,
+            } => {
+                let resolved = resolve_atom_use(atom, caller_use);
+                match self.backend.best_version(*root, &resolved, caller_use) {
+                    Some(cpv) => Response {
+                        code: 0,
+                        value: Some(cpv),
+                    },
+                    None => Response {
+                        code: 0,
+                        value: None,
+                    },
+                }
+            }
         }
     }
 
@@ -181,11 +267,16 @@ mod tests {
     }
 
     impl VersionQuery for FakeStore {
-        fn has_version(&self, root: QueryRoot, atom: &str) -> bool {
-            self.best_version(root, atom).is_some()
+        fn has_version(&self, root: QueryRoot, atom: &str, caller_use: &[String]) -> bool {
+            self.best_version(root, atom, caller_use).is_some()
         }
 
-        fn best_version(&self, root: QueryRoot, atom: &str) -> Option<String> {
+        fn best_version(
+            &self,
+            root: QueryRoot,
+            atom: &str,
+            _caller_use: &[String],
+        ) -> Option<String> {
             // Trivial: match by cp prefix, return the lexically greatest cpv.
             let cp = atom.trim_start_matches(['>', '<', '=', '~', '!']);
             self.installed
@@ -198,6 +289,30 @@ mod tests {
         }
     }
 
+    /// A backend that records the resolved atom it was asked about, so a test can
+    /// assert the USE-conditional evaluation happened against caller USE.
+    #[derive(Default)]
+    struct RecordingStore {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl VersionQuery for RecordingStore {
+        fn has_version(&self, _root: QueryRoot, atom: &str, _caller_use: &[String]) -> bool {
+            self.seen.lock().unwrap().push(atom.to_string());
+            atom.contains("[bar]")
+        }
+
+        fn best_version(
+            &self,
+            _root: QueryRoot,
+            atom: &str,
+            _caller_use: &[String],
+        ) -> Option<String> {
+            self.seen.lock().unwrap().push(atom.to_string());
+            None
+        }
+    }
+
     #[test]
     fn parses_has_version_request() {
         let q = parse_request("has_version host dev-libs/foo").unwrap();
@@ -205,9 +320,58 @@ mod tests {
             q,
             Query::HasVersion {
                 root: QueryRoot::Host,
-                atom: "dev-libs/foo".into()
+                atom: "dev-libs/foo".into(),
+                caller_use: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn parses_caller_use_after_atom() {
+        let q = parse_request("has_version host dev-libs/foo ssl threads").unwrap();
+        assert_eq!(
+            q,
+            Query::HasVersion {
+                root: QueryRoot::Host,
+                atom: "dev-libs/foo".into(),
+                caller_use: vec!["ssl".into(), "threads".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn use_conditional_atom_evaluated_against_caller_use() {
+        // `dev-libs/foo[bar?]` resolves to `[bar]` when the caller has `bar`, so
+        // the recording backend (which matches only `[bar]`) succeeds; without
+        // `bar` the conditional drops and the backend sees the bare atom.
+        let backend = RecordingStore::default();
+        let handler = IpcHandler::new(&backend);
+
+        let r = handler
+            .handle_line("has_version host dev-libs/foo[bar?] bar")
+            .unwrap();
+        assert_eq!(r.code, 0);
+
+        let r2 = handler
+            .handle_line("has_version host dev-libs/foo[bar?]")
+            .unwrap();
+        assert_eq!(r2.code, 1);
+
+        let seen = backend.seen.lock().unwrap();
+        assert!(seen.iter().any(|a| a == "dev-libs/foo[bar]"));
+        assert!(seen.iter().any(|a| a == "dev-libs/foo"));
+    }
+
+    #[test]
+    fn best_version_no_match_returns_zero_empty() {
+        let store = FakeStore::new(&["dev-libs/foo-1.0"]);
+        let handler = IpcHandler::new(&store);
+        let r = handler
+            .handle_line("best_version host dev-libs/absent")
+            .unwrap();
+        assert_eq!(r.code, 0);
+        assert_eq!(r.value, None);
+        assert_eq!(r.render(), "0\n");
     }
 
     #[test]
