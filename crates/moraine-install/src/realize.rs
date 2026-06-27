@@ -17,6 +17,7 @@ use moraine_binpkg::greenfield::WriteOptions;
 use moraine_binpkg::{MetadataMap, read_package_with_policy};
 use moraine_build::{
     BuildOutcome, BuildRequest, CommandRunner, QueryRoot, VersionQuery, build_package,
+    pretend_package,
 };
 use moraine_merge::state::PackageState;
 use moraine_merge::{MergeOp, Operation};
@@ -393,6 +394,29 @@ impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
             ebuild,
         };
         Ok(Realized::Apply(Operation::Merge(Box::new(op))))
+    }
+
+    fn pretend(&self, task: &InstallTask) -> Result<()> {
+        // Only from-source tasks have a pkg_pretend to validate; binary-package
+        // tasks are skipped by the upfront pass.
+        if task.source != SourceKind::Source {
+            return Ok(());
+        }
+        let request = self.planner.plan(task)?;
+        let pkg = &request.package;
+        // Skip when the EAPI does not define pkg_pretend (EAPI 0-3) or the ebuild
+        // does not list `pretend` in DEFINED_PHASES, mirroring the
+        // `_run_pkg_pretend` guards in Portage's Scheduler.
+        let eapi_defines_pretend = !matches!(pkg.ident.eapi.as_str(), "0" | "1" | "2" | "3");
+        if !eapi_defines_pretend || !pkg.defined_phases.iter().any(|p| p == "pretend") {
+            return Ok(());
+        }
+        pretend_package(&request, self.runner, Some(self.version_query)).map_err(|e| {
+            InstallError::Realize {
+                cpv: task.cpv.clone(),
+                reason: format!("pkg_pretend failed: {e}"),
+            }
+        })
     }
 }
 
@@ -972,7 +996,10 @@ mod tests {
             ],
         };
         let mut vars = std::collections::BTreeMap::new();
-        vars.insert("PROVIDES_EXCLUDE".to_string(), "libprivate.so.0".to_string());
+        vars.insert(
+            "PROVIDES_EXCLUDE".to_string(),
+            "libprivate.so.0".to_string(),
+        );
         vars.insert("REQUIRES_EXCLUDE".to_string(), "libskip.so.2".to_string());
         apply_soname_excludes(&mut scan, &vars);
 

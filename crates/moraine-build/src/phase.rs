@@ -100,8 +100,11 @@ impl PhaseReport {
 }
 
 /// The full ordered phase set; each is gated by the EAPI and `DEFINED_PHASES`.
+///
+/// `pkg_pretend` is not part of this per-package sequence: Portage validates it
+/// once for the whole mergelist before the merge loop, so it is driven upfront
+/// through [`PhaseDriver::run_pretend`] instead.
 const PHASE_ORDER: &[PhaseKind] = &[
-    PhaseKind::PkgPretend,
     PhaseKind::PkgSetup,
     PhaseKind::SrcUnpack,
     PhaseKind::SrcPrepare,
@@ -223,11 +226,14 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
     ///
     /// Mirrors `doebuild`: `src_unpack` is exempt only when `PROPERTIES`
     /// contains `live`, `src_test` only when `PROPERTIES` contains
-    /// `test_network`, and every other phase is isolated.
+    /// `test_network`, the IPC phases (`pkg_setup`, `pkg_pretend`) are always
+    /// exempt because the host IPC channel needs the network, and every other
+    /// phase is isolated. `pkg_nofetch` is in neither set, so it stays isolated.
     fn network_needed(&self, phase: PhaseKind) -> bool {
         match phase {
             PhaseKind::SrcUnpack => self.properties.iter().any(|p| p == "live"),
             PhaseKind::SrcTest => self.properties.iter().any(|p| p == "test_network"),
+            PhaseKind::PkgSetup | PhaseKind::PkgPretend => true,
             _ => false,
         }
     }
@@ -278,6 +284,33 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
         let mut elog = Vec::new();
         let (_, _) = self.run_phase(PhaseKind::PkgNofetch, &BTreeMap::new(), &mut elog)?;
         Ok(elog)
+    }
+
+    /// Run only the `pkg_pretend` phase for the upfront validation pass.
+    ///
+    /// Portage validates `pkg_pretend` once for the whole mergelist before the
+    /// merge loop, so the per-package [`run_all`](Self::run_all) no longer runs
+    /// it. This drives the single phase through the existing [`run_phase`], with
+    /// the now-unsandboxed and networked plan, returning its elog messages. A
+    /// package whose EAPI does not define `pkg_pretend`, or that does not list
+    /// `pretend` in `DEFINED_PHASES`, is a no-op.
+    pub fn run_pretend(&self) -> Result<Vec<ElogMessage>> {
+        let mut elog = Vec::new();
+        if self.should_run(PhaseKind::PkgPretend) {
+            let (_, _) = self.run_phase(PhaseKind::PkgPretend, &BTreeMap::new(), &mut elog)?;
+        }
+        Ok(elog)
+    }
+
+    /// Whether the active EAPI requires the `eapply_user` tagfile after
+    /// `src_prepare` (EAPI 6 and later), mirroring `___eapi_has_eapply_user`. An
+    /// unknown EAPI is treated permissively as requiring it.
+    fn eapi_has_eapply_user(&self) -> bool {
+        self.env
+            .ident()
+            .eapi_level()
+            .map(|n| n >= 6)
+            .unwrap_or(true)
     }
 
     /// Run a single phase, returning its record and the updated carried env.
@@ -448,11 +481,24 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
         }
         script.push_str(&format!(
             "{dispatch} {func}\n\
-             rc=$?\n\
-             ( set -o posix; set ) > {saved} 2>/dev/null || true\n\
-             exit $rc\n",
+             rc=$?\n",
             dispatch = bashlib::DISPATCH_FUNC,
             func = phase.func_name(),
+        ));
+        // After `src_prepare` on EAPI 6+ the `eapply_user` tagfile must exist, or
+        // the ebuild overrode `src_prepare` without calling `eapply_user`/
+        // `default` and silently skipped the user's /etc/portage/patches. Mirror
+        // `__dyn_prepare`'s check and die when it is absent; the runtime
+        // `___eapi_has_eapply_user` guard matches Portage's exact wording.
+        if phase == PhaseKind::SrcPrepare && self.eapi_has_eapply_user() {
+            script.push_str(
+                "if ___eapi_has_eapply_user && [ ! -f \"${T}/.portage_user_patches_applied\" ]; then \
+                 die \"eapply_user (or default) must be called in src_prepare()!\"; fi\n",
+            );
+        }
+        script.push_str(&format!(
+            "( set -o posix; set ) > {saved} 2>/dev/null || true\n\
+             exit $rc\n",
             saved = shquote(&saved_env_path.to_string_lossy()),
         ));
         script
@@ -911,6 +957,100 @@ mod tests {
     }
 
     #[test]
+    fn per_package_build_skips_pkg_pretend() {
+        let fx = fixture();
+        let cfg = ConfigEnv::rooted([]);
+        let env = EnvBuilder::new(ident("8"), cfg, &fx.layout).unwrap();
+        let sel = selector(&[]);
+        let runner = FakeRunner::always_ok();
+        // Even with `pretend` in DEFINED_PHASES, the per-package run does not
+        // invoke pkg_pretend: it runs once upfront, not per package.
+        let driver = PhaseDriver::new(
+            &runner,
+            &env,
+            &fx.layout,
+            &fx.library,
+            &sel,
+            &fx.ebuild,
+            vec!["pretend".into(), "setup".into(), "compile".into()],
+            false,
+            Vec::new(),
+            None,
+        );
+        let report = driver.run_all().unwrap();
+        assert!(!report.invoked_phases().contains(&PhaseKind::PkgPretend));
+        assert!(!report.runs.iter().any(|r| r.phase == PhaseKind::PkgPretend));
+    }
+
+    #[test]
+    fn run_pretend_invokes_pkg_pretend_when_defined() {
+        let fx = fixture();
+        let cfg = ConfigEnv::rooted([]);
+        let env = EnvBuilder::new(ident("8"), cfg, &fx.layout).unwrap();
+        let sel = selector(&[]);
+        let runner = FakeRunner::always_ok();
+        let driver = PhaseDriver::new(
+            &runner,
+            &env,
+            &fx.layout,
+            &fx.library,
+            &sel,
+            &fx.ebuild,
+            vec!["pretend".into()],
+            false,
+            Vec::new(),
+            None,
+        );
+        driver.run_pretend().unwrap();
+        let calls = runner.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.args.iter().any(|a| a.contains("pkg_pretend"))),
+            "run_pretend must drive the pkg_pretend phase"
+        );
+    }
+
+    #[test]
+    fn eapply_user_die_emitted_only_for_eapi6_plus() {
+        let fx = fixture();
+        let sel = selector(&[]);
+        let prepare_script = |eapi: &str| -> String {
+            let cfg = ConfigEnv::rooted([]);
+            let env = EnvBuilder::new(ident(eapi), cfg, &fx.layout).unwrap();
+            let runner = FakeRunner::always_ok();
+            let driver = PhaseDriver::new(
+                &runner,
+                &env,
+                &fx.layout,
+                &fx.library,
+                &sel,
+                &fx.ebuild,
+                vec!["prepare".into()],
+                false,
+                Vec::new(),
+                None,
+            );
+            driver.run_all().unwrap();
+            let calls = runner.calls();
+            calls
+                .iter()
+                .find(|c| c.args.iter().any(|a| a.contains("src_prepare")))
+                .map(|c| c.args.last().unwrap().clone())
+                .expect("src_prepare call")
+        };
+        // EAPI 8 emits the tagfile die; EAPI 5 (pre-eapply_user) does not.
+        assert!(
+            prepare_script("8").contains(".portage_user_patches_applied"),
+            "EAPI 8 src_prepare must emit the eapply_user tagfile check"
+        );
+        assert!(
+            !prepare_script("5").contains(".portage_user_patches_applied"),
+            "pre-EAPI-6 src_prepare must not require the eapply_user tagfile"
+        );
+    }
+
+    #[test]
     fn network_needed_follows_properties() {
         let fx = fixture();
         let cfg = ConfigEnv::rooted([]);
@@ -945,6 +1085,10 @@ mod tests {
         assert!(!plain.network_needed(PhaseKind::SrcUnpack));
         assert!(!plain.network_needed(PhaseKind::SrcTest));
         assert!(!plain.network_needed(PhaseKind::SrcCompile));
+        // The IPC phases are always networked; pkg_nofetch is not.
+        assert!(plain.network_needed(PhaseKind::PkgSetup));
+        assert!(plain.network_needed(PhaseKind::PkgPretend));
+        assert!(!plain.network_needed(PhaseKind::PkgNofetch));
     }
 
     #[test]

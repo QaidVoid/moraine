@@ -19,6 +19,17 @@ use crate::task::{InstallTask, Realized};
 pub trait StepRunner {
     /// Realize one merge task.
     fn realize(&self, task: &InstallTask) -> Result<Realized>;
+
+    /// Validate one merge task's `pkg_pretend` before the merge loop.
+    ///
+    /// The transaction engine runs this upfront for every source merge task, so a
+    /// failing `pkg_pretend` aborts the whole transaction before anything is
+    /// fetched, built, or merged. The default is a no-op, leaving binary-package
+    /// runners and test fakes unaffected; the from-source runner overrides it.
+    fn pretend(&self, task: &InstallTask) -> Result<()> {
+        let _ = task;
+        Ok(())
+    }
 }
 
 /// Applies operations through the live-filesystem merge engine.

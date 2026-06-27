@@ -285,6 +285,12 @@ impl EnvBuilder {
     /// stays a pure environment computation with no filesystem side effects.
     fn insert_masquerade_vars(base: &mut BTreeMap<String, String>, config: &ConfigEnv) {
         let eprefix = config.eprefix.as_str();
+        // When ccache is not enabled, disable it explicitly so configure scripts
+        // that auto-detect ccache respect `FEATURES=-ccache`, mirroring
+        // `bin/phase-functions.sh`'s `export CCACHE_DISABLE=1`.
+        if !config.has_feature("ccache") {
+            base.insert("CCACHE_DISABLE".to_string(), "1".to_string());
+        }
         let mut masquerade: Vec<String> = Vec::new();
         if config.has_feature("ccache") {
             masquerade.push(format!("{eprefix}/usr/lib/ccache/bin"));
@@ -591,6 +597,21 @@ mod tests {
         let b = EnvBuilder::new(ident("8"), cfg, &layout).unwrap();
         let env = b.for_phase("compile", "src_compile");
         assert!(env.get("CCACHE_DIR").is_none());
+    }
+
+    #[test]
+    fn ccache_disable_set_when_ccache_absent() {
+        let (_t, layout) = layout();
+        // Absent ccache, even with distcc enabled, exports CCACHE_DISABLE=1.
+        let cfg = ConfigEnv::rooted(["distcc".to_string()]);
+        let b = EnvBuilder::new(ident("8"), cfg, &layout).unwrap();
+        let env = b.for_phase("compile", "src_compile");
+        assert_eq!(env.get("CCACHE_DISABLE"), Some("1"));
+        // With ccache enabled, CCACHE_DISABLE is not exported.
+        let cfg = ConfigEnv::rooted(["ccache".to_string()]);
+        let b = EnvBuilder::new(ident("8"), cfg, &layout).unwrap();
+        let env = b.for_phase("compile", "src_compile");
+        assert_eq!(env.get("CCACHE_DISABLE"), None);
     }
 
     #[test]

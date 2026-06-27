@@ -43,7 +43,7 @@ pub mod sandbox;
 pub mod srcuri;
 pub mod strip;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use tracing::instrument;
@@ -172,28 +172,12 @@ pub fn build_package<R: CommandRunner>(
     let layout = BuildLayout::new(&build_root, &pkg.ident.category, &pkg.ident.pf)?;
     layout.create()?;
 
-    // 2. Environment.
-    let mut env = EnvBuilder::new(pkg.ident.clone(), request.config.clone(), &layout)?;
-
-    // 2b. Evaluate REQUIRED_USE against the resolved USE before driving phases,
-    // guarding the direct build_package path (the resolver guards the emerge
-    // path). Export REQUIRED_USE for diagnostics regardless.
-    if let Some(required_use) = pkg.reduced_meta.get("REQUIRED_USE") {
-        check_required_use(required_use, &request.use_flags)?;
-        env.insert_base("REQUIRED_USE", required_use.clone());
-    }
-
-    // 2c. Inject the per-package values computed outside the EAPI gates: the
-    // resolved USE, IUSE_EFFECTIVE (with the strict-check opt-in), and
-    // DEFINED_PHASES.
-    env.insert_base("USE", sorted(&request.use_flags).join(" "));
-    env.insert_base("DEFINED_PHASES", defined_phases_token(&pkg.defined_phases));
-    if request.iuse_effective.is_empty() {
-        env.insert_base("IUSE_EFFECTIVE", pkg.iuse.join(" "));
-    } else {
-        env.insert_base("IUSE_EFFECTIVE", request.iuse_effective.join(" "));
-        env.insert_base("PORTAGE_INTERNAL_CALLER", "1");
-    }
+    // 2. Environment: the static EAPI-gated base plus the per-package values
+    // computed outside the gates (USE, DEFINED_PHASES, IUSE_EFFECTIVE,
+    // REQUIRED_USE). This also evaluates REQUIRED_USE against the resolved USE
+    // before driving phases, guarding the direct build_package path (the resolver
+    // guards the emerge path).
+    let mut env = prepare_env(request, &layout)?;
 
     // 3. SRC_URI mapping and fetch.
     let src_map =
@@ -368,7 +352,13 @@ pub fn build_package<R: CommandRunner>(
     }
     info.write(&layout.build_info)?;
     metadata::copy_ebuild(&pkg.ebuild_path, &layout.build_info)?;
-    metadata::write_saved_environment(&layout.build_info, env.base())?;
+    // The saved environment is the post-src_install ebuild environment (the
+    // mutated final phase env), filtered for readonly metadata and shell-internal
+    // variables, mirroring `__save_ebuild_env --exclude-init-phases |
+    // __filter_readonly_variables`. Carrying the static base would drop any
+    // variable an ebuild or eclass set during a phase.
+    let saved_env = env::filter_saved_env(&BTreeMap::new(), &report.final_env);
+    metadata::write_saved_environment(&layout.build_info, &saved_env)?;
 
     let applied_features = union_features(&report);
 
@@ -379,6 +369,99 @@ pub fn build_package<R: CommandRunner>(
         fetched,
         applied_features,
     })
+}
+
+/// Run `pkg_pretend` for one package upfront, before any fetch, build, or merge.
+///
+/// Portage's Scheduler validates `pkg_pretend` once for the whole mergelist
+/// before the merge loop, so a failing pretend aborts the transaction before
+/// anything is fetched, built, or merged. This lays out the environment and
+/// drives only the `pkg_pretend` phase through [`PhaseDriver::run_pretend`],
+/// reusing the sandbox plan (now unsandboxed and networked for pretend). A
+/// package whose EAPI does not define `pkg_pretend`, or that does not list
+/// `pretend` in `DEFINED_PHASES`, runs nothing. `version_query`, when `Some`,
+/// answers the build-time `has_version`/`best_version` queries the same way
+/// [`build_package`] does, since a `pkg_pretend` often probes installed versions.
+#[instrument(name = "pretend_package", skip_all, fields(pf = %request.package.ident.pf))]
+pub fn pretend_package<R: CommandRunner>(
+    request: &BuildRequest,
+    runner: &R,
+    version_query: Option<&dyn VersionQuery>,
+) -> Result<()> {
+    let pkg = &request.package;
+
+    let build_root = request
+        .config
+        .vars
+        .get("PORTAGE_TMPDIR")
+        .cloned()
+        .unwrap_or_else(|| request.fetch.distdir.to_string_lossy().to_string());
+    let layout = BuildLayout::new(&build_root, &pkg.ident.category, &pkg.ident.pf)?;
+    layout.create()?;
+
+    let env = prepare_env(request, &layout)?;
+    let library = bashlib::PhaseLibrary::materialize(layout.temp.join("bashlib"))?;
+    let sandbox = SandboxSelector::from_config(
+        &request.config,
+        pkg.restrict.iter().map(String::as_str),
+        request.namespace_support,
+    );
+    let properties: Vec<String> = pkg
+        .reduced_meta
+        .get("PROPERTIES")
+        .map(|p| p.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+    let endpoint = match version_query {
+        Some(_) => Some(ipc::IpcEndpoint::create(&layout.ipc)?),
+        None => None,
+    };
+    let ipc_helper = endpoint.as_ref().map(|e| e.helper_path().to_path_buf());
+    let driver = PhaseDriver::new(
+        runner,
+        &env,
+        &layout,
+        &library,
+        &sandbox,
+        &pkg.ebuild_path,
+        pkg.defined_phases.clone(),
+        request.run_tests,
+        properties,
+        ipc_helper,
+    );
+
+    match (endpoint.as_ref(), version_query) {
+        (Some(ep), Some(backend)) => std::thread::scope(|scope| {
+            scope.spawn(|| ep.serve(backend));
+            let result = driver.run_pretend();
+            ep.shutdown();
+            result
+        }),
+        _ => driver.run_pretend(),
+    }?;
+    Ok(())
+}
+
+/// Lay out the EAPI-gated build environment for a package: the static base plus
+/// the per-package values computed outside the EAPI gates (`USE`,
+/// `DEFINED_PHASES`, `IUSE_EFFECTIVE` with the strict-check opt-in, and
+/// `REQUIRED_USE`). Shared by [`build_package`] and [`pretend_package`]. Returns
+/// an error when the resolved USE violates the package's `REQUIRED_USE`.
+fn prepare_env(request: &BuildRequest, layout: &BuildLayout) -> Result<EnvBuilder> {
+    let pkg = &request.package;
+    let mut env = EnvBuilder::new(pkg.ident.clone(), request.config.clone(), layout)?;
+    if let Some(required_use) = pkg.reduced_meta.get("REQUIRED_USE") {
+        check_required_use(required_use, &request.use_flags)?;
+        env.insert_base("REQUIRED_USE", required_use.clone());
+    }
+    env.insert_base("USE", sorted(&request.use_flags).join(" "));
+    env.insert_base("DEFINED_PHASES", defined_phases_token(&pkg.defined_phases));
+    if request.iuse_effective.is_empty() {
+        env.insert_base("IUSE_EFFECTIVE", pkg.iuse.join(" "));
+    } else {
+        env.insert_base("IUSE_EFFECTIVE", request.iuse_effective.join(" "));
+        env.insert_base("PORTAGE_INTERNAL_CALLER", "1");
+    }
+    Ok(env)
 }
 
 /// The current UNIX time in seconds for `BUILD_TIME`, zero if the clock is before
@@ -475,5 +558,102 @@ mod tests {
     fn required_use_empty_is_ok() {
         assert!(check_required_use("", &use_set([])).is_ok());
         assert!(check_required_use("   ", &use_set([])).is_ok());
+    }
+
+    #[test]
+    fn saved_environment_reflects_post_install_state() {
+        // Drives a real bash through the build engine; skip cleanly when bash is
+        // unavailable.
+        if std::process::Command::new("bash")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let distdir = tmp.path().join("distdir");
+        let buildroot = tmp.path().join("buildroot");
+        let repo = tmp.path().join("repo/dev-libs/fixture");
+        std::fs::create_dir_all(&distdir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // An ebuild whose src_install sets a variable. S points at WORKDIR so the
+        // source phases can cd into an existing directory without a real tarball.
+        let ebuild = repo.join("fixture-1.0.ebuild");
+        std::fs::write(
+            &ebuild,
+            "EAPI=8\nS=\"${WORKDIR}\"\nsrc_install() { export MY_INSTALL_VAR=hello; }\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("Manifest"), "").unwrap();
+
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "PORTAGE_TMPDIR".to_string(),
+            buildroot.to_string_lossy().to_string(),
+        );
+
+        let ident = PackageIdent {
+            category: "dev-libs".into(),
+            pf: "fixture-1.0".into(),
+            p: "fixture-1.0".into(),
+            pn: "fixture".into(),
+            pv: "1.0".into(),
+            pvr: "1.0".into(),
+            pr: "r0".into(),
+            eapi: "8".into(),
+            repository: "test".into(),
+        };
+        let package = PackageSpec {
+            ident,
+            ebuild_path: ebuild,
+            src_uri: String::new(),
+            defined_phases: vec!["install".into()],
+            restrict: vec![],
+            slot: "0".into(),
+            subslot: None,
+            iuse: vec![],
+            keywords: vec![],
+            inherited: vec![],
+            reduced_meta: BTreeMap::new(),
+            manifest_path: repo.join("Manifest"),
+        };
+        let request = BuildRequest {
+            package,
+            // No sandbox/fakeroot features so the phases run as plain bash with no
+            // external isolation binaries.
+            config: ConfigEnv {
+                vars,
+                ..ConfigEnv::rooted([])
+            },
+            use_flags: HashSet::new(),
+            iuse_effective: vec![],
+            fetch: FetchConfig::new(&distdir),
+            run_tests: false,
+            require_digest: false,
+            namespace_support: NamespaceSupport::default(),
+            slot_bindings: Vec::new(),
+        };
+
+        let runner = SystemRunner::new();
+        let outcome = build_package(&request, &runner, None).unwrap();
+
+        // The compressed build-info environment carries the variable src_install
+        // set, while readonly metadata like EAPI is filtered back out.
+        use std::io::Read as _;
+        let compressed = std::fs::read(outcome.build_info_dir.join("environment.bz2")).unwrap();
+        let mut decoder = bzip2::read::BzDecoder::new(&compressed[..]);
+        let mut body = String::new();
+        decoder.read_to_string(&mut body).unwrap();
+        assert!(
+            body.contains("MY_INSTALL_VAR") && body.contains("hello"),
+            "post-install variable missing from saved environment:\n{body}"
+        );
+        assert!(
+            !body.contains("declare -x EAPI="),
+            "readonly metadata must be filtered from the saved environment:\n{body}"
+        );
     }
 }

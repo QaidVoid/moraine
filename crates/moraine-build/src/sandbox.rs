@@ -157,10 +157,17 @@ impl SandboxSelector {
     pub fn plan(&self, phase: PhaseKind, build_root: &Path, network_needed: bool) -> SandboxPlan {
         let mut applied = Vec::new();
         let is_install = phase == PhaseKind::SrcInstall;
+        // `pkg_setup` and `pkg_pretend` run unsandboxed, matching the relevant
+        // members of Portage's `_unsandboxed_phases`: they legitimately write
+        // outside the build tree (the lilo/apache `pkg_setup` cases the stock
+        // comment cites) and run with `SANDBOX_ON=0`.
+        let is_unsandboxed = matches!(phase, PhaseKind::PkgSetup | PhaseKind::PkgPretend);
 
         // Filesystem write confinement via the sandbox binary. The install phase
         // also confines, but additionally runs under faked privilege.
-        let sandbox_active = if is_install {
+        let sandbox_active = if is_unsandboxed {
+            false
+        } else if is_install {
             self.use_sandbox || self.use_usersandbox
         } else {
             self.use_sandbox || (self.use_userpriv && self.use_usersandbox)
@@ -198,11 +205,21 @@ impl SandboxSelector {
             // Writes are allowed only under the build tree; everything else is
             // read-only.
             sandbox_vars.push(("SANDBOX_WRITE".to_string(), root.to_string()));
-            sandbox_vars.push((
-                "SANDBOX_PREDICT".to_string(),
-                format!("{}:/dev/null:/dev/zero", root),
-            ));
+            // `src_test` relaxes the predict set to the whole filesystem,
+            // mirroring `__dyn_test`'s `addpredict /`, so test suites that read or
+            // write predicted paths outside the build tree do not trip a denial.
+            let predict = if phase == PhaseKind::SrcTest {
+                format!("/:{root}:/dev/null:/dev/zero")
+            } else {
+                format!("{root}:/dev/null:/dev/zero")
+            };
+            sandbox_vars.push(("SANDBOX_PREDICT".to_string(), predict));
             sandbox_vars.push(("SANDBOX_ON".to_string(), "1".to_string()));
+        } else if is_unsandboxed {
+            // The unsandboxed `pkg_*` phases still export `SANDBOX_ON=0` so any
+            // sandbox already active in the inherited environment is turned off,
+            // mirroring the `help|pretend|setup` case in `bin/phase-functions.sh`.
+            sandbox_vars.push(("SANDBOX_ON".to_string(), "0".to_string()));
         }
 
         // Network isolation: active when network-sandbox is set, the phase does
@@ -345,6 +362,59 @@ mod tests {
         let plan = sel.plan(PhaseKind::SrcCompile, &root(), false);
         assert!(!plan.network_isolated);
         assert!(!plan.namespaces.contains(&Namespace::Network));
+    }
+
+    #[test]
+    fn pkg_setup_and_pretend_run_unsandboxed() {
+        let sel = SandboxSelector::from_config(
+            &cfg(&["sandbox", "network-sandbox"]),
+            [],
+            NamespaceSupport::default(),
+        );
+        for phase in [PhaseKind::PkgSetup, PhaseKind::PkgPretend] {
+            // These are IPC phases the driver marks network-needed, so pass
+            // `network_needed = true` as `network_needed` does for them.
+            let plan = sel.plan(phase, &root(), true);
+            assert!(
+                !plan.wrapper.contains(&"sandbox".to_string()),
+                "{phase} must not be wrapped in the sandbox binary"
+            );
+            let on = plan
+                .sandbox_vars
+                .iter()
+                .find(|(k, _)| k == "SANDBOX_ON")
+                .expect("SANDBOX_ON set for the unsandboxed phase");
+            assert_eq!(on.1, "0", "{phase} must set SANDBOX_ON=0");
+            assert!(
+                plan.sandbox_vars.iter().all(|(k, _)| k != "SANDBOX_WRITE"),
+                "{phase} must not confine writes to the build tree"
+            );
+            assert!(!plan.network_isolated, "{phase} must not be isolated");
+            assert!(!plan.namespaces.contains(&Namespace::Network));
+        }
+    }
+
+    #[test]
+    fn src_test_predicts_whole_filesystem() {
+        let sel = SandboxSelector::from_config(&cfg(&["sandbox"]), [], NamespaceSupport::default());
+        let predict = |phase| {
+            sel.plan(phase, &root(), false)
+                .sandbox_vars
+                .into_iter()
+                .find(|(k, _)| k == "SANDBOX_PREDICT")
+                .map(|(_, v)| v)
+                .expect("SANDBOX_PREDICT set")
+        };
+        let test = predict(PhaseKind::SrcTest);
+        assert!(
+            test.split(':').any(|p| p == "/"),
+            "src_test must predict /: {test}"
+        );
+        let compile = predict(PhaseKind::SrcCompile);
+        assert!(
+            !compile.split(':').any(|p| p == "/"),
+            "src_compile must not receive the / predict relaxation: {compile}"
+        );
     }
 
     #[test]

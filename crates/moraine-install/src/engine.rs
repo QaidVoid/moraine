@@ -72,6 +72,15 @@ impl<'a, S: StepRunner, A: Applier> TransactionEngine<'a, S, A> {
     pub fn run(&self, tx: &Transaction) -> Result<TransactionReport> {
         let _lock = TransactionLock::acquire(&self.state_dir)?;
         self.applier.recover()?;
+        // Upfront pkg_pretend pass: validate every source merge task in
+        // transaction order before any fetch, build, or merge, so a later task's
+        // pretend failure never leaves earlier packages partially applied to the
+        // live root, mirroring Portage's `Scheduler._run_pkg_pretend`.
+        for task in &tx.tasks {
+            if task.kind == TaskKind::Merge {
+                self.runner.pretend(task)?;
+            }
+        }
         let mut journal = Journal::begin(tx);
         journal.save(&self.state_dir)?;
         self.drive(&mut journal)
@@ -164,5 +173,139 @@ fn merge_error(cpv: &str, error: InstallError) -> InstallError {
             source,
         },
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::InstallTask;
+    use moraine_merge::state::PostMergeReport;
+    use std::cell::RefCell;
+
+    /// A step runner that records the order of `pretend`/`realize` calls and can
+    /// be told to fail one task's pretend.
+    struct PretendRunner {
+        fail_pretend_on: Option<String>,
+        pretended: RefCell<Vec<String>>,
+        realized: RefCell<Vec<String>>,
+    }
+
+    impl PretendRunner {
+        fn new() -> Self {
+            PretendRunner {
+                fail_pretend_on: None,
+                pretended: RefCell::new(Vec::new()),
+                realized: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn failing(cpv: &str) -> Self {
+            PretendRunner {
+                fail_pretend_on: Some(cpv.to_owned()),
+                ..PretendRunner::new()
+            }
+        }
+    }
+
+    impl StepRunner for PretendRunner {
+        fn realize(&self, task: &InstallTask) -> Result<Realized> {
+            self.realized.borrow_mut().push(task.cpv.clone());
+            Ok(Realized::PackagedOnly)
+        }
+
+        fn pretend(&self, task: &InstallTask) -> Result<()> {
+            self.pretended.borrow_mut().push(task.cpv.clone());
+            if self.fail_pretend_on.as_deref() == Some(task.cpv.as_str()) {
+                return Err(InstallError::Realize {
+                    cpv: task.cpv.clone(),
+                    reason: "pkg_pretend failed".to_owned(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    /// An applier that records applications and never touches disk.
+    struct RecordingApplier {
+        recovered: RefCell<bool>,
+        applied: RefCell<Vec<String>>,
+    }
+
+    impl RecordingApplier {
+        fn new() -> Self {
+            RecordingApplier {
+                recovered: RefCell::new(false),
+                applied: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Applier for RecordingApplier {
+        fn recover(&self) -> Result<()> {
+            *self.recovered.borrow_mut() = true;
+            Ok(())
+        }
+
+        fn apply(&self, op: &Operation) -> Result<OperationOutcome> {
+            let cpv = op.label().to_owned();
+            self.applied.borrow_mut().push(cpv.clone());
+            Ok(OperationOutcome {
+                cpv,
+                merged: matches!(op, Operation::Merge(_)),
+                counter: Some(1),
+                report: PostMergeReport::default(),
+                preserved: Vec::new(),
+                reconciled: Vec::new(),
+            })
+        }
+    }
+
+    fn tx() -> Transaction {
+        Transaction::new(vec![
+            InstallTask::merge("app/a-1", "app/a", "0"),
+            InstallTask::merge("app/b-2", "app/b", "0"),
+            InstallTask::merge("app/c-3", "app/c", "0"),
+        ])
+    }
+
+    #[test]
+    fn failing_pretend_aborts_before_any_realize() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = PretendRunner::failing("app/c-3");
+        let applier = RecordingApplier::new();
+        let engine = TransactionEngine::new(&runner, &applier, dir.path());
+        let err = engine.run(&tx());
+        assert!(err.is_err(), "a failing pretend must abort the transaction");
+        // The abort happened in the upfront pass, before anything was realized or
+        // applied.
+        assert!(
+            runner.realized.borrow().is_empty(),
+            "no task may be realized when an earlier pretend fails"
+        );
+        assert!(applier.applied.borrow().is_empty());
+        // The pretend pass reached the failing task in transaction order.
+        assert_eq!(
+            runner.pretended.borrow().as_slice(),
+            ["app/a-1", "app/b-2", "app/c-3"]
+        );
+    }
+
+    #[test]
+    fn pretend_pass_precedes_the_merge_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = PretendRunner::new();
+        let applier = RecordingApplier::new();
+        let engine = TransactionEngine::new(&runner, &applier, dir.path());
+        engine.run(&tx()).unwrap();
+        // Every merge task was validated upfront, then realized.
+        assert_eq!(
+            runner.pretended.borrow().as_slice(),
+            ["app/a-1", "app/b-2", "app/c-3"]
+        );
+        assert_eq!(
+            runner.realized.borrow().as_slice(),
+            ["app/a-1", "app/b-2", "app/c-3"]
+        );
     }
 }
