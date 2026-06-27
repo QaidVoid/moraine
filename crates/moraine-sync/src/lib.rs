@@ -54,7 +54,9 @@ pub use error::{Result, SyncError};
 pub use extras::{ExtrasMap, RepoExtras};
 pub use options::{KeyRefresh, SyncDefaults, SyncOptions};
 pub use outcome::{SyncKind, SyncOutcome};
-pub use refresh::{MetadataRefresher, RefreshMode, RefreshReport, RepoRefresher};
+pub use refresh::{
+    Generated, MetadataGenerator, MetadataRefresher, RefreshMode, RefreshReport, RepoRefresher,
+};
 pub use revision::{HISTORY_LIMIT, RevisionHistory};
 pub use verify::{GitSigStatus, Verifier};
 

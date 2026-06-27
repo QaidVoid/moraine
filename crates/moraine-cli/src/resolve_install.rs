@@ -512,11 +512,7 @@ impl CliPlanner<'_> {
     /// The eclass search locations for a repository, in the order `inherit`
     /// walks them (closest repository first), as exported strings.
     fn eclass_locations(&self, repo: &str) -> Vec<String> {
-        self.repo_set
-            .eclass_search_path(repo)
-            .into_iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect()
+        eclass_locations(self.repo_set, repo)
     }
 
     /// The fetch configuration from `make.conf`.
@@ -1039,8 +1035,26 @@ fn compute_preserved_rebuild(vdb: &Store, state_dir: &Path) -> Vec<String> {
     moraine_config::sets::preserved_rebuild_set(&consumers, &preserved_sonames, &preserved_owners)
 }
 
+/// The eclass search locations for a repository, in the order `inherit` walks
+/// them (closest repository first), as the repository-root strings the bash
+/// `inherit` appends `/eclass/<name>.eclass` to. `eclass_search_path` returns
+/// the `<repo>/eclass` directories, so each is mapped back to its repo root.
+pub(crate) fn eclass_locations(repo_set: &moraine_repo::RepoSet, repo: &str) -> Vec<String> {
+    repo_set
+        .eclass_search_path(repo)
+        .into_iter()
+        .map(|eclass_dir| {
+            eclass_dir
+                .parent()
+                .unwrap_or(&eclass_dir)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
 /// Split a `category/package-version` into `(category, pf)`.
-fn split_cpv(cpv: &str) -> (String, String) {
+pub(crate) fn split_cpv(cpv: &str) -> (String, String) {
     match cpv.split_once('/') {
         Some((c, pf)) => (c.to_owned(), pf.to_owned()),
         None => (String::new(), cpv.to_owned()),
@@ -1048,7 +1062,7 @@ fn split_cpv(cpv: &str) -> (String, String) {
 }
 
 /// Split a `pf` (`pn-version`) into `(pn, pvr)` at the version boundary.
-fn split_pf(pf: &str) -> (String, String) {
+pub(crate) fn split_pf(pf: &str) -> (String, String) {
     let bytes = pf.as_bytes();
     let mut idx = 0;
     while let Some(pos) = pf[idx..].find('-') {
@@ -1062,7 +1076,7 @@ fn split_pf(pf: &str) -> (String, String) {
 }
 
 /// Build a [`PackageIdent`] from the split package identity.
-fn package_ident(
+pub(crate) fn package_ident(
     category: &str,
     pf: &str,
     pn: &str,

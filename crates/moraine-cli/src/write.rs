@@ -366,7 +366,13 @@ pub fn sync(cli: &Cli, roots: &Roots) -> Result<()> {
     let staging = wr.state_dir.join("sync-staging");
     let runner = SystemRunner;
     let registry = default_registry(runner);
-    let refresher = RepoRefresher::new(&repo_set, &store_dir);
+    // Regenerate metadata for ebuilds whose md5-cache entry is missing or stale
+    // by sourcing them with a working `inherit`, instead of excluding them.
+    let generator = crate::regen::EbuildMetadataGenerator::new(&repo_set);
+    let mut refresher = RepoRefresher::new(&repo_set, &store_dir);
+    if let Some(generator) = &generator {
+        refresher = refresher.with_generator(generator);
+    }
     let engine = SyncEngine::new(&repo_set, &registry, &refresher, &runner, &staging);
 
     let history_path = wr.state_dir.join("sync-history.mrev");

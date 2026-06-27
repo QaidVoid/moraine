@@ -17,6 +17,7 @@ pub mod elog;
 pub mod news;
 pub mod news_state;
 pub mod plan;
+pub mod regen;
 pub mod render;
 pub mod resolve_install;
 pub mod run;

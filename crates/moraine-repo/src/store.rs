@@ -51,7 +51,7 @@ pub const MAGIC: [u8; 8] = *b"MORAREPO";
 /// All fields are plain strings or string lists so nothing interner-specific is
 /// written to disk. Dependency variables and `REQUIRED_USE` are kept as their
 /// raw text and parsed into ASTs at load time.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredEntry {
     /// The category, for example `dev-libs`.
     pub category: String,

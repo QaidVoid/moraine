@@ -64,7 +64,11 @@ impl MetadataRefresher for FakeRefresher {
             .lock()
             .unwrap()
             .push((repo.to_owned(), mode == RefreshMode::Full));
-        Ok(RefreshReport { mode, entries: 1 })
+        Ok(RefreshReport {
+            mode,
+            entries: 1,
+            regenerated: 0,
+        })
     }
 }
 

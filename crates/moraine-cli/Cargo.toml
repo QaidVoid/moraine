@@ -20,6 +20,7 @@ moraine-resolve = { version = "0.1.0", path = "../moraine-resolve" }
 moraine-sync = { version = "0.1.0", path = "../moraine-sync" }
 moraine-vdb = { version = "0.1.0", path = "../moraine-vdb" }
 moraine-version = { version = "0.1.0", path = "../moraine-version" }
+tempfile = "3.27.0"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
