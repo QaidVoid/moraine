@@ -31,20 +31,37 @@ pub fn import_vdb(
     let span = tracing::info_span!("vdb.import", root = %vdb_root.display());
     let _enter = span.enter();
 
-    let pkg_dirs = collect_package_dirs(vdb_root)?;
+    let pkg_dirs = list_package_dirs(vdb_root)?;
     tracing::info!(count = pkg_dirs.len(), "discovered package directories");
 
+    // A single malformed directory is logged and skipped rather than aborting the
+    // whole import, mirroring `_iter_cpv_all` catching `InvalidData`, recording
+    // the invalid entry, and continuing (`vartree.py:564-571`).
     let records: Vec<PackageRecord> = pkg_dirs
         .par_iter()
-        .map(|dir| import_package_dir(dir, interner))
-        .collect::<Result<_, _>>()?;
+        .filter_map(|dir| match import_package_dir(dir, interner) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                tracing::warn!(
+                    package = %dir.display(),
+                    %error,
+                    "skipping malformed package directory"
+                );
+                None
+            }
+        })
+        .collect();
 
     tracing::info!(count = records.len(), "import complete");
     Ok(records)
 }
 
 /// List every `<category>/<P-V>` directory under `vdb_root`, skipping dotfiles.
-fn collect_package_dirs(vdb_root: &Path) -> Result<Vec<PathBuf>, VdbError> {
+///
+/// Used by the bulk import and by cache revalidation to discover dbdirs present
+/// on disk but absent from the cache, mirroring Portage's `_iter_cpv_all` tree
+/// enumeration. A failure to enumerate the vdb root is fatal.
+pub fn list_package_dirs(vdb_root: &Path) -> Result<Vec<PathBuf>, VdbError> {
     let mut dirs = Vec::new();
     let categories = std::fs::read_dir(vdb_root).with_path(vdb_root)?;
     for cat in categories {
@@ -119,10 +136,9 @@ pub fn import_package_dir(dir: &Path, interner: &Interner) -> Result<PackageReco
 
     // Required fields: must exist as a file or in the environment.
     let eapi = read_aux("EAPI")?.unwrap_or_else(|| "0".to_string());
-    let slot_raw = read_aux("SLOT")?.ok_or_else(|| VdbError::MissingField {
-        field: "SLOT",
-        package: cpv.clone(),
-    })?;
+    // A missing `SLOT` defaults to `0`, mirroring `aux_get` forcing an empty or
+    // invalid slot to `0` so slot-atom generation cannot break (`vartree.py:862-866`).
+    let slot_raw = read_aux("SLOT")?.unwrap_or_else(|| "0".to_string());
 
     let slot = parse_slot(&slot_raw, interner);
     let features = moraine_eapi::features_for(&eapi);
@@ -247,18 +263,38 @@ fn read_line_file(dir: &Path, key: &str) -> Result<Option<String>, VdbError> {
 }
 
 /// Parse `SLOT` (`slot` or `slot/subslot`) into a [`Slot`].
+///
+/// An empty or syntactically invalid slot, or a present but empty or invalid
+/// sub-slot, normalizes the whole value to `0` with no sub-slot, mirroring
+/// `aux_get` replacing an out-of-grammar `SLOT` with `0` (`vartree.py:862-866`).
 fn parse_slot(raw: &str, interner: &Interner) -> Slot {
     let raw = raw.trim();
     match raw.split_once('/') {
-        Some((slot, subslot)) => Slot {
+        Some((slot, subslot)) if is_valid_slot_name(slot) && is_valid_slot_name(subslot) => Slot {
             slot: interner.intern(slot),
             subslot: Some(interner.intern(subslot)),
         },
-        None => Slot {
+        None if is_valid_slot_name(raw) => Slot {
             slot: interner.intern(raw),
             subslot: None,
         },
+        _ => Slot {
+            slot: interner.intern("0"),
+            subslot: None,
+        },
     }
+}
+
+/// Whether `name` matches Portage's `_slot` grammar `[\w][\w+.-]*`: the first
+/// character is ASCII alphanumeric or `_`, and every character is ASCII
+/// alphanumeric or one of `_ + . -`.
+fn is_valid_slot_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '.' | '-'))
 }
 
 /// Split `P-V` into `(package, version)` by locating the version component,
@@ -591,6 +627,67 @@ mod tests {
         let (name, ver) = split_pv("foo-1.2.3").unwrap();
         assert_eq!(name, "foo");
         assert_eq!(ver, "1.2.3");
+    }
+
+    #[test]
+    fn import_vdb_skips_one_malformed_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let vdb = dir.path();
+
+        // A well-formed package.
+        let good = vdb.join("cat").join("good-1");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(good.join("SLOT"), "0\n").unwrap();
+        std::fs::write(good.join("EAPI"), "8\n").unwrap();
+
+        // A malformed package: a NEEDED.ELF.2 line with fewer than five fields.
+        let bad = vdb.join("cat").join("bad-1");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("SLOT"), "0\n").unwrap();
+        std::fs::write(bad.join("EAPI"), "8\n").unwrap();
+        std::fs::write(
+            bad.join("NEEDED.ELF.2"),
+            "X86_64;/usr/lib/libfoo.so;libfoo.so\n",
+        )
+        .unwrap();
+
+        let interner = Interner::new();
+        let records = import_vdb(vdb, &interner).unwrap();
+        let cpvs: Vec<String> = records.iter().map(|r| r.cpv(&interner)).collect();
+        // Only the well-formed package survives; the malformed one is skipped.
+        assert_eq!(cpvs, vec!["cat/good-1".to_string()]);
+    }
+
+    #[test]
+    fn missing_slot_imports_as_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("cat").join("noslot-1");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("EAPI"), "8\n").unwrap();
+        // No SLOT file and no environment.bz2.
+
+        let interner = Interner::new();
+        let record = import_package_dir(&pkg, &interner).unwrap();
+        assert_eq!(interner.resolve(record.slot.slot).as_deref(), Some("0"));
+        assert!(record.slot.subslot.is_none());
+    }
+
+    #[test]
+    fn parse_slot_normalizes_empty_and_invalid() {
+        let interner = Interner::new();
+        let zero = interner.intern("0");
+        for raw in ["", "0/", "-bad", "/", "a/-bad"] {
+            let slot = parse_slot(raw, &interner);
+            assert_eq!(slot.slot, zero, "slot {raw:?} should normalize to 0");
+            assert!(
+                slot.subslot.is_none(),
+                "slot {raw:?} should have no sub-slot"
+            );
+        }
+        // A well-formed slot and slot/subslot stay unchanged.
+        let s = parse_slot("2/3", &interner);
+        assert_eq!(interner.resolve(s.slot).as_deref(), Some("2"));
+        assert_eq!(interner.resolve(s.subslot.unwrap()).as_deref(), Some("3"));
     }
 
     #[test]

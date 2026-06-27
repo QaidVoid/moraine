@@ -34,7 +34,7 @@ pub mod vardb;
 
 pub use contents::{Contents, Entry, EntryKind};
 pub use error::VdbError;
-pub use import::import_vdb;
+pub use import::{import_package_dir, import_vdb, list_package_dirs};
 pub use query::{Installed, SlotBinding};
 pub use record::{Depend, DependKind, DependSet, EnvironmentRef, PackageRecord, Slot};
 pub use soname::{Provides, Requires, SonameEntry};

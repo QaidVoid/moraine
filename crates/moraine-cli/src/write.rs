@@ -6,7 +6,7 @@
 //! orchestrator's [`EngineApplier`]; this module only plans the work, confirms
 //! it when asked, and reports the outcome.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -162,12 +162,49 @@ fn revalidate_cache(store: Store, vdb_dir: &Path) -> Store {
             continue;
         }
         stale = true;
+        // The dbdir is gone (an external unmerge, or the old half of an external
+        // same-slot upgrade): drop the cache entry. This is checked explicitly
+        // rather than relying on a re-import error, since a missing `SLOT` now
+        // defaults to `0` and would otherwise yield a degenerate record.
+        if !dir.is_dir() {
+            continue;
+        }
         match moraine_vdb::import::import_package_dir(&dir, &interner) {
             Ok(reimported) => records.push(reimported),
-            // The dbdir is gone (an external unmerge): drop the cache entry.
             Err(_) => continue,
         }
     }
+
+    // Discover dbdirs present in the tree but absent from the cache, for example
+    // an external `emerge` install or the new half of an external same-slot
+    // upgrade, mirroring `_iter_cpv_all` enumerating the tree on every access
+    // (`vartree.py:525-571`).
+    let known: HashSet<PathBuf> = records
+        .iter()
+        .map(|rec| moraine_vdb::vardb::record_dbdir(vdb_dir, rec, &interner))
+        .collect();
+    match moraine_vdb::list_package_dirs(vdb_dir) {
+        Ok(dirs) => {
+            for dir in dirs {
+                if known.contains(&dir) {
+                    continue;
+                }
+                match moraine_vdb::import::import_package_dir(&dir, &interner) {
+                    Ok(record) => {
+                        records.push(record);
+                        stale = true;
+                    }
+                    Err(error) => tracing::warn!(
+                        package = %dir.display(),
+                        %error,
+                        "skipping malformed package directory during discovery"
+                    ),
+                }
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not enumerate vdb tree for discovery"),
+    }
+
     if !stale {
         return store;
     }
@@ -827,6 +864,42 @@ mod tests {
         assert_eq!(slot_of("cat/a-1"), "5");
         // `cat/b-1` was served from the cache, not re-imported.
         assert_eq!(slot_of("cat/b-1"), "0");
+    }
+
+    #[test]
+    fn externally_added_dbdir_is_discovered_on_load() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let vdb = dir.path();
+        let mk = |name: &str, counter: &str| {
+            let pdir = vdb.join("cat").join(name);
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::write(pdir.join("SLOT"), "0\n").unwrap();
+            std::fs::write(pdir.join("EAPI"), "8\n").unwrap();
+            std::fs::write(pdir.join("COUNTER"), counter).unwrap();
+        };
+
+        // Seed the cache with one installed package and persist it.
+        mk("pkg-1", "1\n");
+        let interner = Arc::new(moraine_common::Interner::new());
+        let records = moraine_vdb::import_vdb(vdb, &interner).unwrap();
+        let store = Store::from_records(StorePaths::in_dir(vdb), interner, records);
+        store.write_primary().unwrap();
+
+        // After the cache was written, an external emerge installs a brand-new
+        // package and performs a same-slot upgrade of the seeded one.
+        mk("dep-1", "2\n");
+        std::fs::remove_dir_all(vdb.join("cat/pkg-1")).unwrap();
+        mk("pkg-2", "3\n");
+
+        let reloaded = load_installed_store(vdb).unwrap();
+        let li = reloaded.interner();
+        let cpvs: BTreeSet<String> = reloaded.records().iter().map(|r| r.cpv(li)).collect();
+        // The externally-added package is discovered on load.
+        assert!(cpvs.contains("cat/dep-1"));
+        // The new half of the same-slot upgrade is visible; the old half is gone.
+        assert!(cpvs.contains("cat/pkg-2"));
+        assert!(!cpvs.contains("cat/pkg-1"));
     }
 
     #[test]

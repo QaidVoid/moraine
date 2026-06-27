@@ -5,7 +5,6 @@ use std::io::Write as _;
 use std::path::Path;
 
 use moraine_common::Interner;
-use moraine_vdb::error::VdbError;
 
 fn write(dir: &Path, name: &str, content: &str) {
     fs::write(dir.join(name), content).unwrap();
@@ -94,21 +93,18 @@ fn recovers_field_from_environment() {
 }
 
 #[test]
-fn missing_required_field_surfaces_diagnostic() {
+fn missing_slot_defaults_to_zero() {
     let root = tempfile::tempdir().unwrap();
     let dir = make_pkg(root.path(), "app-misc", "baz-1.0");
-    // SLOT is required; remove it and give no environment to recover from.
+    // Remove SLOT and give no environment to recover from: it defaults to `0`
+    // with no sub-slot rather than aborting the import.
     fs::remove_file(dir.join("SLOT")).unwrap();
 
     let interner = Interner::new();
-    let err = moraine_vdb::import_vdb(root.path(), &interner).unwrap_err();
-    match err {
-        VdbError::MissingField { field, package } => {
-            assert_eq!(field, "SLOT");
-            assert!(package.contains("baz"));
-        }
-        other => panic!("expected MissingField, got {other:?}"),
-    }
+    let records = moraine_vdb::import_vdb(root.path(), &interner).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(interner.resolve(records[0].slot.slot).as_deref(), Some("0"));
+    assert!(records[0].slot.subslot.is_none());
 }
 
 #[test]
