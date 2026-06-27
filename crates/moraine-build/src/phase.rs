@@ -80,6 +80,12 @@ pub struct PhaseReport {
     pub runs: Vec<PhaseRun>,
     /// All captured elog messages, in order.
     pub elog: Vec<ElogMessage>,
+    /// The final phase's raw saved environment, captured unfiltered so the strip
+    /// stage can read the `PORTAGE_DOSTRIP`/`PORTAGE_DOSTRIP_SKIP` arrays. The
+    /// lossy cross-phase carry flattens bash arrays into scalars, so these arrays
+    /// are dropped from the carry and read here from the last phase's dump
+    /// (`src_install`) instead.
+    pub final_env: BTreeMap<String, String>,
 }
 
 impl PhaseReport {
@@ -246,7 +252,23 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
             carried = new_carried;
             report.runs.push(run);
         }
+        report.final_env = self.read_raw_saved_env();
         Ok(report)
+    }
+
+    /// Read the last phase's saved environment dump unfiltered.
+    ///
+    /// The strip stage needs the `PORTAGE_DOSTRIP` arrays the final phase
+    /// recorded. Those arrays cannot survive the filtered, scalar-only carry, so
+    /// they are read here straight from the last `set`-style dump (the file the
+    /// most recent phase wrote, normally `src_install`). A missing file yields an
+    /// empty map.
+    fn read_raw_saved_env(&self) -> BTreeMap<String, String> {
+        let saved_path = self.layout.temp.join("environment");
+        match std::fs::read_to_string(&saved_path) {
+            Ok(text) => parse_env_file(&text),
+            Err(_) => BTreeMap::new(),
+        }
     }
 
     /// Run the `pkg_nofetch` phase on demand for a fetch-restricted package whose

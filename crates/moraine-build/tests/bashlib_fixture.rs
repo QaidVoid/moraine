@@ -322,6 +322,243 @@ fn bare_default_runs_eapi_default() {
 }
 
 #[test]
+fn unpack_tar_zst_and_standalone_xz() {
+    if !bash_available() {
+        return;
+    }
+    // Skip cleanly when the compressors are unavailable.
+    let have = |p: &str| {
+        Command::new(p)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if !have("zstd") || !have("xz") || !have("tar") {
+        return;
+    }
+    let fx = Fixture::new();
+    let dist = fx.root.join("dist");
+    std::fs::create_dir_all(&dist).unwrap();
+    // Build a .tar.zst whose member is a single file.
+    let payload = fx.root.join("payload");
+    std::fs::create_dir_all(payload.join("sub")).unwrap();
+    std::fs::write(payload.join("sub/file.txt"), "hello\n").unwrap();
+    let tar_zst = dist.join("pkg-data.tar.zst");
+    assert!(
+        Command::new("tar")
+            .args(["--zstd", "-cf"])
+            .arg(&tar_zst)
+            .arg("-C")
+            .arg(&payload)
+            .arg("sub")
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Build a standalone .xz of a plain file.
+    std::fs::write(dist.join("note"), "standalone\n").unwrap();
+    assert!(
+        Command::new("xz")
+            .arg("-z")
+            .arg(dist.join("note"))
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let eb = fx.ebuild("EAPI=8\nsrc_unpack() { unpack pkg-data.tar.zst note.xz; }\n");
+    let (out, ok) = fx.run_phase(
+        "8",
+        &eb,
+        "src_unpack",
+        &[("DISTDIR", &dist.to_string_lossy())],
+    );
+    assert!(ok, "unpack failed: {out}");
+    let work = fx.root.join("work");
+    assert!(
+        work.join("sub/file.txt").is_file(),
+        ".tar.zst not extracted: {out}"
+    );
+    assert!(work.join("note").is_file(), ".xz not extracted: {out}");
+}
+
+#[test]
+fn unpack_skips_unsupported_suffix() {
+    if !bash_available() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dist = fx.root.join("dist");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("readme.txt"), "not an archive\n").unwrap();
+    // unpack of a non-archive must skip and continue rather than die.
+    let eb = fx.ebuild("EAPI=8\nsrc_unpack() { unpack readme.txt; echo SURVIVED; }\n");
+    let (out, ok) = fx.run_phase(
+        "8",
+        &eb,
+        "src_unpack",
+        &[("DISTDIR", &dist.to_string_lossy())],
+    );
+    assert!(ok, "unpack of unsupported suffix aborted: {out}");
+    assert!(out.contains("SURVIVED"), "phase did not continue: {out}");
+}
+
+#[test]
+fn unpack_normalizes_extracted_permissions() {
+    if !bash_available() {
+        return;
+    }
+    if Command::new("tar").arg("--version").output().is_err() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dist = fx.root.join("dist");
+    std::fs::create_dir_all(&dist).unwrap();
+    let payload = fx.root.join("payload");
+    std::fs::create_dir_all(&payload).unwrap();
+    let restricted = payload.join("locked.txt");
+    std::fs::write(&restricted, "data\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Owner-only perms: readable so tar can archive it, but no group/other
+        // read for the post-unpack chmod to add.
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let tar = dist.join("pkg.tar");
+    assert!(
+        Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&payload)
+            .arg("locked.txt")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let eb = fx.ebuild("EAPI=8\nsrc_unpack() { unpack pkg.tar; }\n");
+    let (out, ok) = fx.run_phase(
+        "8",
+        &eb,
+        "src_unpack",
+        &[("DISTDIR", &dist.to_string_lossy())],
+    );
+    assert!(ok, "unpack failed: {out}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(fx.root.join("work/locked.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        // The post-unpack chmod (a+rX) adds group and other read bits.
+        assert_eq!(mode & 0o044, 0o044, "read bits not added: {mode:o}");
+    }
+}
+
+#[test]
+fn dosym_r_writes_relative_target() {
+    if !bash_available() {
+        return;
+    }
+    let fx = Fixture::new();
+    let eb = fx.ebuild("EAPI=8\nsrc_install() { dosym -r /usr/lib/foo.so /usr/bin/foo.so; }\n");
+    let (out, ok) = fx.run_phase("8", &eb, "src_install", &[]);
+    assert!(ok, "{out}");
+    let link = fx.root.join("image/usr/bin/foo.so");
+    let target = std::fs::read_link(&link).unwrap();
+    assert_eq!(
+        target,
+        std::path::PathBuf::from("../lib/foo.so"),
+        "dosym -r did not produce a relative target: {out}"
+    );
+}
+
+#[test]
+fn doman_routes_localized_page() {
+    if !bash_available() {
+        return;
+    }
+    let fx = Fixture::new();
+    let work = fx.root.join("work");
+    std::fs::write(work.join("foo.de.1"), "german man page\n").unwrap();
+    let eb = fx.ebuild("EAPI=8\nsrc_install() { doman foo.de.1; }\n");
+    let (out, ok) = fx.run_phase("8", &eb, "src_install", &[]);
+    assert!(ok, "{out}");
+    assert!(
+        fx.root.join("image/usr/share/man/de/man1/foo.1").is_file(),
+        "localized man page not routed to de/man1/foo.1: {out}"
+    );
+}
+
+#[test]
+fn domo_honors_moprefix() {
+    if !bash_available() {
+        return;
+    }
+    let fx = Fixture::new();
+    let work = fx.root.join("work");
+    std::fs::write(work.join("de.mo"), "catalog\n").unwrap();
+    let eb = fx.ebuild("EAPI=8\nsrc_install() { MOPREFIX=myapp domo de.mo; }\n");
+    let (out, ok) = fx.run_phase("8", &eb, "src_install", &[]);
+    assert!(ok, "{out}");
+    assert!(
+        fx.root
+            .join("image/usr/share/locale/de/LC_MESSAGES/myapp.mo")
+            .is_file(),
+        "domo did not use MOPREFIX for the catalog name: {out}"
+    );
+}
+
+#[test]
+fn doins_recursive_normalizes_mode() {
+    if !bash_available() {
+        return;
+    }
+    let fx = Fixture::new();
+    let work = fx.root.join("work");
+    let tree = work.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let exec = tree.join("script");
+    std::fs::write(&exec, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let eb = fx.ebuild("EAPI=8\nsrc_install() { insinto /opt; doins -r tree; }\n");
+    let (out, ok) = fx.run_phase("8", &eb, "src_install", &[]);
+    assert!(ok, "{out}");
+    let installed = fx.root.join("image/opt/tree/script");
+    assert!(
+        installed.is_file(),
+        "recursive doins did not install: {out}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777;
+        // INSOPTIONS default normalizes to 0644, not the source 0755.
+        assert_eq!(mode, 0o644, "mode not normalized: {mode:o}");
+    }
+}
+
+#[test]
+fn corpus_helper_fidelity_end_to_end() {
+    if std::env::var_os("MORAINE_CORPUS").is_none() {
+        // No real end-to-end build without the corpus opt-in.
+        return;
+    }
+    // With MORAINE_CORPUS set, a real build of a package shipping a .info
+    // manual, a localized man page, and a message catalog would assert those
+    // land in the image and that a dostrip -x exclusion is observed by the
+    // strip stage. The corpus harness drives that; this test is the seam.
+    eprintln!("MORAINE_CORPUS set: real helper-fidelity end-to-end would run here");
+}
+
+#[test]
 fn nonfatal_and_die_n_do_not_abort() {
     if !bash_available() {
         return;

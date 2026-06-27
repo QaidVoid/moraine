@@ -408,6 +408,18 @@ const READONLY_VARS: &[&str] = &[
 /// Bash-internal variables that must be dropped from a saved environment.
 /// Mirrors the stock shell-internal filter set.
 const SHELL_INTERNAL_PREFIXES: &[&str] = &["BASH", "PIPESTATUS", "FUNCNAME", "SHELLOPTS"];
+
+/// Bash array variables that the scalar-only carry cannot represent. Re-sourcing
+/// their `set`-style dump as a scalar `export` corrupts the array, so they are
+/// dropped from the cross-phase carry. The phase library re-initializes them at
+/// source time, and the strip stage reads the final values from the last phase's
+/// raw dump instead of from the carried environment.
+const ARRAY_CARRY_UNSAFE: &[&str] = &[
+    "PORTAGE_DOSTRIP",
+    "PORTAGE_DOSTRIP_SKIP",
+    "PORTAGE_DOCOMPRESS",
+    "PORTAGE_DOCOMPRESS_SKIP",
+];
 const SHELL_INTERNAL_EXACT: &[&str] = &[
     "EUID", "UID", "PPID", "PWD", "OLDPWD", "RANDOM", "SECONDS", "LINENO", "_", "IFS",
 ];
@@ -429,7 +441,8 @@ pub fn filter_saved_env(
 ) -> BTreeMap<String, String> {
     let mut out = previous.clone();
     for (key, value) in incoming {
-        if is_readonly(key) || is_shell_internal(key) {
+        if is_readonly(key) || is_shell_internal(key) || ARRAY_CARRY_UNSAFE.contains(&key.as_str())
+        {
             continue;
         }
         if let Some(suffix) = key.strip_prefix("SANDBOX_") {

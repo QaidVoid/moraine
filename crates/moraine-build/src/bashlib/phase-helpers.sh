@@ -10,6 +10,21 @@
 # bin/ebuild-helpers/* scripts on PATH) to keep the whole helper surface in the
 # sourced library, matching moraine's per-phase driver boundary.
 
+# Install-helper defaults and the doc/strip path lists, mirroring the exports at
+# the top of bin/phase-helpers.sh. MOPREFIX seeds the message-catalog name so an
+# eclass or ebuild override is honored by domo. The PORTAGE_DOCOMPRESS and
+# PORTAGE_DOSTRIP arrays give docompress and dostrip something to append to;
+# PORTAGE_DOSTRIP defaults to the image root unless RESTRICT bans stripping.
+export MOPREFIX=${PN}
+export PORTAGE_DOCOMPRESS_SIZE_LIMIT="128"
+declare -a PORTAGE_DOCOMPRESS=( /usr/share/{doc,info,man} )
+declare -a PORTAGE_DOCOMPRESS_SKIP=( "/usr/share/doc/${PF}/html" )
+declare -a PORTAGE_DOSTRIP=()
+declare -a PORTAGE_DOSTRIP_SKIP=()
+if ! contains_word strip "${RESTRICT}"; then
+    PORTAGE_DOSTRIP+=( / )
+fi
+
 # The image destination, prefix-aware. Falls back to D when ED is unset (for a
 # non-prefix build or an EAPI without prefix variables).
 __edest() {
@@ -231,31 +246,159 @@ emake() {
 }
 
 unpack() {
-    local file src
-    (( $# == 0 )) && die "unpack: too few arguments"
-    for file in "$@"; do
-        if [[ ${file} == ./* ]]; then
-            src=${file}
-        elif [[ ${file} == /* ]]; then
-            ___eapi_unpack_supports_absolute_paths || \
-                die "unpack: absolute paths not supported in EAPI ${EAPI}: ${file}"
-            src=${file}
-        else
-            src="${DISTDIR}/${file}"
-        fi
-        [[ -e ${src} ]] || die "unpack: file does not exist: ${src}"
-        case ${file} in
-            *.tar)            tar xf "${src}" || die "unpack failed: ${file}" ;;
-            *.tar.gz|*.tgz)   tar xzf "${src}" || die "unpack failed: ${file}" ;;
-            *.tar.bz2|*.tbz2|*.tbz) tar xjf "${src}" || die "unpack failed: ${file}" ;;
-            *.tar.xz|*.txz)   tar xJf "${src}" || die "unpack failed: ${file}" ;;
-            *.tar.lz)         tar --lzip -xf "${src}" || die "unpack failed: ${file}" ;;
-            *.gz|*.z)         gunzip -c "${src}" > "${file%.*}" || die "unpack failed: ${file}" ;;
-            *.bz2)            bunzip2 -c "${src}" > "${file%.*}" || die "unpack failed: ${file}" ;;
-            *.zip|*.jar)      unzip -qo "${src}" || die "unpack failed: ${file}" ;;
-            *)                die "unpack: unknown archive format: ${file}" ;;
-        esac
+    local bzip2_cmd basename output srcdir suffix name f
+    local -A suffix_by
+    local -a suffixes
+
+    (( $# == 0 )) && die "unpack: too few arguments (got 0; expected at least 1)"
+
+    # The supported-suffix set, case-sensitively, per PMS 12.3.15. EAPI-gated
+    # formats are appended only when the active EAPI accepts them.
+    suffixes=(
+        a
+        bz
+        bz2
+        deb
+        gz
+        jar
+        lzma
+        tar
+        tar.bz
+        tar.bz2
+        tar.gz
+        tar.lzma
+        tar.Z
+        tbz
+        tbz2
+        tgz
+        Z
+        zip
+        ZIP
+    )
+    ___eapi_unpack_supports_7z  && suffixes+=( 7z 7Z )
+    ___eapi_unpack_supports_lha && suffixes+=( lha LHa LHA lzh )
+    ___eapi_unpack_supports_rar && suffixes+=( rar RAR )
+    ___eapi_unpack_supports_txz && suffixes+=( tar.xz txz )
+    ___eapi_unpack_supports_xz  && suffixes+=( xz )
+
+    # GNU tar auto-decompresses these compressed tarballs via
+    # --warning=decompress-program (the tar|tar.*|tgz dispatch below). The zstd
+    # and lz4 distfiles are now common in the Gentoo tree, so admit them to the
+    # supported set rather than skipping them.
+    suffixes+=( tar.lz tar.lzo tar.lz4 tar.zst )
+
+    # Compose the finalised dictionary of supported suffixes. From EAPI 6 the
+    # match is case-insensitive, induced by lowercasing every later assignment.
+    if ! ___eapi_unpack_is_case_sensitive; then
+        typeset -l suffix
+    fi
+    for suffix in "${suffixes[@]}"; do
+        suffix_by[$suffix]=
     done
+
+    # Honour the user's choice of bzip2 decompressor, if specified.
+    for name in PORTAGE_BUNZIP2_CMD PORTAGE_BZIP2_CMD; do
+        if [[ ${!name} == +([![:blank:]\"\']) ]]; then
+            bzip2_cmd=${!name}
+            break
+        fi
+    done
+
+    for f; do
+        # wrt PMS 12.3.15 Misc Commands
+        if [[ ${f} != */* ]]; then
+            srcdir=${DISTDIR}/
+        elif [[ ${f} == ./* ]]; then
+            srcdir=
+        elif ___eapi_unpack_supports_absolute_paths; then
+            srcdir=
+            if [[ ${f} == "${DISTDIR%/}"/* ]]; then
+                eqawarn "QA Notice: unpack called with redundant \${DISTDIR} in path"
+            fi
+        elif [[ ${f} == "${DISTDIR%/}"/* ]]; then
+            die "Arguments to unpack() cannot begin with \${DISTDIR} in EAPI ${EAPI}"
+        elif [[ ${f} == /* ]]; then
+            die "Arguments to unpack() cannot be absolute in EAPI ${EAPI}"
+        else
+            die "Relative paths to unpack() must be prefixed with './' in EAPI ${EAPI}"
+        fi
+
+        if [[ ! -f ${srcdir}${f} ]]; then
+            die "unpack: ${f@Q} either does not exist or is not a regular file"
+        elif [[ ! -s ${srcdir}${f} ]]; then
+            die "unpack: ${f@Q} cannot be unpacked because it is an empty file"
+        fi
+
+        # Extract the suffix, recognising multi-part tar.* suffixes.
+        basename=${f##*/}
+        suffix=
+        if [[ ${basename} =~ \.([Tt][Aa][Rr]\.)?[^.]+$ ]]; then
+            suffix=${BASH_REMATCH[0]#.}
+        fi
+
+        # Skip any file bearing an unsupported suffix instead of dying.
+        if [[ ${suffix} && -v 'suffix_by[$suffix]' ]]; then
+            __vecho ">>> Unpacking ${f@Q} to ${PWD}"
+        else
+            __vecho "=== Skipping unpack of ${f@Q}"
+            continue
+        fi
+
+        case ${suffix,,} in
+            7z)
+                if ! output=$(7z x -y "${srcdir}${f}"); then
+                    printf '%s\n' "${output}" >&2
+                    false
+                fi
+                ;;
+            a)
+                ar x "${srcdir}${f}"
+                ;;
+            bz|bz2)
+                "${bzip2_cmd-bzip2}" -dc -- "${srcdir}${f}" > "${basename%.*}"
+                ;;
+            deb)
+                ar x "${srcdir}${f}"
+                ;;
+            gz|z)
+                gzip -dc -- "${srcdir}${f}" > "${basename%.*}"
+                ;;
+            jar|zip)
+                # unzip can prompt interactively on errors (bug #336285);
+                # inducing EOF on stdin is an adequate countermeasure.
+                unzip -qo "${srcdir}${f}" </dev/null
+                ;;
+            lha|lzh)
+                lha xfq "${srcdir}${f}"
+                ;;
+            lzma)
+                xz -F lzma -dc -- "${srcdir}${f}" > "${basename%.*}"
+                ;;
+            rar)
+                unrar x -idq -o+ "${srcdir}${f}"
+                ;;
+            tar.bz|tar.bz2|tbz|tbz2)
+                gtar -I "${bzip2_cmd-bzip2} -c" -xof "${srcdir}${f}"
+                ;;
+            tar|tar.*|tgz)
+                # GNU tar recognises various compressors by suffix and runs the
+                # appropriate decompressor; this handles tar.zst, tar.lz and more.
+                gtar --warning=decompress-program -xof "${srcdir}${f}"
+                ;;
+            txz)
+                gtar -xJof "${srcdir}${f}"
+                ;;
+            xz)
+                xz -dc -- "${srcdir}${f}" > "${basename%.*}"
+                ;;
+        esac || die "unpack: failure unpacking ${f@Q}"
+    done
+
+    # PMS 12.3.15: make the freshly extracted top-level entries readable and
+    # traversable so later phases can read the tree. '.' is left alone since it
+    # is probably ${WORKDIR}. moraine has no chmod-lite on PATH, so the read-for-
+    # all / traverse-for-directories mode is applied inline.
+    find . -mindepth 1 -maxdepth 1 ! -type l -exec chmod -R a+rX {} +
 }
 
 econf() {
@@ -520,17 +663,51 @@ doexe() {
     install ${EXEOPTIONS:--m0755} "$@" "${dir}/" || __helpers_die "${FUNCNAME} failed"
 }
 
+# Install one file into the destination directory, normalizing its mode to
+# INSOPTIONS. A symlink source is recreated as a symlink for EAPI 4 and later
+# and otherwise dereferenced, matching bin/doins.py _doins.
+__doins_file() {
+    local dir=$1 src=$2
+    if [[ -L ${src} ]] && ___eapi_doins_and_newins_preserve_symlinks; then
+        cp -P "${src}" "${dir}/" || __helpers_die "doins failed"
+    else
+        install ${INSOPTIONS:--m0644} "${src}" "${dir}/" || __helpers_die "doins failed"
+    fi
+}
+
+# Recreate a source directory under the destination, descending into it and
+# normalizing every installed file's mode, matching doins.py recursion.
+__doins_dir() {
+    local dir=$1 src=${2%/}
+    local dest="${dir}/${src##*/}"
+    install -d "${dest}" || __helpers_die "doins failed"
+    local entry restore_nullglob restore_dotglob
+    restore_nullglob=$(shopt -p nullglob)
+    restore_dotglob=$(shopt -p dotglob)
+    shopt -s nullglob dotglob
+    for entry in "${src}"/*; do
+        if [[ -d ${entry} && ! -L ${entry} ]]; then
+            __doins_dir "${dest}" "${entry}"
+        else
+            __doins_file "${dest}" "${entry}"
+        fi
+    done
+    ${restore_nullglob}
+    ${restore_dotglob}
+}
+
 doins() {
     local ED=$(__edest) recursive=
     [[ $1 == -r ]] && { recursive=1; shift; }
     local dir="${ED}/${__E_INSDESTTREE#/}"
-    install -d "${dir}"
+    install -d "${dir}" || __helpers_die "${FUNCNAME} failed"
     local f
     for f in "$@"; do
-        if [[ -d ${f} && -n ${recursive} ]]; then
-            cp -R "${f}" "${dir}/" || __helpers_die "${FUNCNAME} failed"
+        if [[ -d ${f} && ! -L ${f} ]]; then
+            [[ -n ${recursive} ]] || { __helpers_die "doins: ${f} is a directory; use -r"; continue; }
+            __doins_dir "${dir}" "${f}"
         else
-            install ${INSOPTIONS:--m0644} "${f}" "${dir}/" || __helpers_die "${FUNCNAME} failed"
+            __doins_file "${dir}" "${f}"
         fi
     done
 }
@@ -558,15 +735,74 @@ doheader() {
     fi
 }
 
+doinfo() {
+    [[ -n $1 ]] || { __helpers_die "doinfo: at least one argument needed"; return 1; }
+    local ED=$(__edest)
+    if [[ ! -d ${ED}/usr/share/info ]]; then
+        install -d "${ED}/usr/share/info" || \
+            { __helpers_die "doinfo: failed to install ${ED}/usr/share/info"; return 1; }
+    fi
+    install -m0644 "$@" "${ED}/usr/share/info"
+    local rval=$?
+    if (( rval != 0 )); then
+        local x
+        for x in "$@"; do
+            [[ -e ${x} ]] || echo "!!! doinfo: ${x} does not exist" >&2
+        done
+        __helpers_die "doinfo failed"
+    fi
+    return ${rval}
+}
+
 doman() {
-    local ED=$(__edest) i name suffix dir
-    for i in "$@"; do
-        name=${i##*/}
-        suffix=${name##*.}
-        dir="${ED}/usr/share/man/man${suffix:0:1}"
-        install -d "${dir}"
-        install -m0644 "${i}" "${dir}/${name}" || __helpers_die "${FUNCNAME} failed"
+    (( $# >= 1 )) || { __helpers_die "doman: at least one argument needed"; return 1; }
+    local ED=$(__edest) i18n="" ret=0
+    local x suffix realname name mandir
+    for x in "$@"; do
+        if [[ ${x:0:6} == "-i18n=" ]]; then
+            i18n=${x:6}/
+            continue
+        fi
+        if [[ ${x:0:6} == ".keep_" ]]; then
+            continue
+        fi
+
+        suffix=${x##*.}
+
+        # A compressed man page is not portable; warn and re-derive the suffix.
+        if [[ ${suffix} == @(Z|gz|bz2) ]]; then
+            eqawarn "QA Notice: doman argument '${x}' is compressed, this is not portable"
+            realname=${x%.*}
+            suffix=${realname##*.}
+        fi
+
+        if [[ ${EAPI} == [23] ]] || [[ -z ${i18n} ]] && [[ ${EAPI:-0} != [01] ]] && [[ ${x} =~ (.*)\.([a-z][a-z](_[A-Z][A-Z])?)\.(.*) ]]; then
+            name=${BASH_REMATCH[1]##*/}.${BASH_REMATCH[4]}
+            mandir=${BASH_REMATCH[2]}/man${suffix:0:1}
+        else
+            name=${x##*/}
+            mandir=${i18n#/}man${suffix:0:1}
+        fi
+
+        if [[ ${mandir} == *man[0-9n] ]]; then
+            if [[ -s ${x} ]]; then
+                if [[ ! -d ${ED}/usr/share/man/${mandir} ]]; then
+                    install -d "${ED}/usr/share/man/${mandir}"
+                fi
+                install -m0644 "${x}" "${ED}/usr/share/man/${mandir}/${name}"
+                (( ret |= $? ))
+            elif [[ ! -e ${x} ]]; then
+                echo "!!! doman: ${x} does not exist" >&2
+                (( ret |= 1 ))
+            fi
+        else
+            __vecho "doman: '${x}' is probably not a man page; skipping" >&2
+            (( ret |= 1 ))
+        fi
     done
+
+    (( ret != 0 )) && __helpers_die "doman failed"
+    return ${ret}
 }
 
 dodoc() {
@@ -586,12 +822,79 @@ dodoc() {
 }
 
 dosym() {
-    ___eapi_has_dosym_r && [[ $1 == -r ]] && shift
+    local option_r=
+    if ___eapi_has_dosym_r && [[ $1 == -r ]]; then
+        option_r=t
+        shift
+    fi
+
+    [[ $# -eq 2 ]] || { __helpers_die "dosym: two arguments needed"; return 1; }
+
     local ED=$(__edest)
-    [[ $# -eq 2 ]] || die "dosym: expected two arguments"
-    local target=$1 link=$2
-    install -d "${ED}/$(dirname "${link#/}")"
-    ln -snf "${target}" "${ED}/${link#/}" || __helpers_die "${FUNCNAME} failed"
+
+    if [[ ${2} == */ ]] || [[ -d ${ED}/${2#/} && ! -L ${ED}/${2#/} ]]; then
+        # implicit basename not allowed by PMS (bug #379899)
+        __helpers_die "dosym: dosym target omits basename: '${2}'"
+        return 1
+    fi
+
+    local target=${1}
+
+    if [[ ${option_r} ]]; then
+        # Transparent bash-only replacement for GNU "realpath -m -s". Resolves
+        # "/./", "/../" and extra "/" characters without touching any file.
+        dosym_canonicalize() {
+            local path slash i prev out IFS=/
+
+            read -r -d '' -a path < <(printf '%s\0' "${1}")
+            [[ ${1} == /* ]] && slash=/
+
+            while true; do
+                prev=
+                for i in "${!path[@]}"; do
+                    if [[ -z ${path[i]} || ${path[i]} == . ]]; then
+                        unset "path[i]"
+                    elif [[ ${path[i]} != .. ]]; then
+                        prev=${i}
+                    elif [[ ${prev} || ${slash} ]]; then
+                        [[ ${prev} ]] && unset "path[prev]"
+                        unset "path[i]"
+                        continue 2
+                    fi
+                done
+                break
+            done
+
+            out="${slash}${path[*]}"
+            printf "%s\n" "${out:-.}"
+        }
+
+        # Expansion makes sense only for an absolute target path.
+        [[ ${target} == /* ]] || { __helpers_die \
+            "dosym: -r specified but no absolute target path: '${target}'"; return 1; }
+
+        target=$(dosym_canonicalize "${target}")
+        local linkdir comp
+        linkdir=$(dosym_canonicalize "/${2#/}")
+        linkdir=${linkdir%/*}
+        linkdir=${linkdir:-/}
+
+        local IFS=/
+        for comp in ${linkdir}; do
+            if [[ ${target%%/*} == "${comp}" ]]; then
+                target=${target#"${comp}"}
+                target=${target#/}
+            else
+                target=..${target:+/}${target}
+            fi
+        done
+        unset IFS
+        target=${target:-.}
+    fi
+
+    local destdir=${2%/*}
+    [[ ! -d ${ED}/${destdir#/} ]] && dodir "${destdir}"
+    ln -snf "${target}" "${ED}/${2#/}" || __helpers_die "${FUNCNAME} failed"
 }
 
 doinitd() {
@@ -612,13 +915,35 @@ doenvd() {
 
 domo() {
     ___eapi_has_domo || die "'${FUNCNAME}' not supported in this EAPI"
-    local ED=$(__edest) i name dir
-    for i in "$@"; do
-        name=${i##*/}
-        dir="${ED}/usr/share/locale/${name%.mo}/LC_MESSAGES"
-        install -d "${dir}"
-        install -m0644 "${i}" "${dir}/${PN}.mo" || __helpers_die "${FUNCNAME} failed"
+    (( $# >= 1 )) || { __helpers_die "domo: at least one argument needed"; return 1; }
+    local ED=$(__edest) x mytiny mydir ret=0
+
+    # EAPI 0 through 6 honor into; later EAPIs force /usr like the other
+    # /usr/share helpers. An unset __E_DESTTREE defaults to /usr; an empty value
+    # (set by `into /`) is kept so it routes to the image root.
+    local desttree
+    if ___eapi_domo_respects_into; then
+        desttree=${__E_DESTTREE-/usr}
+    else
+        desttree=/usr
+    fi
+
+    install -d "${ED}/${desttree#/}/share/locale"
+    for x in "$@"; do
+        if [[ -e ${x} ]]; then
+            mytiny=${x##*/}
+            mydir="${ED}/${desttree#/}/share/locale/${mytiny%.*}/LC_MESSAGES"
+            install -d "${mydir}"
+            install -m0644 "${x}" "${mydir}/${MOPREFIX}.mo"
+        else
+            echo "!!! domo: ${x} does not exist" >&2
+            false
+        fi
+        (( ret |= $? ))
     done
+
+    (( ret != 0 )) && __helpers_die "domo failed"
+    return ${ret}
 }
 
 keepdir() {
@@ -640,6 +965,62 @@ fowners() {
     local ED=$(__edest) owner=$1
     shift
     chown "${owner}" "${@/#/${ED}/}" || __helpers_die "${FUNCNAME} failed"
+}
+
+# Record paths whose docs the (future) compression stage should compress, or
+# with -x exclude from compression. Mirrors bin/phase-helpers.sh docompress.
+docompress() {
+    ___eapi_has_docompress || die "'docompress' not supported in this EAPI"
+
+    local f g
+    if [[ ${1} == "-x" ]]; then
+        shift
+        for f; do
+            f=$(__strip_duplicate_slashes "${f}"); f=${f%/}
+            [[ ${f:0:1} == / ]] || f="/${f}"
+            for g in "${PORTAGE_DOCOMPRESS_SKIP[@]}"; do
+                [[ ${f} == "${g}" ]] && continue 2
+            done
+            PORTAGE_DOCOMPRESS_SKIP+=( "${f}" )
+        done
+    else
+        for f; do
+            f=$(__strip_duplicate_slashes "${f}"); f=${f%/}
+            [[ ${f:0:1} == / ]] || f="/${f}"
+            for g in "${PORTAGE_DOCOMPRESS[@]}"; do
+                [[ ${f} == "${g}" ]] && continue 2
+            done
+            PORTAGE_DOCOMPRESS+=( "${f}" )
+        done
+    fi
+}
+
+# Record paths eligible for stripping, or with -x exclude them. The strip stage
+# consumes PORTAGE_DOSTRIP/PORTAGE_DOSTRIP_SKIP. Mirrors phase-helpers.sh dostrip.
+dostrip() {
+    ___eapi_has_dostrip || die "'${FUNCNAME}' not supported in this EAPI"
+
+    local f g
+    if [[ $1 == "-x" ]]; then
+        shift
+        for f; do
+            f=$(__strip_duplicate_slashes "${f}"); f=${f%/}
+            [[ ${f:0:1} == / ]] || f="/${f}"
+            for g in "${PORTAGE_DOSTRIP_SKIP[@]}"; do
+                [[ ${f} == "${g}" ]] && continue 2
+            done
+            PORTAGE_DOSTRIP_SKIP+=( "${f}" )
+        done
+    else
+        for f; do
+            f=$(__strip_duplicate_slashes "${f}"); f=${f%/}
+            [[ ${f:0:1} == / ]] || f="/${f}"
+            for g in "${PORTAGE_DOSTRIP[@]}"; do
+                [[ ${f} == "${g}" ]] && continue 2
+            done
+            PORTAGE_DOSTRIP+=( "${f}" )
+        done
+    fi
 }
 
 if ___eapi_has_dosed; then
@@ -667,7 +1048,9 @@ __new_helper() {
             die "${helper%% *}: reading from stdin not supported in this EAPI"
         cat > "${tmp}"
     else
-        cp -f "${src}" "${tmp}" || __helpers_die "${helper%% *} failed"
+        # -P preserves a symlink source as a symlink so newins/newexe honor the
+        # same symlink-preservation predicate as doins for EAPI 4 and later.
+        cp -Pf "${src}" "${tmp}" || __helpers_die "${helper%% *} failed"
     fi
     ${helper} "${tmp}"
 }

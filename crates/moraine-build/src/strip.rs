@@ -19,17 +19,30 @@ use crate::runner::{CommandRunner, CommandSpec};
 /// honoring the `FEATURES` and `RESTRICT` gates. Never returns an error: a
 /// missing host tool or a failed strip is logged and skipped so the build still
 /// completes, matching `estrip`'s tolerance.
+///
+/// `dostrip` and `dostrip_skip` are the `PORTAGE_DOSTRIP` and
+/// `PORTAGE_DOSTRIP_SKIP` absolute path lists the `dostrip` helper recorded
+/// during `src_install`. An object is stripped only when its image-relative path
+/// lies under a `dostrip` path and under no `dostrip_skip` path. An empty
+/// `dostrip` list falls back to stripping the whole image.
 pub fn strip_image<R: CommandRunner>(
     image: &Path,
     config: &ConfigEnv,
     restrict: &[String],
+    dostrip: &[String],
+    dostrip_skip: &[String],
     runner: &R,
 ) {
     // RESTRICT=binchecks/strip and FEATURES=nostrip suppress the default strip.
     if config.has_feature("nostrip") || restrict.iter().any(|r| r == "strip") {
         return;
     }
-    let objects = elf_objects(image);
+    let include = relative_paths(dostrip);
+    let exclude = relative_paths(dostrip_skip);
+    let objects: Vec<PathBuf> = elf_objects(image)
+        .into_iter()
+        .filter(|object| should_strip(object, image, &config.eprefix, &include, &exclude))
+        .collect();
     if objects.is_empty() {
         return;
     }
@@ -163,6 +176,94 @@ fn extension_with_debug(object: &Path) -> String {
     }
 }
 
+/// Whether an object should be stripped given the include/exclude path lists.
+///
+/// The object is stripped when its install-relative path lies under an include
+/// path and under no exclude path. An empty include list strips everything.
+fn should_strip(
+    object: &Path,
+    image: &Path,
+    eprefix: &str,
+    include: &[PathBuf],
+    exclude: &[PathBuf],
+) -> bool {
+    let Some(rel) = install_relative(object, image, eprefix) else {
+        return false;
+    };
+    let included = include.is_empty() || include.iter().any(|base| path_under(&rel, base));
+    let excluded = exclude.iter().any(|base| path_under(&rel, base));
+    included && !excluded
+}
+
+/// The object's path relative to the install root, accounting for the prefix
+/// offset so the `PORTAGE_DOSTRIP` paths (which are relative to `ED`) match.
+fn install_relative(object: &Path, image: &Path, eprefix: &str) -> Option<PathBuf> {
+    let rel = object.strip_prefix(image).ok()?;
+    let offset = eprefix.trim_start_matches('/').trim_end_matches('/');
+    if offset.is_empty() {
+        return Some(rel.to_path_buf());
+    }
+    match rel.strip_prefix(offset) {
+        Ok(stripped) => Some(stripped.to_path_buf()),
+        Err(_) => Some(rel.to_path_buf()),
+    }
+}
+
+/// Whether `path` lies at or under `base`, comparing whole path components. An
+/// empty `base` (the image root `/`) matches every path.
+fn path_under(path: &Path, base: &Path) -> bool {
+    base.as_os_str().is_empty() || path == base || path.starts_with(base)
+}
+
+/// Convert absolute `PORTAGE_DOSTRIP` paths into image-relative paths by
+/// dropping the leading slash. The bare root `/` becomes an empty path that
+/// matches every object.
+fn relative_paths(absolute: &[String]) -> Vec<PathBuf> {
+    absolute
+        .iter()
+        .map(|p| PathBuf::from(p.trim_start_matches('/')))
+        .collect()
+}
+
+/// Parse a bash `set -o posix` array dump such as `([0]="/" [1]="/usr/lib")`
+/// into its element strings. A value that is not an array dump, or an empty
+/// array `()`, yields an empty vector.
+pub fn parse_bash_string_array(dump: &str) -> Vec<String> {
+    let Some(inner) = dump
+        .trim()
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return Vec::new();
+    };
+    let chars: Vec<char> = inner.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '"' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let mut value = String::new();
+        while i < chars.len() {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                value.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if chars[i] == '"' {
+                i += 1;
+                break;
+            }
+            value.push(chars[i]);
+            i += 1;
+        }
+        out.push(value);
+    }
+    out
+}
+
 /// Collect the regular (non-symlink) ELF object files under `image`.
 fn elf_objects(image: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -214,7 +315,7 @@ mod tests {
         std::fs::write(tmp.path().join("a.bin"), elf_bytes()).unwrap();
         let runner = FakeRunner::always_ok();
         let cfg = ConfigEnv::rooted(["nostrip".to_string()]);
-        strip_image(tmp.path(), &cfg, &[], &runner);
+        strip_image(tmp.path(), &cfg, &[], &[], &[], &runner);
         assert!(runner.calls().is_empty());
     }
 
@@ -224,7 +325,7 @@ mod tests {
         std::fs::write(tmp.path().join("a.bin"), elf_bytes()).unwrap();
         let runner = FakeRunner::always_ok();
         let cfg = ConfigEnv::rooted([]);
-        strip_image(tmp.path(), &cfg, &["strip".to_string()], &runner);
+        strip_image(tmp.path(), &cfg, &["strip".to_string()], &[], &[], &runner);
         assert!(runner.calls().is_empty());
     }
 
@@ -236,7 +337,7 @@ mod tests {
         std::fs::write(tmp.path().join("lib.so"), elf_bytes()).unwrap();
         let runner = FakeRunner::always_ok();
         let cfg = ConfigEnv::rooted([]);
-        strip_image(tmp.path(), &cfg, &[], &runner);
+        strip_image(tmp.path(), &cfg, &[], &[], &[], &runner);
         let calls = runner.calls();
         // Only the two ELF files are stripped; the text file is untouched.
         assert_eq!(calls.len(), 2);
@@ -255,9 +356,50 @@ mod tests {
         std::fs::write(tmp.path().join("prog"), elf_bytes()).unwrap();
         let runner = FakeRunner::always_ok();
         let cfg = ConfigEnv::rooted(["splitdebug".to_string()]);
-        strip_image(tmp.path(), &cfg, &[], &runner);
+        strip_image(tmp.path(), &cfg, &[], &[], &[], &runner);
         let calls = runner.calls();
         let programs: Vec<&str> = calls.iter().map(|c| c.program.as_str()).collect();
         assert_eq!(programs, vec!["objcopy", "strip", "objcopy"]);
+    }
+
+    #[test]
+    fn dostrip_skip_excludes_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        // One object under an excluded path, one under a stripped path.
+        let keep = tmp.path().join("usr/lib/foo");
+        let strip = tmp.path().join("usr/bin");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::create_dir_all(&strip).unwrap();
+        std::fs::write(keep.join("keepme.so"), elf_bytes()).unwrap();
+        std::fs::write(strip.join("prog"), elf_bytes()).unwrap();
+        let runner = FakeRunner::always_ok();
+        let cfg = ConfigEnv::rooted([]);
+        strip_image(
+            tmp.path(),
+            &cfg,
+            &[],
+            &["/".to_string()],
+            &["/usr/lib/foo".to_string()],
+            &runner,
+        );
+        let calls = runner.calls();
+        // Only the object outside the skip path is stripped.
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].args.iter().any(|a| a.ends_with("prog")));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.args.iter().any(|a| a.ends_with("keepme.so")))
+        );
+    }
+
+    #[test]
+    fn parse_bash_string_array_reads_elements() {
+        assert_eq!(
+            parse_bash_string_array("([0]=\"/\" [1]=\"/usr/lib/foo\")"),
+            vec!["/".to_string(), "/usr/lib/foo".to_string()]
+        );
+        assert!(parse_bash_string_array("()").is_empty());
+        assert!(parse_bash_string_array("not an array").is_empty());
     }
 }

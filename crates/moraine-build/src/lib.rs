@@ -262,8 +262,30 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
     // 5. Drive phases.
     let report = driver.run_all()?;
 
-    // 5b. Strip ELF objects in the image, gated on nostrip/RESTRICT=strip.
-    strip::strip_image(&layout.image, &request.config, &pkg.restrict, runner);
+    // 5b. Strip ELF objects in the image, gated on nostrip/RESTRICT=strip and
+    // honoring the dostrip include/exclude lists recorded during src_install.
+    let dostrip = strip::parse_bash_string_array(
+        report
+            .final_env
+            .get("PORTAGE_DOSTRIP")
+            .map(String::as_str)
+            .unwrap_or_default(),
+    );
+    let dostrip_skip = strip::parse_bash_string_array(
+        report
+            .final_env
+            .get("PORTAGE_DOSTRIP_SKIP")
+            .map(String::as_str)
+            .unwrap_or_default(),
+    );
+    strip::strip_image(
+        &layout.image,
+        &request.config,
+        &pkg.restrict,
+        &dostrip,
+        &dostrip_skip,
+        runner,
+    );
 
     // 6. Build-info metadata.
     let mut info = BuildInfo::default();
