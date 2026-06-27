@@ -784,6 +784,8 @@ dependencies = [
  "object 0.39.1",
  "proptest",
  "rustix",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",

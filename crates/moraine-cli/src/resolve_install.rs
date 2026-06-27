@@ -487,7 +487,7 @@ impl BuildPlanner for CliPlanner<'_> {
             // the full IUSE_EFFECTIVE (with implicit/forced/masked flags) is
             // computed here; an incomplete set would make use() die spuriously.
             iuse_effective: Vec::new(),
-            fetch: self.fetch_config(),
+            fetch: self.fetch_config(&entry.repository),
             run_tests,
             require_digest: true,
             namespace_support: NamespaceSupport::default(),
@@ -616,8 +616,9 @@ impl CliPlanner<'_> {
         eclass_locations(self.repo_set, repo)
     }
 
-    /// The fetch configuration from `make.conf`.
-    fn fetch_config(&self) -> FetchConfig {
+    /// The fetch configuration from `make.conf`, with the required-hash policy
+    /// taken from the distfiles' owning repository.
+    fn fetch_config(&self, owning_repo: &str) -> FetchConfig {
         let distdir = self
             .ctx
             .vars
@@ -669,7 +670,6 @@ impl CliPlanner<'_> {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(5);
 
-        let defaults = FetchConfig::new(&distdir);
         FetchConfig {
             distdir,
             fetchcommand,
@@ -678,7 +678,7 @@ impl CliPlanner<'_> {
             thirdparty: crate::config::thirdparty_mirrors(self.repo_set),
             resume_min_size: 350_000,
             max_attempts: 3,
-            required_hashes: required_manifest_hashes(self.repo_set),
+            required_hashes: required_manifest_hashes(self.repo_set, owning_repo),
             fetchcommand_proto,
             resumecommand_proto,
             ssh_opts: self
@@ -691,27 +691,30 @@ impl CliPlanner<'_> {
             distlocks: self.ctx.features.iter().any(|f| f == "distlocks"),
             ro_distdirs,
             custom_mirrors: moraine_build::CustomMirrors::default(),
-            mirror_layout: defaults.mirror_layout,
         }
     }
 }
 
-/// The union of `manifest-required-hashes` across the active repositories,
-/// defaulting to `{BLAKE2B, SHA512}` when none are declared.
+/// The `manifest-required-hashes` of the distfiles' owning repository,
+/// defaulting to `{BLAKE2B, SHA512}` when the repository is unknown or declares
+/// none. Each distfile is verified against its own repository's policy rather
+/// than a global union across repositories, matching Portage's per-repo
+/// `required_hashes`.
 fn required_manifest_hashes(
     repo_set: &moraine_repo::RepoSet,
+    owning_repo: &str,
 ) -> std::collections::BTreeSet<String> {
-    let union: std::collections::BTreeSet<String> = repo_set
-        .ordered()
-        .flat_map(|r| r.manifest_required_hashes.iter().cloned())
-        .collect();
-    if union.is_empty() {
+    let owned: std::collections::BTreeSet<String> = repo_set
+        .get(owning_repo)
+        .map(|r| r.manifest_required_hashes.iter().cloned().collect())
+        .unwrap_or_default();
+    if owned.is_empty() {
         ["BLAKE2B", "SHA512"]
             .into_iter()
             .map(String::from)
             .collect()
     } else {
-        union
+        owned
     }
 }
 

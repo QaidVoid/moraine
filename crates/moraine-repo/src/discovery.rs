@@ -206,11 +206,12 @@ impl RepoSet {
         }
         // The repository's own eclasses.
         push(repo, &mut out, &mut seen);
-        // Masters in resolved order (a master is earlier in `order`).
-        for name in &self.order {
-            if cfg.masters.contains(name) {
-                push(name, &mut out, &mut seen);
-            }
+        // Masters in reverse declared order, so the later-declared master lands
+        // earlier in this first-occurrence-wins search path and therefore wins
+        // the master-vs-master tiebreak, matching Portage's `eclass_locations`
+        // assembly in which later locations override earlier ones.
+        for name in cfg.masters.iter().rev() {
+            push(name, &mut out, &mut seen);
         }
         out
     }
@@ -484,13 +485,10 @@ fn read_layout_conf(location: &Path) -> Layout {
     if layout.manifest_hashes.is_empty() {
         layout.manifest_hashes = vec!["BLAKE2B".to_string(), "SHA512".to_string()];
     }
+    // An unset required set requires every declared hash, matching Portage's
+    // `repository/config.py` default (require all hashes unless specified).
     if layout.manifest_required_hashes.is_empty() {
-        layout.manifest_required_hashes = layout
-            .manifest_hashes
-            .iter()
-            .filter(|h| h.as_str() == "BLAKE2B" || h.as_str() == "SHA512")
-            .cloned()
-            .collect();
+        layout.manifest_required_hashes = layout.manifest_hashes.clone();
     }
     layout
         .manifest_required_hashes
@@ -672,6 +670,16 @@ mod tests {
         assert_eq!(d.manifest_hashes, ["BLAKE2B", "SHA512"]);
         assert_eq!(d.manifest_required_hashes, ["BLAKE2B", "SHA512"]);
         assert!(!d.thin_manifests);
+
+        // A declared three-hash set with no required override requires all three.
+        let loc3 = make_repo(
+            tmp.path(),
+            "r3",
+            "manifest-hashes = BLAKE2B SHA512 SHA256\n",
+        );
+        let l3 = read_layout_conf(&loc3);
+        assert_eq!(l3.manifest_hashes, ["BLAKE2B", "SHA512", "SHA256"]);
+        assert_eq!(l3.manifest_required_hashes, ["BLAKE2B", "SHA512", "SHA256"]);
 
         // A required hash not in the declared set is dropped (subset rule).
         let loc2 = make_repo(

@@ -157,8 +157,9 @@ impl MetadataRefresher for RepoRefresher<'_> {
 }
 
 impl RepoRefresher<'_> {
-    /// Regenerate the entries named by `MissingMetadata`/`StaleEclass` issues
-    /// through the attached generator, merging each result into `entries`
+    /// Regenerate the entries named by `MissingMetadata`/`StaleEclass`/
+    /// `EbuildMd5Mismatch` issues through the attached generator, merging each
+    /// result into `entries`
     /// (replacing any same-`cpv` entry). Returns the number regenerated. With no
     /// generator this is a no-op and the gaps stay excluded.
     fn regenerate_gaps(
@@ -195,7 +196,9 @@ fn regenerate_into(
     let mut regenerated = 0;
     for issue in issues {
         let cpv = match issue {
-            ImportIssue::MissingMetadata { cpv } | ImportIssue::StaleEclass { cpv, .. } => cpv,
+            ImportIssue::MissingMetadata { cpv }
+            | ImportIssue::StaleEclass { cpv, .. }
+            | ImportIssue::EbuildMd5Mismatch { cpv } => cpv,
             _ => continue,
         };
         if let Some(result) = generator.generate(repo, cpv, prev_by_cpv.get(cpv.as_str()).copied())

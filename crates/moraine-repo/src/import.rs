@@ -72,6 +72,20 @@ pub enum ImportIssue {
         /// The banned EAPI.
         eapi: String,
     },
+    /// An entry's `EAPI` is not a supported EAPI, so it is disregarded rather
+    /// than parsed permissively.
+    UnsupportedEapi {
+        /// The `<cat>/<P-V>` identifier.
+        cpv: String,
+        /// The unsupported EAPI.
+        eapi: String,
+    },
+    /// An md5-dict entry's `_md5_` did not match the md5 of the on-disk ebuild,
+    /// so the entry is stale and excluded for gap regeneration.
+    EbuildMd5Mismatch {
+        /// The `<cat>/<P-V>` identifier.
+        cpv: String,
+    },
 }
 
 /// The result of an import: the kept entries plus the issues encountered.
@@ -228,6 +242,26 @@ fn import_one(
         }
     };
 
+    // Validate the md5-dict `_md5_` against the on-disk ebuild it describes,
+    // mirroring `cache/template.py:_validate_entry`. The md5-dict validation
+    // digest is the ebuild's content md5, so a mismatch means the committed
+    // cache is stale; the entry is excluded and reported for gap regeneration.
+    // Scoped to the md5-dict format and to entries that carry a non-empty
+    // `_md5_`; the PMS flat_list format validates by mtime/eclass and carries
+    // no ebuild `_md5_`.
+    if matches!(format, CacheFormat::Md5Dict)
+        && !md5.is_empty()
+        && let Ok(bytes) = std::fs::read(
+            cfg.location
+                .join(category)
+                .join(&package)
+                .join(format!("{pv}.ebuild")),
+        )
+        && moraine_common::hash::md5(&bytes) != md5
+    {
+        return EntryOutcome::Rejected(ImportIssue::EbuildMd5Mismatch { cpv });
+    }
+
     // Incremental reuse: the md5-dict format's validation digest is `_md5_`, so
     // reuse a previous entry whose `_md5_` matches (real gentoo md5-cache entries
     // carry `_md5_` but no `_mtime_`). An mtime-based cache additionally requires
@@ -248,10 +282,12 @@ fn import_one(
         return EntryOutcome::Rejected(ImportIssue::StaleEclass { cpv, eclass: stale });
     }
 
-    // Use the repository default EAPI when the entry declares none.
+    // Default a cache entry that omits `EAPI` to `0` (PMS), matching
+    // `dbapi/porttree.py:_pull_valid_cache`. The repository `profiles/eapi`
+    // value governs profile directories, not the per-ebuild cache default.
     let eapi = match fields.get("EAPI").map(|s| s.trim()) {
         Some(e) if !e.is_empty() => e.to_owned(),
-        _ => cfg.default_eapi.clone(),
+        _ => "0".to_owned(),
     };
     // Reject a banned EAPI; warn on a deprecated one but keep the entry.
     if cfg.eapis_banned.iter().any(|b| b == &eapi) {
@@ -259,6 +295,12 @@ fn import_one(
     }
     if cfg.eapis_deprecated.iter().any(|d| d == &eapi) {
         tracing::warn!(cpv = %cpv, eapi = %eapi, "entry uses a deprecated EAPI");
+    }
+    // Disregard an entry whose EAPI is not a supported EAPI rather than admitting
+    // it through the permissive parse fallback, mirroring the `eapi_is_supported`
+    // gate in `_pull_valid_cache`.
+    if moraine_eapi::level(&eapi).is_none() {
+        return EntryOutcome::Rejected(ImportIssue::UnsupportedEapi { cpv, eapi });
     }
     let features = features_for(&eapi);
 
@@ -698,7 +740,8 @@ mod tests {
         fs::write(r.loc.join("metadata/layout.conf"), "eapis-banned = 4\n").unwrap();
         fs::write(r.loc.join("profiles/eapi"), "8\n").unwrap();
         r.cache("dev-libs", "banned-1", "EAPI=4\nSLOT=0\n");
-        // No EAPI line: the repository default EAPI (8) applies.
+        // No EAPI line: a cache entry that omits EAPI defaults to EAPI 0 (PMS),
+        // not the repository's profiles/eapi value.
         r.cache(
             "dev-libs",
             "def-1",
@@ -718,7 +761,7 @@ mod tests {
                 .any(|i| matches!(i, ImportIssue::BannedEapi { eapi, .. } if eapi == "4"))
         );
         let def = report.entries.iter().find(|e| e.package == "def").unwrap();
-        assert_eq!(def.eapi, "8");
+        assert_eq!(def.eapi, "0");
     }
 
     #[test]
@@ -730,7 +773,8 @@ mod tests {
         fs::write(r.loc.join("metadata/layout.conf"), "cache-formats = pms\n").unwrap();
         let cache = r.loc.join("metadata/cache/dev-libs");
         fs::create_dir_all(&cache).unwrap();
-        // Positional auxdbkey order: DEPEND, RDEPEND, SLOT, ... EAPI at line 15.
+        // Current Portage auxdbkey_order: IDEPEND at index 9, EAPI at index 15
+        // (the sixteenth line).
         let lines = [
             "",              // DEPEND
             "dev-libs/zlib", // RDEPEND
@@ -741,6 +785,7 @@ mod tests {
             "GPL-2",         // LICENSE
             "",              // DESCRIPTION
             "amd64",         // KEYWORDS
+            "",              // IDEPEND
             "",              // INHERITED
             "ssl",           // IUSE
             "",              // REQUIRED_USE
@@ -761,6 +806,162 @@ mod tests {
         assert_eq!(e.subslot.as_deref(), Some("3"));
         assert_eq!(e.rdepend, "dev-libs/zlib");
         assert_eq!(e.eapi, "8");
+    }
+
+    #[test]
+    fn pms_idepend_and_eapi_from_correct_slots() {
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "overlay");
+        fs::remove_dir_all(r.loc.join("metadata/md5-cache")).unwrap();
+        fs::write(r.loc.join("metadata/layout.conf"), "cache-formats = pms\n").unwrap();
+        let cache = r.loc.join("metadata/cache/dev-libs");
+        fs::create_dir_all(&cache).unwrap();
+        // Current Portage auxdbkey_order: IDEPEND at index 9, EAPI at index 15.
+        let lines = [
+            "",                // DEPEND
+            "dev-libs/zlib",   // RDEPEND
+            "0",               // SLOT
+            "",                // SRC_URI
+            "",                // RESTRICT
+            "",                // HOMEPAGE
+            "GPL-2",           // LICENSE
+            "",                // DESCRIPTION
+            "amd64",           // KEYWORDS
+            "dev-build/cmake", // IDEPEND
+            "",                // INHERITED
+            "",                // IUSE
+            "",                // REQUIRED_USE
+            "",                // PDEPEND
+            "",                // BDEPEND
+            "8",               // EAPI
+        ];
+        fs::write(cache.join("bar-2"), lines.join("\n")).unwrap();
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[overlay]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        let report = import_repo(&set, "overlay", &HashMap::new()).unwrap();
+        let e = report.entries.iter().find(|e| e.package == "bar").unwrap();
+        assert_eq!(e.eapi, "8");
+        assert_eq!(e.idepend, "dev-build/cmake");
+        assert_eq!(e.rdepend, "dev-libs/zlib");
+    }
+
+    #[test]
+    fn no_eapi_defaults_to_eapi_zero() {
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "gentoo");
+        // profiles/eapi is 8, but a cache entry omitting EAPI defaults to 0.
+        fs::write(r.loc.join("profiles/eapi"), "8\n").unwrap();
+        r.cache("dev-libs", "noeapi-1", "SLOT=0\n_md5_=x\n");
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[gentoo]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        let report = import_repo(&set, "gentoo", &HashMap::new()).unwrap();
+        let e = report
+            .entries
+            .iter()
+            .find(|e| e.package == "noeapi")
+            .unwrap();
+        assert_eq!(e.eapi, "0");
+    }
+
+    #[test]
+    fn unsupported_eapi_disregarded() {
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "gentoo");
+        r.cache("dev-libs", "future-1", "EAPI=999\nSLOT=0\n_md5_=x\n");
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[gentoo]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        let report = import_repo(&set, "gentoo", &HashMap::new()).unwrap();
+        assert!(report.entries.iter().all(|e| e.package != "future"));
+        assert!(report.issues.iter().any(|i| matches!(
+            i,
+            ImportIssue::UnsupportedEapi { eapi, .. } if eapi == "999"
+        )));
+    }
+
+    #[test]
+    fn ebuild_md5_mismatch_reported_as_gap() {
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "gentoo");
+        // An md5-dict entry whose `_md5_` does not match the on-disk ebuild.
+        r.ebuild("dev-libs", "drift", "drift-1");
+        r.cache("dev-libs", "drift-1", "EAPI=8\nSLOT=0\n_md5_=deadbeef\n");
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[gentoo]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        let report = import_repo(&set, "gentoo", &HashMap::new()).unwrap();
+        assert!(report.entries.iter().all(|e| e.package != "drift"));
+        assert!(report.issues.iter().any(|i| matches!(
+            i,
+            ImportIssue::EbuildMd5Mismatch { cpv } if cpv == "dev-libs/drift-1"
+        )));
+    }
+
+    #[test]
+    fn matching_ebuild_md5_admits_entry() {
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "gentoo");
+        r.ebuild("dev-libs", "ok", "ok-1");
+        // The builder writes "# ebuild\n"; use its md5 so the entry is admitted.
+        let md5 = moraine_common::hash::md5(b"# ebuild\n");
+        r.cache(
+            "dev-libs",
+            "ok-1",
+            &format!("EAPI=8\nSLOT=0\n_md5_={md5}\n"),
+        );
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[gentoo]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        let report = import_repo(&set, "gentoo", &HashMap::new()).unwrap();
+        assert!(report.entries.iter().any(|e| e.package == "ok"));
+    }
+
+    #[test]
+    fn later_declared_master_wins_eclass_tiebreak() {
+        let tmp = TempDir::new().unwrap();
+        // Two masters define the same eclass with differing content; the child
+        // declares `masters = a b`, so the later-declared `b` must win.
+        let a = RepoBuilder::new(tmp.path(), "a");
+        let _a_md5 = a.eclass("shared", "# from a\n");
+        let b = RepoBuilder::new(tmp.path(), "b");
+        let b_md5 = b.eclass("shared", "# from b\n");
+        let child = RepoBuilder::new(tmp.path(), "child");
+        // The cache references `b`'s eclass md5; with the correct tiebreak the
+        // resolver picks `b`'s copy and the entry validates.
+        child.cache(
+            "dev-libs",
+            "c-1",
+            &format!("EAPI=8\nSLOT=0\n_eclasses_=shared\t{b_md5}\n_mtime_=1\n_md5_=x\n"),
+        );
+        let conf = repos_conf(
+            tmp.path(),
+            &format!(
+                "[a]\nlocation = {}\nmasters =\n[b]\nlocation = {}\nmasters =\n[child]\nlocation = {}\nmasters = a b\n",
+                a.loc.display(),
+                b.loc.display(),
+                child.loc.display()
+            ),
+        );
+        let set = discover(&conf).unwrap();
+        // The search path must list b's eclass dir before a's.
+        let path = set.eclass_search_path("child");
+        let ia = path.iter().position(|p| p == &a.loc.join("eclass"));
+        let ib = path.iter().position(|p| p == &b.loc.join("eclass"));
+        assert!(ib < ia, "later-declared master b must precede a: {path:?}");
+        let report = import_repo(&set, "child", &HashMap::new()).unwrap();
+        assert_eq!(report.entries.len(), 1, "b's eclass md5 must validate");
     }
 
     #[test]

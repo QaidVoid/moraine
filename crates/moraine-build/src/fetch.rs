@@ -10,8 +10,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
+
+/// The number of consecutive checksum failures after which the upstream
+/// `SRC_URI` URIs are escalated ahead of the remaining mirrors, matching
+/// Portage's `checksum_failure_primaryuri`.
+const CHECKSUM_FAILURE_PRIMARYURI: u32 = 2;
+
+/// The maximum age of a cached per-mirror layout before it is re-resolved.
+const MIRROR_LAYOUT_TTL_SECS: u64 = 24 * 60 * 60;
 
 use crate::error::{BuildError, IoExt as _, Result};
 use crate::manifest::{self, Manifest, VerifyOutcome};
@@ -36,7 +46,9 @@ impl RestrictFlags {
         for tok in tokens {
             match tok {
                 "fetch" => flags.fetch = true,
-                "mirror" => flags.mirror = true,
+                // The deprecated `nomirror` is treated as `mirror`, matching
+                // `package/ebuild/fetch.py`.
+                "mirror" | "nomirror" => flags.mirror = true,
                 "primaryuri" => flags.primaryuri = true,
                 _ => {}
             }
@@ -65,8 +77,9 @@ pub struct FetchConfig {
     /// Retained as a transport-failure backstop; checksum failures are bounded
     /// separately by [`checksum_try_mirrors`](Self::checksum_try_mirrors).
     pub max_attempts: u32,
-    /// The hashes a verified distfile must carry and match, from the repository's
-    /// `manifest-required-hashes` policy. Defaults to `{BLAKE2B, SHA512}`.
+    /// The hashes a verified distfile must carry and match, selected from the
+    /// distfile's owning repository's `manifest-required-hashes` policy rather
+    /// than a global union across repositories. Defaults to `{BLAKE2B, SHA512}`.
     pub required_hashes: BTreeSet<String>,
     /// Protocol-specific `FETCHCOMMAND_<PROTO>` templates keyed by lowercase
     /// scheme (`http`, `https`, `ftp`, `ssh`, ...); the generic
@@ -87,10 +100,6 @@ pub struct FetchConfig {
     /// Custom mirror tiers from `CUSTOM_MIRRORS_FILE`, preferred before the
     /// public Gentoo mirrors.
     pub custom_mirrors: CustomMirrors,
-    /// The directory layout assumed for the Gentoo mirror network. Production
-    /// mirrors use `filename-hash BLAKE2B 8`; a flat path is also tried as a
-    /// fallback so a flat mirror still resolves.
-    pub mirror_layout: MirrorLayout,
 }
 
 /// The custom-mirror tiers from `CUSTOM_MIRRORS_FILE`.
@@ -138,10 +147,6 @@ impl FetchConfig {
             distlocks: false,
             ro_distdirs: Vec::new(),
             custom_mirrors: CustomMirrors::default(),
-            mirror_layout: MirrorLayout::FilenameHash {
-                algo: "BLAKE2B".to_string(),
-                cutoffs: vec![8],
-            },
         }
     }
 }
@@ -295,7 +300,14 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
         };
 
         let sources = self.resolve_sources(file, restrict);
-        self.download_from(file, entry, &sources)
+        // The upstream URIs are passed for checksum-failure escalation; under
+        // `primaryuri` they are already at the front and no escalation is needed.
+        let upstream = if restrict.primaryuri {
+            Vec::new()
+        } else {
+            self.upstream_uris(file)
+        };
+        self.download_from(file, entry, &sources, &upstream)
     }
 
     /// Fetch a distfile from only the local custom mirrors, used under
@@ -306,13 +318,13 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
         entry: Option<&manifest::DistEntry>,
     ) -> Result<FetchedFile> {
         let digests = entry.map(|e| e.hashes.clone()).unwrap_or_default();
+        let bases = self.config.custom_mirrors.local.clone();
+        let layouts = self.resolve_mirror_layouts(&bases);
         let mut sources = Vec::new();
-        for base in &self.config.custom_mirrors.local {
-            for path in self.mirror_paths(&file.name, &digests) {
-                sources.push(format!("{}/distfiles/{path}", base.trim_end_matches('/')));
-            }
+        for base in &bases {
+            sources.extend(self.mirror_sources(base, &layouts, &file.name, &digests));
         }
-        self.download_from(file, entry, &sources)
+        self.download_from(file, entry, &sources, &[])
     }
 
     /// Try each source in order, downloading to a `.__download__` staging path and
@@ -324,6 +336,7 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
         file: &DistFile,
         entry: Option<&manifest::DistEntry>,
         sources: &[String],
+        upstream: &[String],
     ) -> Result<FetchedFile> {
         let dest = self.config.distdir.join(&file.name);
         let staging = self
@@ -332,17 +345,24 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
             .join(format!("{}.__download__", file.name));
         let staging_name = format!("{}.__download__", file.name);
 
+        // A growable work list so the upstream URIs can be escalated ahead of the
+        // remaining mirrors after repeated checksum failures.
+        let mut work: Vec<String> = sources.to_vec();
+        let mut i = 0usize;
         let mut transport_attempts = 0u32;
         let mut checksum_failures = 0u32;
-        for uri in sources {
-            if transport_attempts >= self.config.max_attempts.max(sources.len() as u32) {
+        let mut escalated = false;
+        while i < work.len() {
+            if transport_attempts >= self.config.max_attempts.max(work.len() as u32) {
                 break;
             }
             if checksum_failures >= self.config.checksum_try_mirrors {
                 break;
             }
+            let uri = work[i].clone();
+            i += 1;
             transport_attempts += 1;
-            self.run_fetch(uri, &staging_name, entry, &staging)?;
+            self.run_fetch(&uri, &staging_name, entry, &staging)?;
 
             if !staging.exists() {
                 continue;
@@ -362,6 +382,17 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
                             warn!(uri, reason = %outcome.reason(), "verification failed; trying next source");
                             checksum_failures += 1;
                             self.move_aside(&staging)?;
+                            // After the second consecutive checksum failure,
+                            // insert the upstream URIs ahead of the remaining
+                            // mirrors so upstream is tried before the give-up
+                            // budget, matching `checksum_failure_primaryuri`.
+                            if !escalated
+                                && checksum_failures >= CHECKSUM_FAILURE_PRIMARYURI
+                                && !upstream.is_empty()
+                            {
+                                escalate_to_upstream(&mut work, i, upstream);
+                                escalated = true;
+                            }
                         }
                     }
                 }
@@ -450,28 +481,19 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
             .map(|e| e.hashes.clone())
             .unwrap_or_default();
 
-        // Upstream `SRC_URI` hosts (with `mirror://` expanded).
-        let mut upstream = Vec::new();
-        for uri in &file.uris {
-            if let Some(rest) = uri.strip_prefix("mirror://") {
-                upstream.extend(self.expand_mirror(rest));
-            } else {
-                upstream.push(uri.clone());
-            }
-        }
+        let upstream = self.upstream_uris(file);
 
-        // The Gentoo mirror network, through the configured layout plus a flat
-        // fallback so both hashed and flat mirrors resolve.
+        // The Gentoo mirror network, with each mirror's candidate path computed
+        // from that mirror's own resolved layout plus a flat fallback.
         let mut mirror_net = Vec::new();
         if mirrorable {
             let mut bases = self.config.custom_mirrors.local.clone();
             bases.extend(self.config.mirrors.clone());
             bases.extend(self.config.custom_mirrors.public.clone());
             shuffle_seeded(&mut bases, seed_for(&file.name));
+            let layouts = self.resolve_mirror_layouts(&bases);
             for base in &bases {
-                for path in self.mirror_paths(&file.name, &digests) {
-                    mirror_net.push(format!("{}/distfiles/{path}", base.trim_end_matches('/')));
-                }
+                mirror_net.extend(self.mirror_sources(base, &layouts, &file.name, &digests));
             }
         }
 
@@ -488,17 +510,104 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
         out
     }
 
-    /// The mirror-relative path(s) for a distfile under `distfiles/`: the layout
-    /// path first, then the flat name as a fallback.
-    fn mirror_paths(&self, name: &str, digests: &BTreeMap<String, String>) -> Vec<String> {
-        let mut paths = Vec::new();
-        if let Some(p) = self.config.mirror_layout.get_path(name, digests) {
-            paths.push(p);
+    /// The upstream `SRC_URI` source URIs for a distfile, with `mirror://`
+    /// references expanded against the third-party mirror lists.
+    fn upstream_uris(&self, file: &DistFile) -> Vec<String> {
+        let mut upstream = Vec::new();
+        for uri in &file.uris {
+            if let Some(rest) = uri.strip_prefix("mirror://") {
+                upstream.extend(self.expand_mirror(rest));
+            } else {
+                upstream.push(uri.clone());
+            }
         }
-        if !paths.iter().any(|p| p == name) {
-            paths.push(name.to_string());
+        upstream
+    }
+
+    /// The full source URIs for one mirror base, computing the candidate path
+    /// from that mirror's resolved layout and url-encoding it for the web
+    /// schemes.
+    fn mirror_sources(
+        &self,
+        base: &str,
+        layouts: &BTreeMap<String, MirrorLayout>,
+        name: &str,
+        digests: &BTreeMap<String, String>,
+    ) -> Vec<String> {
+        let key = base.trim_end_matches('/');
+        let layout = layouts.get(key).unwrap_or(&MirrorLayout::Flat);
+        let web = matches!(uri_scheme(base), "http" | "https" | "ftp");
+        mirror_paths(layout, name, digests)
+            .into_iter()
+            .map(|path| {
+                let path = if web { url_encode_path(&path) } else { path };
+                format!("{key}/distfiles/{path}")
+            })
+            .collect()
+    }
+
+    /// The path to the per-distdir mirror-layout cache file.
+    fn mirror_cache_path(&self) -> PathBuf {
+        self.config.distdir.join(".mirror-cache.json")
+    }
+
+    /// Resolve every distinct mirror base's distfile layout, reading each from a
+    /// daily-refreshed `DISTDIR/.mirror-cache.json` and otherwise fetching that
+    /// mirror's `distfiles/layout.conf` through the runner. A base whose layout
+    /// cannot be read falls back to a flat layout.
+    fn resolve_mirror_layouts(&self, bases: &[String]) -> BTreeMap<String, MirrorLayout> {
+        let cache_path = self.mirror_cache_path();
+        let mut cache = MirrorCache::load(&cache_path);
+        let now = now_secs();
+        let mut out = BTreeMap::new();
+        let mut dirty = false;
+        for base in bases {
+            let key = base.trim_end_matches('/').to_string();
+            if out.contains_key(&key) {
+                continue;
+            }
+            let layout = match cache.entries.get(&key) {
+                Some(entry) if now.saturating_sub(entry.fetched_at) < MIRROR_LAYOUT_TTL_SECS => {
+                    entry.layout.clone()
+                }
+                _ => {
+                    let resolved = self.fetch_mirror_layout(&key);
+                    cache.entries.insert(
+                        key.clone(),
+                        CachedMirrorLayout {
+                            layout: resolved.clone(),
+                            fetched_at: now,
+                        },
+                    );
+                    dirty = true;
+                    resolved
+                }
+            };
+            out.insert(key, layout);
         }
-        paths
+        if dirty {
+            cache.save(&cache_path);
+        }
+        out
+    }
+
+    /// Fetch and parse a single mirror's `distfiles/layout.conf` through the
+    /// runner, returning [`MirrorLayout::Flat`] when it cannot be read or is
+    /// empty, mirroring Portage's `async_mirror_url`.
+    fn fetch_mirror_layout(&self, base: &str) -> MirrorLayout {
+        let uri = format!("{base}/distfiles/layout.conf");
+        let staging_name = ".mirror-layout.__download__";
+        let staging = self.config.distdir.join(staging_name);
+        let _ = std::fs::remove_file(&staging);
+        if self.run_fetch(&uri, staging_name, None, &staging).is_err() {
+            return MirrorLayout::Flat;
+        }
+        let layout = match std::fs::read_to_string(&staging) {
+            Ok(text) if !text.trim().is_empty() => MirrorLayout::parse(&text),
+            _ => MirrorLayout::Flat,
+        };
+        let _ = std::fs::remove_file(&staging);
+        layout
     }
 
     /// Expand a `mirror://group/path` reference against the named third-party
@@ -630,7 +739,7 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
 /// under `distfiles/`), `filename-hash <algo> <cutoffs>` (hashed by filename),
 /// and `content-hash <algo> <cutoffs>` (addressed by the file's content digest).
 /// Cutoffs are bit counts, split into nested hex directory levels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MirrorLayout {
     /// The distfile sits directly under the mirror's `distfiles/`.
     Flat,
@@ -740,6 +849,101 @@ fn digest_of(algo: &str, data: &[u8]) -> Option<String> {
         "MD5" => Some(moraine_common::hash::md5(data)),
         _ => None,
     }
+}
+
+/// A per-mirror resolved layout cached in `DISTDIR/.mirror-cache.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedMirrorLayout {
+    /// The resolved layout for the mirror.
+    layout: MirrorLayout,
+    /// The unix timestamp (seconds) when the layout was last resolved.
+    fetched_at: u64,
+}
+
+/// The on-disk cache of resolved mirror layouts, keyed by mirror base URL.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MirrorCache {
+    /// The cached layout per mirror base URL.
+    entries: BTreeMap<String, CachedMirrorLayout>,
+}
+
+impl MirrorCache {
+    /// Load the cache from `path`, returning an empty cache when it is absent or
+    /// unparseable.
+    fn load(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => MirrorCache::default(),
+        }
+    }
+
+    /// Persist the cache to `path`, ignoring write errors (the cache is an
+    /// optimization, not a correctness requirement).
+    fn save(&self, path: &Path) {
+        if let Ok(text) = serde_json::to_string(self) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+}
+
+/// The current unix time in whole seconds.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The mirror-relative path(s) for a distfile under `distfiles/`, given a
+/// mirror's resolved layout: the layout path first, then the flat name as a
+/// fallback.
+fn mirror_paths(
+    layout: &MirrorLayout,
+    name: &str,
+    digests: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(p) = layout.get_path(name, digests) {
+        paths.push(p);
+    }
+    if !paths.iter().any(|p| p == name) {
+        paths.push(name.to_string());
+    }
+    paths
+}
+
+/// Percent-encode a mirror path for the `http`, `https`, and `ftp` schemes,
+/// preserving `/` separators and the RFC 3986 unreserved characters.
+fn url_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        match b {
+            b'/' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Splice `upstream` URIs ahead of the not-yet-tried tail of `work` (from index
+/// `cursor`), dropping any later duplicates so upstream is tried before the
+/// remaining mirrors without retrying the already-attempted prefix.
+fn escalate_to_upstream(work: &mut Vec<String>, cursor: usize, upstream: &[String]) {
+    let already: BTreeSet<&String> = work[..cursor].iter().collect();
+    let fresh: Vec<String> = upstream
+        .iter()
+        .filter(|u| !already.contains(*u))
+        .cloned()
+        .collect();
+    let remaining: Vec<String> = work[cursor..]
+        .iter()
+        .filter(|s| !fresh.contains(s))
+        .cloned()
+        .collect();
+    work.truncate(cursor);
+    work.extend(fresh);
+    work.extend(remaining);
 }
 
 fn file_len(path: &Path) -> Result<u64> {
@@ -885,7 +1089,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = FetchConfig::new(dir.path());
         cfg.mirrors = vec!["https://mirror.example".to_string()];
-        cfg.mirror_layout = MirrorLayout::Flat;
         let mani = Manifest::default();
         let runner = FakeRunner::always_ok();
         let fetcher = Fetcher::new(&runner, &cfg, &mani, false);
@@ -911,7 +1114,6 @@ mod tests {
         let mani = manifest_for("f.tar.gz", good);
         let mut cfg = FetchConfig::new(dir.path());
         cfg.checksum_try_mirrors = 2;
-        cfg.mirror_layout = MirrorLayout::Flat;
         let staging = dir.path().join("f.tar.gz.__download__");
         let runner = FakeRunner::default();
         // Three bad sources, but the budget stops after 2 checksum failures.
@@ -1150,5 +1352,154 @@ mod tests {
         assert!(r.fetch && r.mirror);
         let r2 = RestrictFlags::from_tokens(["strip"]);
         assert!(!r2.fetch && !r2.mirror);
+        // The deprecated `nomirror` is equivalent to `mirror`.
+        let r3 = RestrictFlags::from_tokens(["nomirror"]);
+        assert!(r3.mirror && !r3.fetch);
+    }
+
+    #[test]
+    fn nomirror_excludes_gentoo_mirrors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = FetchConfig::new(dir.path());
+        cfg.mirrors = vec!["https://mirror.example".to_string()];
+        let mani = Manifest::default();
+        let runner = FakeRunner::always_ok();
+        let fetcher = Fetcher::new(&runner, &cfg, &mani, false);
+        let file = distfile("foo.tar.gz", &["https://upstream/foo.tar.gz"]);
+        let restrict = RestrictFlags::from_tokens(["nomirror"]);
+        let sources = fetcher.resolve_sources(&file, restrict);
+        assert!(!sources.iter().any(|s| s.contains("mirror.example")));
+        assert_eq!(sources, vec!["https://upstream/foo.tar.gz"]);
+    }
+
+    #[test]
+    fn per_mirror_layout_selection_with_flat_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = FetchConfig::new(dir.path());
+        cfg.mirrors = vec![
+            "https://m0.example".to_string(),
+            "https://m1.example".to_string(),
+        ];
+        // Pre-seed m0's layout as filename-hash; m1 has no layout.conf and falls
+        // back to flat (resolved through the always-ok runner).
+        let mut cache = MirrorCache::default();
+        cache.entries.insert(
+            "https://m0.example".to_string(),
+            CachedMirrorLayout {
+                layout: MirrorLayout::FilenameHash {
+                    algo: "BLAKE2B".to_string(),
+                    cutoffs: vec![8],
+                },
+                fetched_at: now_secs(),
+            },
+        );
+        cache.save(&dir.path().join(".mirror-cache.json"));
+
+        let mani = Manifest::default();
+        let runner = FakeRunner::always_ok();
+        let fetcher = Fetcher::new(&runner, &cfg, &mani, false);
+        let file = distfile("foo.tar.gz", &[]);
+        let sources = fetcher.resolve_sources(&file, RestrictFlags::default());
+
+        let hash = moraine_common::hash::blake2b("foo.tar.gz".as_bytes());
+        let hashed = format!("https://m0.example/distfiles/{}/foo.tar.gz", &hash[..2]);
+        assert!(
+            sources.contains(&hashed),
+            "m0 uses its own filename-hash layout: {sources:?}"
+        );
+        assert!(
+            sources.contains(&"https://m1.example/distfiles/foo.tar.gz".to_string()),
+            "m1 falls back to flat: {sources:?}"
+        );
+    }
+
+    #[test]
+    fn escalates_to_upstream_after_second_checksum_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = b"the correct bytes";
+        let mani = manifest_for("f.tar.gz", good);
+        let mut cfg = FetchConfig::new(dir.path());
+        cfg.checksum_try_mirrors = 5;
+        cfg.mirrors = (0..5).map(|i| format!("https://m{i}.example")).collect();
+        // Pre-seed every mirror as flat so layout resolution does not consume the
+        // queued download responses.
+        let mut cache = MirrorCache::default();
+        for base in &cfg.mirrors {
+            cache.entries.insert(
+                base.clone(),
+                CachedMirrorLayout {
+                    layout: MirrorLayout::Flat,
+                    fetched_at: now_secs(),
+                },
+            );
+        }
+        cache.save(&dir.path().join(".mirror-cache.json"));
+
+        let staging = dir.path().join("f.tar.gz.__download__");
+        let runner = FakeRunner::default();
+        // Two bad mirror responses, then the upstream serves the correct bytes.
+        runner.push(Response::WriteFile {
+            status: 0,
+            path: staging.clone(),
+            contents: b"bad".to_vec(),
+        });
+        runner.push(Response::WriteFile {
+            status: 0,
+            path: staging.clone(),
+            contents: b"bad".to_vec(),
+        });
+        runner.push(Response::WriteFile {
+            status: 0,
+            path: staging.clone(),
+            contents: good.to_vec(),
+        });
+        let fetcher = Fetcher::new(&runner, &cfg, &mani, true);
+        let file = distfile("f.tar.gz", &["https://upstream.example/f.tar.gz"]);
+        let f = fetcher.fetch_one(&file, RestrictFlags::default()).unwrap();
+        assert_eq!(f.status, FetchStatus::Fetched);
+        // Upstream was tried on the third attempt, before exhausting the mirrors.
+        assert_eq!(runner.call_count(), 3);
+    }
+
+    #[test]
+    fn owning_repo_required_hashes_accepts_relaxed_overlay_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = FetchConfig::new(dir.path());
+        // The owning overlay requires only SHA512 (a relaxed set).
+        cfg.required_hashes = ["SHA512".to_string()].into_iter().collect();
+        let data = b"overlay payload";
+        // A Manifest entry listing only SHA512 (no BLAKE2B).
+        let text = format!(
+            "DIST f.tar.gz {} SHA512 {}\n",
+            data.len(),
+            moraine_common::hash::sha512(data)
+        );
+        let mani = Manifest::parse(&text);
+        let dest = dir.path().join("f.tar.gz.__download__");
+        let runner = FakeRunner::default();
+        runner.push(Response::WriteFile {
+            status: 0,
+            path: dest,
+            contents: data.to_vec(),
+        });
+        let fetcher = Fetcher::new(&runner, &cfg, &mani, true);
+        let f = fetcher
+            .fetch_one(
+                &distfile("f.tar.gz", &["https://x/f.tar.gz"]),
+                RestrictFlags::default(),
+            )
+            .unwrap();
+        assert_eq!(f.status, FetchStatus::Fetched);
+        // The same entry under the global {BLAKE2B, SHA512} union would be
+        // rejected for the missing BLAKE2B, so the relaxation is meaningful.
+        let union: BTreeSet<String> = ["BLAKE2B", "SHA512"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let entry = mani.dist("f.tar.gz").unwrap();
+        assert!(matches!(
+            manifest::verify_bytes(entry, data, &union),
+            VerifyOutcome::MissingRequiredHash { .. }
+        ));
     }
 }

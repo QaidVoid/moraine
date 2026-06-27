@@ -30,6 +30,7 @@ const AUXDBKEY_ORDER: [&str; 22] = [
     "LICENSE",
     "DESCRIPTION",
     "KEYWORDS",
+    "IDEPEND",
     "INHERITED",
     "IUSE",
     "REQUIRED_USE",
@@ -38,8 +39,7 @@ const AUXDBKEY_ORDER: [&str; 22] = [
     "EAPI",
     "PROPERTIES",
     "DEFINED_PHASES",
-    "HDEPEND",
-    "IDEPEND",
+    "UNUSED_04",
     "UNUSED_03",
     "UNUSED_02",
     "UNUSED_01",
@@ -95,24 +95,25 @@ mod tests {
 
     #[test]
     fn positional_maps_by_auxdbkey_order() {
-        // DEPEND, RDEPEND, SLOT, SRC_URI, RESTRICT, HOMEPAGE, LICENSE, DESCRIPTION,
-        // KEYWORDS, ..., EAPI at index 14.
+        // Current Portage auxdbkey_order: IDEPEND at index 9, EAPI at index 15
+        // (the sixteenth line).
         let lines = [
-            "dev-lang/perl", // DEPEND
-            "dev-libs/zlib", // RDEPEND
-            "0/3",           // SLOT
-            "",              // SRC_URI
-            "",              // RESTRICT
-            "https://x",     // HOMEPAGE
-            "GPL-2",         // LICENSE
-            "desc",          // DESCRIPTION
-            "amd64 ~arm64",  // KEYWORDS
-            "",              // INHERITED
-            "ssl",           // IUSE
-            "",              // REQUIRED_USE
-            "",              // PDEPEND
-            "",              // BDEPEND
-            "8",             // EAPI
+            "dev-lang/perl",   // DEPEND
+            "dev-libs/zlib",   // RDEPEND
+            "0/3",             // SLOT
+            "",                // SRC_URI
+            "",                // RESTRICT
+            "https://x",       // HOMEPAGE
+            "GPL-2",           // LICENSE
+            "desc",            // DESCRIPTION
+            "amd64 ~arm64",    // KEYWORDS
+            "dev-build/cmake", // IDEPEND
+            "",                // INHERITED
+            "ssl",             // IUSE
+            "",                // REQUIRED_USE
+            "",                // PDEPEND
+            "",                // BDEPEND
+            "8",               // EAPI
         ];
         let fields = parse(&lines.join("\n"));
         assert_eq!(
@@ -123,6 +124,10 @@ mod tests {
         assert_eq!(
             fields.get("KEYWORDS").map(String::as_str),
             Some("amd64 ~arm64")
+        );
+        assert_eq!(
+            fields.get("IDEPEND").map(String::as_str),
+            Some("dev-build/cmake")
         );
         assert_eq!(fields.get("EAPI").map(String::as_str), Some("8"));
     }
