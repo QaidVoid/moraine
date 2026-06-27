@@ -165,12 +165,28 @@ pub fn read_with_policy(
     let image_comp = inner_compression(&image_member.rel)?;
     let image = image_comp.decompress(&image_member.bytes)?;
 
+    // Verify the gpkg-1 marker against its Manifest record when the Manifest
+    // lists it, mirroring Portage verifying the version file like any other
+    // member (`lib/portage/gpkg.py:1722-1808`). The marker bytes are empty, so
+    // the recorded size is 0 and the digests are over empty content. A Manifest
+    // that omits the marker still reads, keeping older Moraine output importable.
+    if manifest.contains_key(MARKER_PREFIX) {
+        let marker = lookup
+            .get(MARKER_PREFIX)
+            .expect("marker member presence checked above");
+        verify_member(&manifest, MARKER_PREFIX, &marker.bytes)?;
+        verified.insert(MARKER_PREFIX.to_string());
+    }
+
     // Cross-check completeness in both directions: every container member except
-    // the version marker, the Manifest, and any detached signature must have been
-    // verified, and every Manifest record must map to a verified member, matching
-    // Portage's `_verify_binpkg` (`lib/portage/gpkg.py:1811`).
+    // the Manifest and any detached signature must have been verified, and every
+    // Manifest record must map to a verified member, matching Portage's
+    // `_verify_binpkg` (`lib/portage/gpkg.py:1811`). The marker is verified above
+    // when the Manifest lists it; a Manifest that omits the marker still reads.
     for member in &members {
         let rel = member.rel.as_str();
+        // The marker is skipped here so older Moraine output, whose Manifest
+        // carries no marker record, still passes the forward check.
         if rel == MARKER_PREFIX || rel == "Manifest" || rel.ends_with(".sig") {
             continue;
         }
@@ -221,7 +237,17 @@ pub fn write(
     let meta_name = format!("metadata.tar.{}", comp.suffix());
     let image_name = format!("image.tar.{}", comp.suffix());
 
-    let mut manifest = String::new();
+    // Record the gpkg-1 marker first, over its empty bytes, then the metadata
+    // and image members. Portage records the version file before the inner tars
+    // (`lib/portage/gpkg.py:1024`) and requires a record for every member,
+    // marker included, so omitting it fails with `gpkg-1 checksum not found`.
+    let marker = b"";
+    let mut manifest = format!(
+        "DATA {MARKER_PREFIX} {} BLAKE2B {} SHA512 {}\n",
+        marker.len(),
+        blake2b(marker),
+        sha512(marker),
+    );
     for (name, bytes) in [(&meta_name, &meta_stored), (&image_name, &image_stored)] {
         manifest.push_str(&format!(
             "DATA {name} {} BLAKE2B {} SHA512 {}\n",
@@ -592,8 +618,13 @@ mod tests {
         let meta_name = format!("metadata.tar.{}", comp.suffix());
         let image_name = format!("image.tar.{}", comp.suffix());
 
+        // Portage layout: the Manifest lists a record for the gpkg-1 marker
+        // over its empty bytes ahead of the inner-tar members.
+        let marker: &[u8] = b"";
         let manifest = format!(
-            "DATA {meta_name} {} BLAKE2B {} SHA512 {}\nDATA {image_name} {} BLAKE2B {} SHA512 {}\n",
+            "DATA {MARKER_PREFIX} 0 BLAKE2B {} SHA512 {}\nDATA {meta_name} {} BLAKE2B {} SHA512 {}\nDATA {image_name} {} BLAKE2B {} SHA512 {}\n",
+            blake2b(marker),
+            sha512(marker),
             meta_tar.len(),
             blake2b(&meta_tar),
             sha512(&meta_tar),
@@ -678,6 +709,51 @@ mod tests {
             assert_eq!(pkg.metadata(), &meta, "metadata mismatch for {comp:?}");
             assert!(!pkg.image().is_empty());
         }
+    }
+
+    #[test]
+    fn portage_layout_manifest_with_marker_imports() {
+        // A Portage gpkg lists a `DATA gpkg-1 0 ...` record for the version
+        // marker. The reader must verify that record and import the package,
+        // covering the `--getbinpkg` interop direction.
+        let meta = sample_metadata();
+        let file = build_gpkg(&meta, Compression::Zstd, false);
+        let pkg = read(&file, None).unwrap();
+        assert_eq!(pkg.metadata(), &meta);
+    }
+
+    #[test]
+    fn manifest_without_marker_still_reads() {
+        // Older Moraine output omits the marker record (build_gpkg_mutated's
+        // Manifest lists only the inner tars). It must still import.
+        let meta = sample_metadata();
+        let file = build_gpkg_mutated(&meta, Compression::Gzip, |_| {});
+        let pkg = read(&file, None).unwrap();
+        assert_eq!(pkg.metadata(), &meta);
+    }
+
+    #[test]
+    fn writer_manifest_lists_gpkg_marker() {
+        // The produced-package interop direction: Portage requires a Manifest
+        // record for the gpkg-1 marker, so write emits a `DATA gpkg-1 0` line
+        // over the empty marker bytes.
+        let meta = sample_metadata();
+        let bytes = write(&meta, &root_relative_image_tar(), Compression::Zstd).unwrap();
+        let members = read_outer(&bytes).unwrap();
+        let manifest = members
+            .iter()
+            .find(|m| m.rel == "Manifest")
+            .expect("Manifest member present");
+        let text = std::str::from_utf8(&manifest.bytes).unwrap();
+        let marker_line = format!(
+            "DATA {MARKER_PREFIX} 0 BLAKE2B {} SHA512 {}",
+            blake2b(b""),
+            sha512(b""),
+        );
+        assert!(
+            text.lines().any(|l| l == marker_line),
+            "Manifest lists the gpkg-1 marker line: {text}"
+        );
     }
 
     #[test]

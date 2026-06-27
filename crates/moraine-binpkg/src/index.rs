@@ -22,7 +22,12 @@ use crate::error::IndexError;
 use crate::metadata::{KEY_DESCRIPTION, KEY_MTIME, KEY_REPOSITORY, MetadataMap};
 
 /// The newest `Packages` index version this crate understands.
-pub const SUPPORTED_VERSION: u32 = 1;
+///
+/// Pinned to `0` to match Portage's `_pkgindex_version`
+/// (`lib/portage/dbapi/bintree.py:561`), so a written index declares
+/// `VERSION: 0` and a stock Portage client accepts it through
+/// `_pkgindex_version_supported` rather than discarding it.
+pub const SUPPORTED_VERSION: u32 = 0;
 
 /// The use-evaluated dependency keys, reduced against recorded USE at write
 /// time.
@@ -473,7 +478,24 @@ mod tests {
     }
 
     #[test]
+    fn index_version_is_zero() {
+        // Portage's `_pkgindex_version` is 0, so the header must declare
+        // VERSION: 0 for a stock client to accept the index.
+        assert_eq!(SUPPORTED_VERSION, 0);
+        let interner = Interner::new();
+        let index = sample_index();
+        assert_eq!(index.header.get("VERSION").map(String::as_str), Some("0"));
+        let text = index.emit(&interner);
+        assert!(text.contains("VERSION: 0"), "emitted header: {text}");
+        // An index declaring VERSION 0 parses and retains its stanzas.
+        let parsed = PackagesIndex::parse(&text).unwrap();
+        assert_eq!(parsed.header.get("VERSION").map(String::as_str), Some("0"));
+        assert_eq!(parsed.packages.len(), 1);
+    }
+
+    #[test]
     fn unsupported_version_rejected() {
+        // SUPPORTED_VERSION is now 0, so this rejects the off-by-one VERSION: 1.
         let text = format!("VERSION: {}\n\n", SUPPORTED_VERSION + 1);
         assert!(matches!(
             PackagesIndex::parse(&text),
