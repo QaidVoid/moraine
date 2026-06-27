@@ -80,6 +80,11 @@ pub struct Cli {
     #[arg(long = "config-update")]
     pub config_update: bool,
 
+    /// Re-offer a differing protected config even when the same content was
+    /// already offered, disabling the config-memory suppression.
+    #[arg(long)]
+    pub noconfmem: bool,
+
     /// Resume the unfinished portion of the most recent transaction.
     #[arg(long)]
     pub resume: bool,

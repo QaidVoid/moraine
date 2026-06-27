@@ -40,6 +40,7 @@ fn context(root: &std::path::Path) -> MergeContext {
         collision_ignore: Vec::new(),
         uninstall_ignore: Vec::new(),
         install_mask: Default::default(),
+        noconfmem: false,
     }
 }
 

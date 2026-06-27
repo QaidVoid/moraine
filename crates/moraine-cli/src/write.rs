@@ -77,7 +77,10 @@ pub(crate) fn ensure_dirs(wr: &WriteRoots) -> Result<()> {
 }
 
 /// Build the merge context from configuration and roots.
-pub(crate) fn merge_context(ctx: &ConfigContext, wr: &WriteRoots) -> MergeContext {
+///
+/// `noconfmem` comes from the `--noconfmem` command-line flag and forces a fresh
+/// `._cfg` variant for a differing protected config regardless of config memory.
+pub(crate) fn merge_context(ctx: &ConfigContext, wr: &WriteRoots, noconfmem: bool) -> MergeContext {
     MergeContext {
         eroot: wr.eroot.clone(),
         vdb_dir: wr.vdb_dir.clone(),
@@ -91,6 +94,7 @@ pub(crate) fn merge_context(ctx: &ConfigContext, wr: &WriteRoots) -> MergeContex
         collision_ignore: whitespace_list(ctx.vars.get("COLLISION_IGNORE")),
         uninstall_ignore: whitespace_list(ctx.vars.get("UNINSTALL_IGNORE")),
         install_mask: install_mask_from(ctx),
+        noconfmem,
     }
 }
 
@@ -264,7 +268,7 @@ fn run_removal(cli: &Cli, ctx: &ConfigContext, wr: &WriteRoots, cpvs: &[String])
         .collect();
 
     ensure_dirs(wr)?;
-    let mctx = merge_context(ctx, wr);
+    let mctx = merge_context(ctx, wr, cli.noconfmem);
     let applier = EngineApplier::new(mctx);
     let runner = NoBuild;
     let engine = TransactionEngine::new(&runner, &applier, &wr.state_dir);
@@ -290,7 +294,7 @@ pub fn resume(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let pkgdir = wr.eroot.join("var/cache/binpkgs");
     let stage = wr.state_dir.join("install-stage");
     let runner = BinpkgRunner::new(LocalPkgdir { pkgdir }, stage);
-    let mctx = merge_context(ctx, &wr);
+    let mctx = merge_context(ctx, &wr, cli.noconfmem);
     let applier = EngineApplier::new(mctx);
     let engine = TransactionEngine::new(&runner, &applier, &wr.state_dir);
     engine.resume().map_err(|e| miette!("resume failed: {e}"))?;

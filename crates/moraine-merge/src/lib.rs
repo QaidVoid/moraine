@@ -131,6 +131,10 @@ pub struct MergeContext {
     /// The combined `INSTALL_MASK`/`PKG_INSTALL_MASK` filter: matching image
     /// paths are dropped before they enter CONTENTS.
     pub install_mask: install_mask::InstallMask,
+    /// `--noconfmem`: always re-offer a differing protected config as a fresh
+    /// `._cfg` variant, ignoring the config-memory suppression. A downgrade
+    /// behaves as if this were set, matching Portage.
+    pub noconfmem: bool,
 }
 
 impl MergeContext {
@@ -280,6 +284,7 @@ mod tests {
             collision_ignore: Vec::new(),
             uninstall_ignore: Vec::new(),
             install_mask: Default::default(),
+            noconfmem: false,
         };
         assert_eq!(
             ctx.live_path("/usr/bin/foo"),

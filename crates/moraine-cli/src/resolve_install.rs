@@ -343,7 +343,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         binpkg: BinpkgRunner::new(binpkg_source, stage)
             .with_signature(signature_policy, signature_config(&ctx.vars)),
     };
-    let applier = EngineApplier::new(merge_context(ctx, &wr));
+    let applier = EngineApplier::new(merge_context(ctx, &wr, cli.noconfmem));
     let engine = TransactionEngine::new(&runner, &applier, &wr.state_dir);
     let report = engine
         .run(&Transaction::new(tasks))

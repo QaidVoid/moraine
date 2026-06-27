@@ -162,15 +162,18 @@ pub fn highest_variant_path(target: &Path, target_name: &str) -> Option<PathBuf>
     Some(dir.join(format!("._cfg{highest:04}_{target_name}")))
 }
 
-/// The config memory (`CONFIG_MEMORY_FILE`): the md5 digests already offered to
-/// the admin for each protected config path, so an identical update is not
-/// re-offered as a fresh `._cfg` variant (Portage's `noconfmem`).
+/// The config memory (`CONFIG_MEMORY_FILE`): the single latest md5 digest
+/// offered to the admin for each protected config path, so an identical update
+/// is not re-offered as a fresh `._cfg` variant (Portage's `noconfmem`). Storing
+/// exactly one digest per path matches Portage's `cfgfiledict[dest_real] =
+/// [src_md5]`, so reverting to an earlier value re-offers it.
 ///
-/// The on-disk form is one line per path: `<install_path>\t<md5>,<md5>,...`.
+/// The on-disk form is one line per path: `<install_path>\t<md5>`. A legacy file
+/// carrying a comma list is read as its first md5 and rewritten as one.
 #[derive(Debug, Default)]
 pub(crate) struct ConfMem {
     path: PathBuf,
-    offered: BTreeMap<String, Vec<String>>,
+    offered: BTreeMap<String, String>,
 }
 
 impl ConfMem {
@@ -180,30 +183,26 @@ impl ConfMem {
         let mut offered = BTreeMap::new();
         if let Ok(text) = std::fs::read_to_string(&path) {
             for line in text.lines() {
-                if let Some((install_path, digests)) = line.split_once('\t') {
-                    offered.insert(
-                        install_path.to_string(),
-                        digests.split(',').map(str::to_string).collect(),
-                    );
+                if let Some((install_path, digests)) = line.split_once('\t')
+                    && let Some(md5) = digests.split(',').next()
+                {
+                    offered.insert(install_path.to_string(), md5.to_string());
                 }
             }
         }
         Self { path, offered }
     }
 
-    /// Whether `md5` has already been offered for `install_path`.
+    /// Whether `md5` is the latest offered digest for `install_path`.
     pub(crate) fn already_offered(&self, install_path: &str, md5: &str) -> bool {
-        self.offered
-            .get(install_path)
-            .is_some_and(|v| v.iter().any(|m| m == md5))
+        self.offered.get(install_path).is_some_and(|m| m == md5)
     }
 
-    /// Record that `md5` was offered for `install_path`.
+    /// Record `md5` as the latest digest offered for `install_path`, replacing any
+    /// earlier value.
     pub(crate) fn record(&mut self, install_path: &str, md5: &str) {
-        let entry = self.offered.entry(install_path.to_string()).or_default();
-        if !entry.iter().any(|m| m == md5) {
-            entry.push(md5.to_string());
-        }
+        self.offered
+            .insert(install_path.to_string(), md5.to_string());
     }
 
     /// Persist the config memory, creating the parent directory if needed.
@@ -212,10 +211,10 @@ impl ConfMem {
             std::fs::create_dir_all(parent)?;
         }
         let mut out = String::new();
-        for (install_path, digests) in &self.offered {
+        for (install_path, md5) in &self.offered {
             out.push_str(install_path);
             out.push('\t');
-            out.push_str(&digests.join(","));
+            out.push_str(md5);
             out.push('\n');
         }
         std::fs::write(&self.path, out)

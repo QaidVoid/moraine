@@ -57,9 +57,19 @@ pub enum Resolution {
 pub fn resolve_update(update: &PendingUpdate, resolution: Resolution) -> Result<bool> {
     match resolution {
         Resolution::Apply => {
-            let bytes =
-                std::fs::read(&update.variant).map_err(|e| InstallError::io(&update.variant, e))?;
-            write_target(&update.target, &bytes)?;
+            // A symlink variant is recreated as a symlink so its target string is
+            // applied verbatim rather than its dereferenced bytes.
+            let meta = std::fs::symlink_metadata(&update.variant)
+                .map_err(|e| InstallError::io(&update.variant, e))?;
+            if meta.file_type().is_symlink() {
+                let link_target = std::fs::read_link(&update.variant)
+                    .map_err(|e| InstallError::io(&update.variant, e))?;
+                recreate_symlink(&update.target, &link_target)?;
+            } else {
+                let bytes = std::fs::read(&update.variant)
+                    .map_err(|e| InstallError::io(&update.variant, e))?;
+                write_target(&update.target, &bytes)?;
+            }
             remove_variant(&update.variant)?;
             Ok(true)
         }
@@ -94,6 +104,20 @@ fn strip_variant_prefix(name: &str) -> Option<String> {
 /// excluded from pending updates, matching `find_updated_config_files`.
 fn is_backup_name(name: &str) -> bool {
     name.ends_with('~') || name.to_ascii_lowercase().ends_with(".bak")
+}
+
+/// Recreate the live target as a symlink to `link_target`, replacing any existing
+/// path and creating parents.
+fn recreate_symlink(target: &Path, link_target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| InstallError::io(parent, e))?;
+    }
+    match std::fs::remove_file(target) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(InstallError::io(target, e)),
+    }
+    std::os::unix::fs::symlink(link_target, target).map_err(|e| InstallError::io(target, e))
 }
 
 /// Write `bytes` to the live target atomically, creating parents.
@@ -172,5 +196,31 @@ mod tests {
         assert!(changed);
         assert_eq!(std::fs::read_to_string(&update.target).unwrap(), "merged\n");
         assert!(!update.variant.exists());
+    }
+
+    #[test]
+    fn apply_recreates_symlink_variant_as_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("link");
+        let variant = dir.path().join("._cfg0000_link");
+        // The live path is a symlink the admin customized.
+        std::os::unix::fs::symlink("old-target", &target).unwrap();
+        // The variant is itself a symlink to the new target.
+        std::os::unix::fs::symlink("new-target", &variant).unwrap();
+        let update = PendingUpdate::from_variant(&variant).unwrap();
+        assert_eq!(update.target, target);
+
+        let changed = resolve_update(&update, Resolution::Apply).unwrap();
+        assert!(changed);
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "live path is recreated as a symlink, not a regular file"
+        );
+        assert_eq!(
+            std::fs::read_link(&target).unwrap(),
+            PathBuf::from("new-target")
+        );
+        assert!(!variant.exists());
     }
 }

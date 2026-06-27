@@ -15,9 +15,12 @@ use std::path::Path;
 use moraine_common::Interner;
 use moraine_vdb::contents::{Entry, EntryKind};
 use moraine_vdb::store::Store;
+use moraine_version::Version;
 
 use crate::collision;
-use crate::contents::{compute_md5, dev_entry, dir_entry, fif_entry, obj_entry, sym_entry};
+use crate::contents::{
+    compute_md5, dev_entry, dir_entry, fif_entry, mtime_secs, obj_entry, sym_entry,
+};
 use crate::error::{IoResultExt as _, MergeError};
 use crate::image::{self, ImageItem, ImageKind};
 use crate::plan::MergeOp;
@@ -98,6 +101,12 @@ pub(crate) fn place_image(
     let prior_md5 = prior_recorded_md5(store, interner, op.replaces.as_deref());
     let mut confmem = protect::ConfMem::load(ctx.confmem_file());
 
+    // A downgrade behaves as `--noconfmem`, forcing a fresh `._cfg` variant for a
+    // differing protected config so the admin is re-prompted on upgrade/downgrade
+    // cycles, matching Portage's `downgrade` handling.
+    let downgrade = is_downgrade(&op.state.version, op.replaces.as_deref());
+    let force = ctx.noconfmem || downgrade;
+
     for item in &items {
         let shared = matches!(item.kind, ImageKind::File) && item.nlink > 1;
         if shared
@@ -110,6 +119,7 @@ pub(crate) fn place_image(
                 ctx,
                 item,
                 &prior_md5,
+                force,
                 &mut confmem,
                 &mut entries,
                 &mut config_updates,
@@ -167,10 +177,12 @@ pub(crate) fn place_image(
 }
 
 /// Place a single image item into the live root, appending its CONTENTS entry.
+#[allow(clippy::too_many_arguments)]
 fn place_item(
     ctx: &MergeContext,
     item: &ImageItem,
     prior_md5: &HashMap<String, String>,
+    force: bool,
     confmem: &mut protect::ConfMem,
     entries: &mut Vec<Entry>,
     config_updates: &mut Vec<String>,
@@ -178,9 +190,18 @@ fn place_item(
     let live = ctx.live_path(&item.install_path);
     match &item.kind {
         ImageKind::Dir => {
-            backup_blocker(&live, true)?;
+            // A directory (or a symlink to one) that already exists keeps its
+            // mode and ownership; only a directory this merge creates receives the
+            // image metadata, matching Portage's chmod/chown of a freshly created
+            // directory.
+            let pre_existing = live.is_dir();
+            if !pre_existing {
+                backup_blocker(&live, true)?;
+            }
             std::fs::create_dir_all(&live).with_path(&live)?;
-            apply_metadata(&live, item, false)?;
+            if !pre_existing {
+                apply_metadata(&live, item, false)?;
+            }
             entries.push(dir_entry(&item.install_path));
         }
         ImageKind::File => {
@@ -197,6 +218,7 @@ fn place_item(
                 &bytes,
                 item.mtime,
                 prior_md5.get(&item.install_path).map(String::as_str),
+                force,
                 confmem,
                 config_updates,
             )?;
@@ -208,19 +230,25 @@ fn place_item(
             if let Some(parent) = live.parent() {
                 std::fs::create_dir_all(parent).with_path(parent)?;
             }
-            backup_blocker(&live, false)?;
-            place_symlink(&live, target)?;
-            apply_metadata(&live, item, true)?;
-            apply_source_mtime(&live, item, true);
-            entries.push(sym_entry(&item.install_path, target, item.mtime));
+            let entry = if ctx.config_protect.is_protected(&item.install_path) {
+                place_protected_symlink(&live, item, target, force, confmem, config_updates)?
+            } else {
+                backup_blocker(&live, false)?;
+                place_symlink(&live, target)?;
+                apply_metadata(&live, item, true)?;
+                apply_source_mtime(&live, item, true);
+                sym_entry(&item.install_path, target, item.mtime)
+            };
+            entries.push(entry);
         }
         ImageKind::Fifo => {
             if let Some(parent) = live.parent() {
                 std::fs::create_dir_all(parent).with_path(parent)?;
             }
             backup_blocker(&live, false)?;
-            place_node(&live, item)?;
-            apply_metadata(&live, item, false)?;
+            if place_node(&live, item)? {
+                apply_metadata(&live, item, false)?;
+            }
             entries.push(fif_entry(&item.install_path));
         }
         ImageKind::Dev => {
@@ -228,12 +256,122 @@ fn place_item(
                 std::fs::create_dir_all(parent).with_path(parent)?;
             }
             backup_blocker(&live, false)?;
-            place_node(&live, item)?;
-            apply_metadata(&live, item, false)?;
+            if place_node(&live, item)? {
+                apply_metadata(&live, item, false)?;
+            }
             entries.push(dev_entry(&item.install_path));
         }
     }
     Ok(())
+}
+
+/// Place a symlink under a `CONFIG_PROTECT` path, returning its CONTENTS entry.
+///
+/// When the live link is absent or already points at the same target, it is
+/// written in place. When it points elsewhere, a `._cfgNNNN_<name>` symlink
+/// variant is written beside it, the live link is left untouched, and the variant
+/// is reported as a pending config update, mirroring `_protect` forcing a variant
+/// when `dest_link != src_link` (bug #485598). The md5 of the new target string is
+/// remembered in config memory; an identical update already offered is suppressed
+/// unless `force` is set.
+fn place_protected_symlink(
+    live: &Path,
+    item: &ImageItem,
+    target: &str,
+    force: bool,
+    confmem: &mut protect::ConfMem,
+    config_updates: &mut Vec<String>,
+) -> Result<Entry, MergeError> {
+    let install_path = &item.install_path;
+    let live_target = std::fs::read_link(live)
+        .ok()
+        .map(|t| t.to_string_lossy().into_owned());
+
+    if live_target.as_deref() != Some(target) && live_target.is_some() {
+        // The live link points elsewhere: protect it.
+        let md5 = compute_md5(target.as_bytes());
+        if !force && confmem.already_offered(install_path, &md5) {
+            // The same update was already offered and dismissed: leave the live
+            // link untouched and record it as still owned.
+            let live_target = live_target.unwrap_or_else(|| target.to_string());
+            return Ok(sym_entry(install_path, &live_target, item.mtime));
+        }
+        let (entry, variant_install) =
+            write_symlink_variant(install_path, live, target, item.mtime)?;
+        confmem.record(install_path, &md5);
+        config_updates.push(variant_install);
+        return Ok(entry);
+    }
+
+    // Absent or identical: write the link in place.
+    backup_blocker(live, false)?;
+    place_symlink(live, target)?;
+    apply_metadata(live, item, true)?;
+    apply_source_mtime(live, item, true);
+    Ok(sym_entry(install_path, target, item.mtime))
+}
+
+/// Write a `._cfgNNNN_<name>` symlink variant beside `live`, reusing the highest
+/// existing variant when its link target already equals `target`. Returns the
+/// `sym` CONTENTS entry for the variant and its install path.
+fn write_symlink_variant(
+    install_path: &str,
+    live: &Path,
+    target: &str,
+    mtime: i64,
+) -> Result<(Entry, String), MergeError> {
+    let name = live
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let variant = choose_symlink_variant(live, &name, target);
+    let variant_live = live.with_file_name(&variant);
+    place_symlink(&variant_live, target)?;
+    let variant_install = sibling_install_path(install_path, &variant);
+    let entry = sym_entry(&variant_install, target, mtime);
+    Ok((entry, variant_install))
+}
+
+/// Choose the `._cfgNNNN_<name>` symlink variant: reuse the highest existing
+/// variant when its link target already equals `target`, otherwise allocate the
+/// next index, mirroring Portage's `new_protect_filename` for symlinks.
+fn choose_symlink_variant(live: &Path, name: &str, target: &str) -> String {
+    if let Some(highest) = protect::highest_variant_path(live, name)
+        && std::fs::read_link(&highest).is_ok_and(|t| t.to_string_lossy() == target)
+        && let Some(highest_name) = highest.file_name()
+    {
+        return highest_name.to_string_lossy().into_owned();
+    }
+    protect::variant_name(name, &protect::sibling_names(live))
+}
+
+/// Whether replacing the prior `category/package-version` with `new_version` is a
+/// version downgrade, mirroring Portage's `vercmp(...) < 0`. A missing or
+/// unparsable prior version is not a downgrade.
+fn is_downgrade(new_version: &str, prior_cpv: Option<&str>) -> bool {
+    let Some(prior_version) = prior_cpv.and_then(cpv_version) else {
+        return false;
+    };
+    match (Version::parse(new_version), Version::parse(&prior_version)) {
+        (Ok(new), Ok(old)) => new < old,
+        _ => false,
+    }
+}
+
+/// Extract the version from a `category/package-version` cpv, at the first `-`
+/// followed by a parsable version.
+fn cpv_version(cpv: &str) -> Option<String> {
+    let pv = cpv.rsplit_once('/').map(|(_, pv)| pv).unwrap_or(cpv);
+    let mut idx = 0;
+    while let Some(rel) = pv[idx..].find('-') {
+        let at = idx + rel;
+        let tail = &pv[at + 1..];
+        if tail.as_bytes().first().is_some_and(u8::is_ascii_digit) && Version::parse(tail).is_ok() {
+            return Some(tail.to_string());
+        }
+        idx = at + 1;
+    }
+    None
 }
 
 /// Rename a type-conflicting blocker out of the way before placement. A
@@ -298,12 +436,16 @@ fn place_hardlink(
     Ok(())
 }
 
-/// Create a FIFO or device node at `path` with `mknod`, replacing any stale
-/// entry. The node type and permission bits come from the source mode and the
-/// device number from `rdev`.
-fn place_node(path: &Path, item: &ImageItem) -> Result<(), MergeError> {
+/// Create a FIFO or device node at `path` with `mknod`, returning whether the
+/// node was created. A node already present is left in place untouched and only
+/// its CONTENTS record is written, mirroring Portage merging a node only when the
+/// destination does not already exist. The node type and permission bits come
+/// from the source mode and the device number from `rdev`.
+fn place_node(path: &Path, item: &ImageItem) -> Result<bool, MergeError> {
     use rustix::fs::{FileType, Mode, RawMode};
-    let _ = std::fs::remove_file(path);
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Ok(false);
+    }
     let file_type = FileType::from_raw_mode(item.mode as RawMode);
     let mode = Mode::from_bits_truncate((item.mode & 0o7777) as RawMode);
     let dev = if matches!(file_type, FileType::CharacterDevice | FileType::BlockDevice) {
@@ -317,7 +459,7 @@ fn place_node(path: &Path, item: &ImageItem) -> Result<(), MergeError> {
             source: std::io::Error::from_raw_os_error(e.raw_os_error()),
         }
     })?;
-    Ok(())
+    Ok(true)
 }
 
 /// Reapply the source mode, ownership, and xattrs to a freshly placed path. The
@@ -408,6 +550,7 @@ fn place_file(
     bytes: &[u8],
     mtime: i64,
     prior_md5: Option<&str>,
+    force: bool,
     confmem: &mut protect::ConfMem,
     config_updates: &mut Vec<String>,
 ) -> Result<(Entry, std::path::PathBuf), MergeError> {
@@ -443,9 +586,11 @@ fn place_file(
             return in_place(install_path);
         }
         // noconfmem: an identical update already offered for this path is not
-        // re-offered; leave the live file as the admin left it.
+        // re-offered; leave the live file as the admin left it. `force`
+        // (`--noconfmem` or a downgrade) bypasses the suppression and always
+        // writes a fresh variant.
         let md5 = compute_md5(bytes);
-        if confmem.already_offered(install_path, &md5) {
+        if !force && confmem.already_offered(install_path, &md5) {
             return Ok((
                 obj_entry(install_path, &existing, mtime),
                 live.to_path_buf(),
@@ -678,6 +823,13 @@ fn remove_obsolete(
         if preserved_paths.contains(&entry.path) {
             continue;
         }
+        // An admin-modified obsolete file (md5 or mtime drift) is left in place,
+        // mirroring `_unmerge_pkgfiles`. A `sym` entry keeps the prior behavior.
+        if let EntryKind::Obj { md5, mtime } = &entry.kind
+            && !obsolete_obj_removable(ctx, &entry.path, md5, *mtime)?
+        {
+            continue;
+        }
         let live = ctx.live_path(&entry.path);
         match std::fs::remove_file(&live) {
             Ok(()) => {}
@@ -705,6 +857,34 @@ fn remove_obsolete(
     }
 
     Ok(preserved)
+}
+
+/// Whether an obsolete prior-version `obj` may be removed on a same-slot replace:
+/// the live bytes must still match the recorded md5 and mtime, mirroring
+/// `_unmerge_pkgfiles`. `FEATURES=unmerge-orphans` removes regardless of drift; a
+/// preserved-library placeholder (empty md5) and a modified or unreadable file are
+/// left in place. This reuses the same guard `unmerge.rs::classify_obj` applies so
+/// the replace path and the standalone unmerge path stay consistent.
+fn obsolete_obj_removable(
+    ctx: &MergeContext,
+    path: &str,
+    md5: &str,
+    mtime: i64,
+) -> Result<bool, MergeError> {
+    if md5.is_empty() {
+        return Ok(false);
+    }
+    if ctx.features.unmerge_orphans {
+        return Ok(true);
+    }
+    let live = ctx.live_path(path);
+    let Ok(bytes) = std::fs::read(&live) else {
+        return Ok(false);
+    };
+    if compute_md5(&bytes) != md5 {
+        return Ok(false);
+    }
+    Ok(mtime_secs(&live)? == mtime)
 }
 
 /// The recorded `(bucket, soname)` of the library at `path`, from the per-object
