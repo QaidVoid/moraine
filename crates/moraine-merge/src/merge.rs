@@ -72,6 +72,7 @@ pub(crate) fn place_image(
             &items,
             op.replaces.as_deref(),
             &ctx.collision_ignore,
+            &ctx.config_protect,
         )
     };
     let aborting = collision::aborting(ctx.features, &collisions);
@@ -194,11 +195,13 @@ fn place_item(
                 &item.install_path,
                 &live,
                 &bytes,
+                item.mtime,
                 prior_md5.get(&item.install_path).map(String::as_str),
                 confmem,
                 config_updates,
             )?;
             apply_metadata(&written, item, false)?;
+            apply_source_mtime(&written, item, false);
             entries.push(entry);
         }
         ImageKind::Sym { target } => {
@@ -208,7 +211,8 @@ fn place_item(
             backup_blocker(&live, false)?;
             place_symlink(&live, target)?;
             apply_metadata(&live, item, true)?;
-            entries.push(sym_entry(&item.install_path, target, &live)?);
+            apply_source_mtime(&live, item, true);
+            entries.push(sym_entry(&item.install_path, target, item.mtime));
         }
         ImageKind::Fifo => {
             if let Some(parent) = live.parent() {
@@ -287,9 +291,10 @@ fn place_hardlink(
     let target = ctx.live_path(first_install_path);
     let _ = std::fs::remove_file(&live);
     std::fs::hard_link(&target, &live).with_path(&live)?;
-    // The hardlink shares the sibling's content; record its md5 and mtime.
+    // The hardlink shares the sibling's content; record its md5 and source mtime.
     let bytes = std::fs::read(&item.source).with_path(&item.source)?;
-    entries.push(obj_entry(&item.install_path, &bytes, &live)?);
+    apply_source_mtime(&live, item, false);
+    entries.push(obj_entry(&item.install_path, &bytes, item.mtime));
     Ok(())
 }
 
@@ -357,6 +362,31 @@ fn apply_metadata(path: &Path, item: &ImageItem, is_symlink: bool) -> Result<(),
     Ok(())
 }
 
+/// Stamp the source file's modification time onto a freshly placed path,
+/// mirroring Portage's `os.utime(..., follow_symlinks=False)`. A symlink is
+/// stamped without following it. The operation degrades gracefully: a permission
+/// or unsupported error is logged and the merge continues, since the source mtime
+/// is recorded in CONTENTS regardless, matching `apply_metadata`.
+fn apply_source_mtime(path: &Path, item: &ImageItem, is_symlink: bool) {
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
+    let ts = Timespec {
+        tv_sec: item.mtime,
+        tv_nsec: item.mtime_nsec as _,
+    };
+    let times = Timestamps {
+        last_access: ts,
+        last_modification: ts,
+    };
+    let flags = if is_symlink {
+        AtFlags::SYMLINK_NOFOLLOW
+    } else {
+        AtFlags::empty()
+    };
+    if let Err(e) = utimensat(CWD, path, &times, flags) {
+        tracing::debug!(path = %path.display(), error = ?e, "could not stamp source mtime");
+    }
+}
+
 /// Whether an I/O error is `EPERM`/`EACCES`, which Rust maps to
 /// `PermissionDenied`.
 fn is_permission_denied(e: &std::io::Error) -> bool {
@@ -370,18 +400,20 @@ const ENOTSUP: i32 = 95;
 /// CONTENTS entry for either the real path or the `._cfg` variant that was
 /// written, paired with the live path actually written so the caller can reapply
 /// metadata to it.
+#[allow(clippy::too_many_arguments)]
 fn place_file(
     ctx: &MergeContext,
     install_path: &str,
     live: &Path,
     bytes: &[u8],
+    mtime: i64,
     prior_md5: Option<&str>,
     confmem: &mut protect::ConfMem,
     config_updates: &mut Vec<String>,
 ) -> Result<(Entry, std::path::PathBuf), MergeError> {
     let in_place = |entry_path: &str| -> Result<(Entry, std::path::PathBuf), MergeError> {
         atomic_place_file(live, bytes)?;
-        Ok((obj_entry(entry_path, bytes, live)?, live.to_path_buf()))
+        Ok((obj_entry(entry_path, bytes, mtime), live.to_path_buf()))
     };
 
     // A zero-byte `.keep` marker is never config-protected.
@@ -415,11 +447,11 @@ fn place_file(
         let md5 = compute_md5(bytes);
         if confmem.already_offered(install_path, &md5) {
             return Ok((
-                obj_entry(install_path, &existing, live)?,
+                obj_entry(install_path, &existing, mtime),
                 live.to_path_buf(),
             ));
         }
-        let (entry, written, variant_install) = write_variant(install_path, live, bytes)?;
+        let (entry, written, variant_install) = write_variant(install_path, live, bytes, mtime)?;
         confmem.record(install_path, &md5);
         config_updates.push(variant_install);
         Ok((entry, written))
@@ -427,7 +459,7 @@ fn place_file(
         // A protected file recorded in the old contents was deleted by the admin:
         // force a `._cfg` variant rather than silently restoring it.
         let md5 = compute_md5(bytes);
-        let (entry, written, variant_install) = write_variant(install_path, live, bytes)?;
+        let (entry, written, variant_install) = write_variant(install_path, live, bytes, mtime)?;
         confmem.record(install_path, &md5);
         config_updates.push(variant_install);
         Ok((entry, written))
@@ -445,6 +477,7 @@ fn write_variant(
     install_path: &str,
     live: &Path,
     bytes: &[u8],
+    mtime: i64,
 ) -> Result<(Entry, std::path::PathBuf, String), MergeError> {
     let name = live
         .file_name()
@@ -454,7 +487,7 @@ fn write_variant(
     let variant_live = live.with_file_name(&variant);
     atomic_place_file(&variant_live, bytes)?;
     let variant_install = sibling_install_path(install_path, &variant);
-    let entry = obj_entry(&variant_install, bytes, &variant_live)?;
+    let entry = obj_entry(&variant_install, bytes, mtime);
     Ok((entry, variant_live, variant_install))
 }
 
@@ -586,8 +619,10 @@ fn remove_obsolete(
         return Ok(preserved);
     };
 
-    // Map the soname provided by each prior path, for preserve-libs decisions.
-    let prior_sonames = provided_sonames(prior, interner);
+    // Map each prior object path to its recorded soname, for preserve-libs
+    // decisions. The recorded `NEEDED.ELF.2` linkage keys the real versioned
+    // library directly, so its soname symlink need not be present in CONTENTS.
+    let prior_sonames = preserve::needed_soname_map(&prior.needed);
     // The sonames the new version re-provides (by entry basename): a replacement
     // soname link/hardlink means the old library need not be preserved.
     let new_sonames: BTreeSet<&str> = new_entries.iter().map(|e| basename(&e.path)).collect();
@@ -670,28 +705,11 @@ fn remove_obsolete(
     Ok(preserved)
 }
 
-/// The sonames provided by a record, paired with the basename they map to.
-///
-/// stock `PROVIDES` does not carry the path, so the engine matches a soname to a
-/// library by the file's basename, which is the soname for a real `.so.N` file.
-fn provided_sonames(
-    record: &moraine_vdb::record::PackageRecord,
-    interner: &Interner,
-) -> Vec<String> {
-    record
-        .provides
-        .entries
-        .iter()
-        .filter_map(|e| interner.resolve(e.soname).map(|s| s.to_string()))
-        .collect()
-}
-
-/// Whether `path`'s basename is one of the provided sonames; if so, the soname.
-fn library_soname(path: &str, sonames: &[String]) -> Option<String> {
-    sonames
-        .iter()
-        .find(|s| s.as_str() == basename(path))
-        .cloned()
+/// The recorded soname of the library at `path`, from the per-object
+/// `NEEDED.ELF.2` linkage map, or `None` when the path is not a recorded ELF
+/// object with a soname.
+fn library_soname(path: &str, soname_map: &HashMap<String, String>) -> Option<String> {
+    soname_map.get(path).cloned()
 }
 
 /// The final path component of an install path.

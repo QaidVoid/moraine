@@ -75,6 +75,10 @@ pub struct Features {
     /// admin has modified it from what was last installed; an unmodified file is
     /// overwritten in place. Default on, matching Portage.
     pub config_protect_if_modified: bool,
+    /// `unmerge-orphans`: on unmerge, unlink a non-directory, non-symlink-to-dir,
+    /// non-protected, non-preserved file still owned by the package regardless of
+    /// md5 or mtime drift.
+    pub unmerge_orphans: bool,
 }
 
 impl Features {
@@ -90,6 +94,7 @@ impl Features {
                 "sandbox" => f.sandbox = true,
                 "usersandbox" => f.usersandbox = true,
                 "config-protect-if-modified" => f.config_protect_if_modified = true,
+                "unmerge-orphans" => f.unmerge_orphans = true,
                 _ => {}
             }
         }
@@ -178,33 +183,95 @@ pub(crate) fn path_matches_any(path: &str, globs: &[String]) -> bool {
     })
 }
 
-/// A minimal `fnmatch` supporting `*` (any run, separators included) and `?`
-/// (any single character).
+/// A minimal `fnmatch` supporting `*` (any run, separators included), `?` (any
+/// single character), and `[seq]`/`[!seq]` character classes including `a-z`
+/// ranges, matching the patterns Python's `fnmatch.translate` matches. An
+/// unterminated `[` is treated as a literal `[`, as Python does.
 pub(crate) fn fnmatch(text: &str, pat: &str) -> bool {
     let (t, p) = (text.as_bytes(), pat.as_bytes());
     // Iterative backtracking match.
-    let (mut ti, mut pi) = (0, 0);
-    let (mut star_p, mut star_t) = (None, 0);
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let (mut star_p, mut star_t): (Option<usize>, usize) = (None, 0);
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
-            ti += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
+        if pi < p.len() && p[pi] == b'*' {
             star_p = Some(pi);
             star_t = ti;
             pi += 1;
-        } else if let Some(sp) = star_p {
-            pi = sp + 1;
-            star_t += 1;
-            ti = star_t;
+            continue;
+        }
+        // The pattern position past a single matched unit, or `None` on mismatch.
+        let next = if pi < p.len() {
+            match p[pi] {
+                b'?' => Some(pi + 1),
+                b'[' => match match_class(p, pi, t[ti]) {
+                    Some((true, end)) => Some(end),
+                    Some((false, _)) => None,
+                    // An unterminated `[` is a literal `[`.
+                    None => (p[pi] == t[ti]).then_some(pi + 1),
+                },
+                c => (c == t[ti]).then_some(pi + 1),
+            }
         } else {
-            return false;
+            None
+        };
+        match next {
+            Some(np) => {
+                pi = np;
+                ti += 1;
+            }
+            None => match star_p {
+                Some(sp) => {
+                    pi = sp + 1;
+                    star_t += 1;
+                    ti = star_t;
+                }
+                None => return false,
+            },
         }
     }
     while pi < p.len() && p[pi] == b'*' {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// Match a `[...]` character class in `pat` at `pi` (the opening `[`) against
+/// `ch`. Returns whether `ch` matches and the index just past the closing `]`, or
+/// `None` when the class is unterminated so the caller treats `[` as a literal. A
+/// leading `!` or `^` negates; a `]` immediately after the opening (or negation)
+/// is a literal member; `a-z` denotes an inclusive range.
+fn match_class(pat: &[u8], pi: usize, ch: u8) -> Option<(bool, usize)> {
+    let mut j = pi + 1;
+    let negate = matches!(pat.get(j), Some(b'!') | Some(b'^'));
+    if negate {
+        j += 1;
+    }
+    let start = j;
+    let mut matched = false;
+    loop {
+        match pat.get(j) {
+            // Unterminated class.
+            None => return None,
+            // A closing `]` after at least one member ends the class; a `]` in the
+            // first position is a literal member instead.
+            Some(b']') if j > start => break,
+            Some(&c) => {
+                if pat.get(j + 1) == Some(&b'-') && pat.get(j + 2).is_some_and(|&e| e != b']') {
+                    let end = pat[j + 2];
+                    if c <= ch && ch <= end {
+                        matched = true;
+                    }
+                    j += 3;
+                } else {
+                    if c == ch {
+                        matched = true;
+                    }
+                    j += 1;
+                }
+            }
+        }
+    }
+    Some((matched ^ negate, j + 1))
 }
 
 /// Read the directory entry names directly under `dir`, returning an empty list
@@ -231,6 +298,7 @@ mod tests {
             "collision-protect",
             "xattr",
             "config-protect-if-modified",
+            "unmerge-orphans",
         ]);
         assert!(f.preserve_libs);
         assert!(f.collision_protect);
@@ -240,6 +308,43 @@ mod tests {
         assert!(f.usersandbox);
         assert!(f.xattr);
         assert!(f.config_protect_if_modified);
+        assert!(f.unmerge_orphans);
+    }
+
+    #[test]
+    fn fnmatch_character_classes() {
+        // Positive class.
+        assert!(fnmatch("a", "[abc]"));
+        assert!(!fnmatch("d", "[abc]"));
+        // Negated class (both spellings).
+        assert!(fnmatch("d", "[!abc]"));
+        assert!(!fnmatch("a", "[!abc]"));
+        assert!(fnmatch("d", "[^abc]"));
+        // Range.
+        assert!(fnmatch("5", "[0-9]"));
+        assert!(!fnmatch("x", "[0-9]"));
+        // A leading `]` is a literal member.
+        assert!(fnmatch("]", "[]a]"));
+        // Class embedded in a larger pattern.
+        assert!(fnmatch("/usr/lib/libfoo.so.1", "/usr/lib/*.so.[0-9]*"));
+        assert!(!fnmatch("/usr/lib/libfoo.so.x", "/usr/lib/*.so.[0-9]*"));
+        // An unterminated `[` is a literal `[`.
+        assert!(fnmatch("a[b", "a[b"));
+        assert!(!fnmatch("ab", "a[b"));
+    }
+
+    #[test]
+    fn install_mask_inherits_character_classes() {
+        let mask = install_mask::InstallMask::new("/usr/lib/*.so.[0-9]*");
+        assert!(mask.is_masked("/usr/lib/libfoo.so.1"));
+        assert!(!mask.is_masked("/usr/lib/libfoo.so"));
+    }
+
+    #[test]
+    fn path_matches_any_inherits_character_classes() {
+        let globs = vec!["/var/log/app[0-9].log".to_string()];
+        assert!(path_matches_any("/var/log/app7.log", &globs));
+        assert!(!path_matches_any("/var/log/appx.log", &globs));
     }
 
     #[test]

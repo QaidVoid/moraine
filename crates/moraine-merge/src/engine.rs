@@ -116,26 +116,21 @@ impl MergeEngine {
     }
 
     /// Rebuild the registry from installed soname data: any installed file whose
-    /// basename is a soname still required by another package is a preserved lib.
+    /// recorded `NEEDED.ELF.2` soname is still required by another package is a
+    /// preserved lib.
     fn rebuild_registry(&self, store: &Store) -> PreservedLibs {
         let interner = store.interner();
         let mut reg = PreservedLibs::new();
         for record in store.records() {
             let cpv = record.cpv(interner);
-            let provided: Vec<String> = record
-                .provides
-                .entries
-                .iter()
-                .filter_map(|e| interner.resolve(e.soname).map(|s| s.to_string()))
-                .collect();
+            let soname_map = preserve::needed_soname_map(&record.needed);
             for entry in record.contents.iter() {
-                let base = entry.path.rsplit('/').next().unwrap_or(&entry.path);
-                if provided.iter().any(|s| s == base)
-                    && preserve::soname_still_needed(store, interner, base, Some(&cpv))
+                if let Some(soname) = soname_map.get(&entry.path)
+                    && preserve::soname_still_needed(store, interner, soname, Some(&cpv))
                 {
                     reg.insert(crate::preserve::PreservedEntry {
                         cpv: cpv.clone(),
-                        soname: base.to_string(),
+                        soname: soname.clone(),
                         path: entry.path.clone(),
                     });
                 }
@@ -260,7 +255,14 @@ impl MergeEngine {
         recovery::write_marker(&self.ctx.marker_dir(), MarkerKind::Unmerge, &op.cpv)?;
 
         let interner = store.interner().clone();
-        let _ = unmerge::unmerge(&self.ctx, store, &interner, &op.cpv)?;
+        let result = unmerge::unmerge(&self.ctx, store, &interner, &op.cpv)?;
+
+        // Register any still-needed library deferred by the walk before the record
+        // is removed, so the registry owns it once the record is gone, mirroring
+        // Portage's `plib_registry.register`.
+        for entry in &result.preserved {
+            registry.insert(entry.clone());
+        }
 
         // Remove the record and, for an explicit package not being replaced, drop
         // it from the world file.
@@ -293,7 +295,7 @@ impl MergeEngine {
             merged: false,
             counter: None,
             report,
-            preserved: Vec::new(),
+            preserved: result.preserved.into_iter().map(|p| p.path).collect(),
             reconciled,
         })
     }
@@ -347,10 +349,16 @@ impl MergeEngine {
             }
             MarkerKind::Unmerge => {
                 // Re-run the unmerge idempotently: it removes only paths still
-                // owned and matching.
+                // owned and matching. Register any library it defers around the
+                // re-run so a crash between defer and register still converges.
                 let store = Store::load(self.store_paths())?;
                 let interner = store.interner().clone();
-                let _ = unmerge::unmerge(&self.ctx, &store, &interner, &marker.cpv)?;
+                let mut registry = self.load_registry(&store)?;
+                let result = unmerge::unmerge(&self.ctx, &store, &interner, &marker.cpv)?;
+                for entry in &result.preserved {
+                    registry.insert(entry.clone());
+                }
+                registry.save(&self.ctx.registry_file())?;
                 tracing::info!("unmerge re-run idempotently");
             }
         }

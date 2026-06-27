@@ -13,10 +13,12 @@ use moraine_common::Interner;
 use moraine_vdb::contents::EntryKind;
 use moraine_vdb::store::Store;
 
+use std::collections::HashMap;
+
 use crate::collision;
 use crate::contents::{compute_md5, mtime_secs};
 use crate::error::MergeError;
-use crate::preserve;
+use crate::preserve::{self, PreservedEntry};
 use crate::{MergeContext, dir_entry_names};
 
 /// The outcome of an unmerge walk: which paths were removed and which were
@@ -27,6 +29,21 @@ pub(crate) struct UnmergeResult {
     pub removed: Vec<String>,
     /// Paths skipped and left in place.
     pub skipped: Vec<String>,
+    /// Still-needed shared libraries deferred to preserve-libs, to be registered
+    /// in the durable registry before the package record is removed.
+    pub preserved: Vec<PreservedEntry>,
+}
+
+/// What the unmerge walk should do with a recorded `obj` entry.
+enum ObjAction {
+    /// Remove the file from the live system.
+    Remove,
+    /// Leave the file in place for an ordinary reason (protected, foreign-owned,
+    /// modified, or already gone).
+    Skip,
+    /// Defer the file to preserve-libs reconciliation, carrying its recorded
+    /// soname so the standalone-unmerge path can register it.
+    Preserve(String),
 }
 
 /// Walk and remove the CONTENTS of `cpv` from the live root.
@@ -53,13 +70,9 @@ pub(crate) fn unmerge(
         return Ok(result);
     };
 
-    // Provided sonames so a still-needed library can be deferred.
-    let provided: Vec<String> = record
-        .provides
-        .entries
-        .iter()
-        .filter_map(|e| interner.resolve(e.soname).map(|s| s.to_string()))
-        .collect();
+    // Per-object soname map so a still-needed library can be matched by its
+    // recorded `NEEDED.ELF.2` linkage and deferred.
+    let soname_map = preserve::needed_soname_map(&record.needed);
 
     // Walk in reverse depth order so deeper paths precede their parents.
     let mut entries: Vec<_> = record.contents.iter().collect();
@@ -86,18 +99,30 @@ pub(crate) fn unmerge(
                 }
             }
             EntryKind::Obj { md5, mtime } => {
-                if should_skip_obj(
+                match classify_obj(
                     ctx,
                     store,
                     interner,
                     cpv,
                     &entry.path,
-                    &provided,
+                    &soname_map,
                     md5,
                     *mtime,
                 )? {
-                    result.skipped.push(entry.path.clone());
-                    continue;
+                    ObjAction::Skip => {
+                        result.skipped.push(entry.path.clone());
+                        continue;
+                    }
+                    ObjAction::Preserve(soname) => {
+                        result.skipped.push(entry.path.clone());
+                        result.preserved.push(PreservedEntry {
+                            cpv: cpv.to_string(),
+                            soname,
+                            path: entry.path.clone(),
+                        });
+                        continue;
+                    }
+                    ObjAction::Remove => {}
                 }
                 // Neutralize any outstanding hardlink to a suid/sgid file by
                 // stripping its mode before unlinking, matching Portage.
@@ -179,51 +204,59 @@ fn other_owns_through(store: &Store, interner: &Interner, sym_path: &str, cpv: &
     false
 }
 
+/// Classify a recorded `obj` entry: remove it, skip it, or defer it to
+/// preserve-libs. The config-protect, foreign-ownership, and preserve-libs guards
+/// run first; `unmerge-orphans` then bypasses the md5/mtime gate for a genuine
+/// file the package still owns.
 #[allow(clippy::too_many_arguments)]
-fn should_skip_obj(
+fn classify_obj(
     ctx: &MergeContext,
     store: &Store,
     interner: &Interner,
     cpv: &str,
     path: &str,
-    provided: &[String],
+    soname_map: &HashMap<String, String>,
     md5: &str,
     mtime: i64,
-) -> Result<bool, MergeError> {
+) -> Result<ObjAction, MergeError> {
     // Protected configs are never removed on unmerge.
     if ctx.config_protect.is_protected(path) {
-        return Ok(true);
+        return Ok(ObjAction::Skip);
     }
     // Now owned by another package: skip.
     if collision::owner_of(store, interner, path, Some(cpv)).is_some() {
-        return Ok(true);
+        return Ok(ObjAction::Skip);
     }
-    // Defer a still-needed shared library to preserve-libs reconciliation.
-    if ctx.features.preserve_libs {
-        let base = path.rsplit('/').next().unwrap_or(path);
-        if provided.iter().any(|s| s == base)
-            && preserve::soname_still_needed(store, interner, base, Some(cpv))
-        {
-            return Ok(true);
-        }
+    // Defer a still-needed shared library to preserve-libs reconciliation,
+    // matching the library to its soname by recorded `NEEDED.ELF.2` linkage.
+    if ctx.features.preserve_libs
+        && let Some(soname) = soname_map.get(path)
+        && preserve::soname_still_needed(store, interner, soname, Some(cpv))
+    {
+        return Ok(ObjAction::Preserve(soname.clone()));
+    }
+    // An empty recorded md5 is a preserved-library placeholder: never remove it.
+    if md5.is_empty() {
+        return Ok(ObjAction::Skip);
+    }
+    // unmerge-orphans: a non-protected, non-foreign, non-preserved file the
+    // package still owns is unlinked regardless of md5/mtime drift.
+    if ctx.features.unmerge_orphans {
+        return Ok(ObjAction::Remove);
     }
     let live = ctx.live_path(path);
     let Ok(bytes) = std::fs::read(&live) else {
         // Gone already or unreadable: nothing to remove.
-        return Ok(true);
+        return Ok(ObjAction::Skip);
     };
-    // A modified file (md5 or mtime mismatch) is skipped. An empty recorded md5
-    // is a preserved-library placeholder: never remove it here.
-    if md5.is_empty() {
-        return Ok(true);
-    }
+    // A modified file (md5 or mtime mismatch) is skipped.
     if compute_md5(&bytes) != md5 {
-        return Ok(true);
+        return Ok(ObjAction::Skip);
     }
     if mtime_secs(&live)? != mtime {
-        return Ok(true);
+        return Ok(ObjAction::Skip);
     }
-    Ok(false)
+    Ok(ObjAction::Remove)
 }
 
 fn should_skip_sym(

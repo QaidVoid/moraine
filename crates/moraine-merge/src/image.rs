@@ -37,6 +37,12 @@ pub struct ImageItem {
     pub ino: u64,
     /// The source `st_nlink`; greater than one marks a possible hardlink.
     pub nlink: u64,
+    /// The source modification time in whole seconds since the epoch, recorded in
+    /// CONTENTS and stamped onto the placed file.
+    pub mtime: i64,
+    /// The nanosecond component of the source modification time, used to stamp the
+    /// live file to full precision.
+    pub mtime_nsec: i64,
     /// The captured extended attributes, when `FEATURES=xattr` is enabled. Empty
     /// otherwise and for symlinks, whose xattrs Portage does not copy.
     pub xattrs: Vec<(OsString, Vec<u8>)>,
@@ -92,6 +98,7 @@ fn walk(
         let install_path = install_path_of(root, &source)?;
         let (mode, uid, gid, rdev) = (meta.mode(), meta.uid(), meta.gid(), meta.rdev());
         let (dev, ino, nlink) = (meta.dev(), meta.ino(), meta.nlink());
+        let (mtime, mtime_nsec) = (meta.mtime(), meta.mtime_nsec());
         let ft = meta.file_type();
         let is_symlink = ft.is_symlink();
         // Portage copies xattrs for regular files and directories, not symlinks.
@@ -112,6 +119,8 @@ fn walk(
                 dev,
                 ino,
                 nlink,
+                mtime,
+                mtime_nsec,
                 xattrs: xattrs.clone(),
             });
         };

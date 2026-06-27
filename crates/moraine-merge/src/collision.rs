@@ -17,6 +17,7 @@ use moraine_vdb::store::Store;
 
 use crate::Features;
 use crate::image::{ImageItem, ImageKind};
+use crate::protect::ConfigProtect;
 
 /// Why a target path is a collision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +71,10 @@ pub(crate) fn owner_of(
 /// by another package, when it exists on the live system but is owned by no
 /// package, when a symlink lands on an existing directory, or when two image
 /// entries resolve to one real path with differing content. Paths matching a
-/// `collision_ignore` glob are exempt.
+/// `collision_ignore` glob are exempt. A config-protected path is treated as
+/// owned and is never an owned-by-other or unowned collision, matching Portage's
+/// `_collision_protect` exemption; the symlink-onto-directory ban and internal
+/// collisions still apply.
 pub(crate) fn detect(
     store: &Store,
     interner: &Interner,
@@ -78,6 +82,7 @@ pub(crate) fn detect(
     items: &[ImageItem],
     exclude_cpv: Option<&str>,
     collision_ignore: &[String],
+    config_protect: &ConfigProtect,
 ) -> Vec<Collision> {
     let mut out = Vec::new();
     // Real-path -> the first image entry that resolved to it, for internal
@@ -91,7 +96,11 @@ pub(crate) fn detect(
         if crate::path_matches_any(path, collision_ignore) {
             continue;
         }
-        if let Some(owner) = owner_of(store, interner, path, exclude_cpv) {
+        // A config-protected path is treated as owned: its content is resolved by
+        // the `._cfg` variant logic during placement, so it is exempt from the
+        // ownership-based collision check.
+        let protected = config_protect.is_protected(path);
+        if !protected && let Some(owner) = owner_of(store, interner, path, exclude_cpv) {
             out.push(Collision {
                 path: path.clone(),
                 kind: CollisionKind::OwnedByOther(owner),
@@ -107,7 +116,7 @@ pub(crate) fn detect(
                     path: path.clone(),
                     kind: CollisionKind::SymlinkOntoDir,
                 });
-            } else {
+            } else if !protected {
                 out.push(Collision {
                     path: path.clone(),
                     kind: CollisionKind::Unowned,
@@ -185,7 +194,125 @@ pub(crate) fn record_is(record: &PackageRecord, interner: &Interner, cpv: &str) 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use moraine_vdb::contents::Contents;
+    use moraine_vdb::record::{DependSet, Slot, Toolchain};
+    use moraine_vdb::soname::{Provides, Requires};
+    use moraine_vdb::store::StorePaths;
+
     use super::*;
+    use crate::ConfigProtect;
+
+    /// A record owning a single `obj` path, for ownership-collision tests.
+    fn owned_record(interner: &Interner, cpv: &str, path: &str) -> PackageRecord {
+        let (cp, version) = cpv.rsplit_once('-').unwrap();
+        let (category, package) = cp.split_once('/').unwrap();
+        let contents = Contents::from_entries([moraine_vdb::contents::Entry {
+            path: path.to_string(),
+            kind: moraine_vdb::contents::EntryKind::Obj {
+                md5: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+                mtime: 1,
+            },
+        }]);
+        PackageRecord {
+            category: interner.intern(category),
+            package: interner.intern(package),
+            version: moraine_version::Version::parse(version).unwrap(),
+            eapi: "8".to_string(),
+            slot: Slot {
+                slot: interner.intern("0"),
+                subslot: None,
+            },
+            use_flags: Vec::new(),
+            iuse: Vec::new(),
+            depends: DependSet::default(),
+            keywords: Vec::new(),
+            license: String::new(),
+            description: String::new(),
+            homepage: String::new(),
+            properties: String::new(),
+            restrict: String::new(),
+            repository: None,
+            defined_phases: Vec::new(),
+            build_time: None,
+            build_id: None,
+            counter: 0,
+            chost: String::new(),
+            provides: Provides {
+                entries: Vec::new(),
+            },
+            requires: Requires {
+                entries: Vec::new(),
+            },
+            contents,
+            environment: None,
+            inherited: Vec::new(),
+            features: Vec::new(),
+            size: None,
+            needed: Vec::new(),
+            toolchain: Toolchain::default(),
+            dbdir_mtime: 0,
+        }
+    }
+
+    fn file_item(install_path: &str, source: &Path) -> ImageItem {
+        ImageItem {
+            install_path: install_path.to_string(),
+            source: source.to_path_buf(),
+            kind: ImageKind::File,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            dev: 0,
+            ino: 0,
+            nlink: 1,
+            mtime: 0,
+            mtime_nsec: 0,
+            xattrs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn config_protected_paths_are_exempt_from_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let eroot = dir.path().join("eroot");
+        std::fs::create_dir_all(eroot.join("etc")).unwrap();
+        // A protected path that already exists unowned on the live system.
+        std::fs::write(eroot.join("etc/unowned.conf"), b"live").unwrap();
+        // A protected path owned by another installed package.
+        std::fs::write(eroot.join("etc/owned.conf"), b"live").unwrap();
+
+        let interner = Interner::new();
+        let owner = owned_record(&interner, "cat/other-1", "/etc/owned.conf");
+        let store = Store::from_records(
+            StorePaths::in_dir(dir.path().join("vdb")),
+            Arc::new(interner),
+            vec![owner],
+        );
+        let store_interner = store.interner().clone();
+
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"new").unwrap();
+        let items = vec![
+            file_item("/etc/unowned.conf", &src),
+            file_item("/etc/owned.conf", &src),
+        ];
+
+        // Without protection both are collisions (unowned and owned-by-other).
+        let bare = ConfigProtect::default();
+        let unprotected = detect(&store, &store_interner, &eroot, &items, None, &[], &bare);
+        assert_eq!(unprotected.len(), 2, "both paths collide when unprotected");
+
+        // With /etc protected neither is reported as a collision.
+        let cp = ConfigProtect::new(["/etc".to_string()], std::iter::empty());
+        let protected = detect(&store, &store_interner, &eroot, &items, None, &[], &cp);
+        assert!(
+            protected.is_empty(),
+            "config-protected paths must be exempt: {protected:?}"
+        );
+    }
 
     #[test]
     fn aborting_respects_features() {

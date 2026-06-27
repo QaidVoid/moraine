@@ -1036,6 +1036,7 @@ fn preserve_libs_keeps_still_needed_soname_and_drops_when_unneeded() {
         bucket: "x86_64".to_string(),
         soname: "libfoo.so.1".to_string(),
     }];
+    prov1.needed = vec!["x86_64;/usr/lib/libfoo.so.1;libfoo.so.1;;".to_string()];
     let engine = MergeEngine::new(sb.context(features, ConfigProtect::default()));
     engine
         .apply(&[merge_op(image1, prov1, None, false)])
@@ -1124,6 +1125,8 @@ fn preserve_libs_keeps_soname_symlink_chain() {
         bucket: "x86_64".to_string(),
         soname: "libfoo.so.1".to_string(),
     }];
+    // The recorded soname keys the real versioned file, not the symlink.
+    prov1.needed = vec!["x86_64;/usr/lib/libfoo.so.1.2.3;libfoo.so.1;;".to_string()];
     MergeEngine::new(sb.context(features, ConfigProtect::default()))
         .apply(&[merge_op(image1, prov1, None, false)])
         .unwrap();
@@ -1230,6 +1233,240 @@ fn interrupted_unmerge_is_rerun_idempotently() {
 }
 
 #[test]
+fn source_mtime_recorded_and_stamped() {
+    use std::os::unix::fs::MetadataExt as _;
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/usr/bin/foo", b"hello")]);
+    // Stamp a distinctive source mtime well in the past.
+    let when = filetime_set(&image.join("usr/bin/foo"), 1_600_000_000);
+
+    MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()))
+        .apply(&[merge_op(image, state("cat/p", "1", "0"), None, false)])
+        .unwrap();
+
+    // The live file carries the source mtime, not the placement instant.
+    let live_mtime = std::fs::metadata(sb.live("/usr/bin/foo")).unwrap().mtime();
+    assert_eq!(live_mtime, when, "live file must carry the source mtime");
+
+    // CONTENTS records the same source mtime.
+    let store = moraine_vdb::Store::load(moraine_vdb::StorePaths::in_dir(&sb.vdb)).unwrap();
+    let entry = store.records()[0].contents.owner("/usr/bin/foo").unwrap();
+    match entry {
+        moraine_vdb::EntryKind::Obj { mtime, .. } => {
+            assert_eq!(*mtime, when, "recorded mtime must equal the source mtime");
+        }
+        _ => panic!("expected obj"),
+    }
+}
+
+/// Set `path`'s mtime to `secs` since the epoch and return the value, so the
+/// test can assert against the exact stamped time.
+fn filetime_set(path: &Path, secs: i64) -> i64 {
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
+    let ts = Timespec {
+        tv_sec: secs,
+        tv_nsec: 0,
+    };
+    utimensat(
+        CWD,
+        path,
+        &Timestamps {
+            last_access: ts,
+            last_modification: ts,
+        },
+        AtFlags::empty(),
+    )
+    .unwrap();
+    secs
+}
+
+#[test]
+fn unmerge_orphans_removes_modified_file_when_enabled() {
+    let features = Features {
+        unmerge_orphans: true,
+        ..Features::default()
+    };
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/d/dirty", b"orig")]);
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(image, state("cat/pkg", "1", "0"), None, false)])
+        .unwrap();
+
+    // The admin modifies the owned file so its md5/mtime no longer match.
+    std::fs::write(sb.live("/d/dirty"), b"changed by admin").unwrap();
+
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "cat/pkg-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+
+    assert!(
+        !sb.live("/d/dirty").exists(),
+        "unmerge-orphans must remove a modified owned file"
+    );
+}
+
+#[test]
+fn unmerge_orphans_off_keeps_modified_file() {
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/d/dirty", b"orig")]);
+    MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()))
+        .apply(&[merge_op(image, state("cat/pkg", "1", "0"), None, false)])
+        .unwrap();
+
+    std::fs::write(sb.live("/d/dirty"), b"changed by admin").unwrap();
+
+    MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()))
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "cat/pkg-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+
+    assert!(
+        sb.live("/d/dirty").exists(),
+        "without unmerge-orphans a modified file is kept"
+    );
+}
+
+#[test]
+fn unmerge_orphans_still_skips_protected_and_foreign_files() {
+    let features = Features {
+        unmerge_orphans: true,
+        ..Features::default()
+    };
+    let sb = Sandbox::new();
+
+    // A protected modified file.
+    let cp = ConfigProtect::new(["/etc".to_string()], std::iter::empty());
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/etc/app.conf", b"orig")]);
+    MergeEngine::new(sb.context(features, cp.clone()))
+        .apply(&[merge_op(image, state("cat/pkg", "1", "0"), None, false)])
+        .unwrap();
+    std::fs::write(sb.live("/etc/app.conf"), b"admin edit").unwrap();
+
+    // A file now owned by a second package, modified after install.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let image2 = build_image(tmp2.path(), &[("/usr/bin/tool", b"a")]);
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(image2, state("cat/a", "1", "0"), None, false)])
+        .unwrap();
+    let tmp3 = tempfile::tempdir().unwrap();
+    let image3 = build_image(tmp3.path(), &[("/usr/bin/tool", b"b")]);
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(image3, state("cat/b", "1", "0"), None, false)])
+        .unwrap();
+    std::fs::write(sb.live("/usr/bin/tool"), b"modified").unwrap();
+
+    // Unmerge the first package with unmerge-orphans on.
+    MergeEngine::new(sb.context(features, cp))
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "cat/pkg-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "cat/a-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+
+    assert!(
+        sb.live("/etc/app.conf").exists(),
+        "protected file must survive unmerge-orphans"
+    );
+    assert!(
+        sb.live("/usr/bin/tool").exists(),
+        "foreign-owned file must survive unmerge-orphans"
+    );
+}
+
+#[test]
+fn standalone_unmerge_registers_preserved_library() {
+    use moraine_merge::state::Soname;
+    let features = Features {
+        preserve_libs: true,
+        ..Features::default()
+    };
+    let sb = Sandbox::new();
+
+    // Provider ships libfoo.so.1 and records its soname linkage.
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/usr/lib/libfoo.so.1", b"abi1")]);
+    let mut prov = state("lib/foo", "1", "0");
+    prov.provides = vec![Soname {
+        bucket: "x86_64".to_string(),
+        soname: "libfoo.so.1".to_string(),
+    }];
+    prov.needed = vec!["x86_64;/usr/lib/libfoo.so.1;libfoo.so.1;;".to_string()];
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(image, prov, None, false)])
+        .unwrap();
+
+    // Consumer requires libfoo.so.1.
+    let tmpc = tempfile::tempdir().unwrap();
+    let imagec = build_image(tmpc.path(), &[("/usr/bin/consumer", b"app")]);
+    let mut cons = state("app/consumer", "1", "0");
+    cons.requires = vec![Soname {
+        bucket: "x86_64".to_string(),
+        soname: "libfoo.so.1".to_string(),
+    }];
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(imagec, cons, None, false)])
+        .unwrap();
+
+    // Standalone-unmerge the provider while the consumer is not rebuilt.
+    let out = MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "lib/foo-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+
+    // The library is kept on disk and registered in the durable registry.
+    assert!(
+        sb.live("/usr/lib/libfoo.so.1").exists(),
+        "still-needed library must survive a standalone unmerge"
+    );
+    assert_eq!(out[0].preserved, vec!["/usr/lib/libfoo.so.1".to_string()]);
+    let reg = moraine_merge::PreservedLibs::load(&sb.state.join("preserved-libs")).unwrap();
+    assert!(
+        reg.entries()
+            .iter()
+            .any(|e| e.path == "/usr/lib/libfoo.so.1" && e.soname == "libfoo.so.1"),
+        "registry must record the deferred library"
+    );
+
+    // Rebuild the consumer against a new soname; reconciliation drops the lib.
+    let tmpc2 = tempfile::tempdir().unwrap();
+    let imagec2 = build_image(tmpc2.path(), &[("/usr/bin/consumer", b"app2")]);
+    let mut cons2 = state("app/consumer", "2", "0");
+    cons2.requires = vec![Soname {
+        bucket: "x86_64".to_string(),
+        soname: "libbar.so.1".to_string(),
+    }];
+    let out2 = MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(imagec2, cons2, Some("app/consumer-1"), false)])
+        .unwrap();
+    assert!(
+        !sb.live("/usr/lib/libfoo.so.1").exists(),
+        "reconciliation must drop the now-unneeded preserved library"
+    );
+    assert!(
+        out2[0]
+            .reconciled
+            .contains(&"/usr/lib/libfoo.so.1".to_string())
+    );
+}
+
+#[test]
 fn corpus_roundtrip_gated_on_env() {
     let Ok(corpus) = std::env::var("MORAINE_CORPUS") else {
         // No-op when the corpus is not configured.
@@ -1238,4 +1475,103 @@ fn corpus_roundtrip_gated_on_env() {
     // A real corpus install would round-trip through the installed store's
     // importer/exporter; without a corpus this is a no-op by design.
     assert!(Path::new(&corpus).exists());
+}
+
+#[test]
+fn corpus_preserve_libs_and_mtime_e2e_gated_on_env() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    use moraine_merge::state::Soname;
+    let Ok(corpus) = std::env::var("MORAINE_CORPUS") else {
+        // No corpus configured: skip cleanly.
+        return;
+    };
+    assert!(Path::new(&corpus).exists());
+
+    // Drive the same end-to-end shape the corpus exercises against a sandbox:
+    // a standalone-unmerged library is kept and registered while its consumer is
+    // unbuilt, then dropped once the consumer is rebuilt; merged regular files
+    // keep their source mtime; and a merge into a config-protected unowned path
+    // proceeds under default FEATURES rather than aborting.
+    let features = Features {
+        preserve_libs: true,
+        protect_owned: true,
+        ..Features::default()
+    };
+    let sb = Sandbox::new();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/usr/lib/libe2e.so.1", b"abi1")]);
+    let when = filetime_set(&image.join("usr/lib/libe2e.so.1"), 1_600_000_000);
+    let mut prov = state("lib/e2e", "1", "0");
+    prov.provides = vec![Soname {
+        bucket: "x86_64".to_string(),
+        soname: "libe2e.so.1".to_string(),
+    }];
+    prov.needed = vec!["x86_64;/usr/lib/libe2e.so.1;libe2e.so.1;;".to_string()];
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(image, prov, None, false)])
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(sb.live("/usr/lib/libe2e.so.1"))
+            .unwrap()
+            .mtime(),
+        when,
+        "merged file keeps its source mtime"
+    );
+
+    let tmpc = tempfile::tempdir().unwrap();
+    let imagec = build_image(tmpc.path(), &[("/usr/bin/e2e-consumer", b"app")]);
+    let mut cons = state("app/e2e-consumer", "1", "0");
+    cons.requires = vec![Soname {
+        bucket: "x86_64".to_string(),
+        soname: "libe2e.so.1".to_string(),
+    }];
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(imagec, cons, None, false)])
+        .unwrap();
+
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "lib/e2e-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+    assert!(sb.live("/usr/lib/libe2e.so.1").exists());
+    let reg = moraine_merge::PreservedLibs::load(&sb.state.join("preserved-libs")).unwrap();
+    assert!(
+        reg.entries()
+            .iter()
+            .any(|e| e.path == "/usr/lib/libe2e.so.1")
+    );
+
+    let tmpc2 = tempfile::tempdir().unwrap();
+    let imagec2 = build_image(tmpc2.path(), &[("/usr/bin/e2e-consumer", b"app2")]);
+    let mut cons2 = state("app/e2e-consumer", "2", "0");
+    cons2.requires = vec![Soname {
+        bucket: "x86_64".to_string(),
+        soname: "libe2e.so.2".to_string(),
+    }];
+    MergeEngine::new(sb.context(features, ConfigProtect::default()))
+        .apply(&[merge_op(imagec2, cons2, Some("app/e2e-consumer-1"), false)])
+        .unwrap();
+    assert!(
+        !sb.live("/usr/lib/libe2e.so.1").exists(),
+        "reconciliation drops the library once its consumer is rebuilt"
+    );
+
+    // A merge into a config-protected unowned path proceeds, not aborts.
+    let cp = ConfigProtect::new(["/etc".to_string()], std::iter::empty());
+    std::fs::create_dir_all(sb.eroot.join("etc")).unwrap();
+    std::fs::write(sb.live("/etc/e2e.conf"), b"preexisting").unwrap();
+    let tmpp = tempfile::tempdir().unwrap();
+    let imagep = build_image(tmpp.path(), &[("/etc/e2e.conf", b"shipped")]);
+    MergeEngine::new(sb.context(features, cp))
+        .apply(&[merge_op(
+            imagep,
+            state("app/e2e-conf", "1", "0"),
+            None,
+            false,
+        )])
+        .expect("merge into a protected unowned path must proceed");
 }

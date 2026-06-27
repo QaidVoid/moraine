@@ -3,8 +3,9 @@
 //! A CONTENTS record is produced for every installed path using the three stock
 //! record kinds: `dir`, `obj` (path, md5, mtime), and `sym` (path, target,
 //! mtime). The md5 of an `obj` record is computed from the bytes actually
-//! written to the live file and the mtime is the post-placement mtime of the
-//! placed file, so ownership, unmerge, and modification detection are exact.
+//! written to the live file and the mtime is the source file's mtime in whole
+//! seconds, the same value stamped onto the live file, so ownership, unmerge, and
+//! modification detection are exact.
 
 use std::path::Path;
 
@@ -31,34 +32,29 @@ pub(crate) fn mtime_secs(path: &Path) -> Result<i64, MergeError> {
     Ok(secs)
 }
 
-/// Build an `obj` CONTENTS entry from a placed file's bytes and live path.
-pub(crate) fn obj_entry(
-    install_path: &str,
-    bytes: &[u8],
-    live: &Path,
-) -> Result<Entry, MergeError> {
-    Ok(Entry {
+/// Build an `obj` CONTENTS entry from a placed file's bytes and source mtime.
+///
+/// `mtime` is the source file's modification time in whole seconds, the same
+/// value stamped onto the live file, so the recorded and on-disk mtimes agree.
+pub(crate) fn obj_entry(install_path: &str, bytes: &[u8], mtime: i64) -> Entry {
+    Entry {
         path: install_path.to_string(),
         kind: EntryKind::Obj {
             md5: compute_md5(bytes),
-            mtime: mtime_secs(live)?,
+            mtime,
         },
-    })
+    }
 }
 
-/// Build a `sym` CONTENTS entry from a placed symlink's target and live path.
-pub(crate) fn sym_entry(
-    install_path: &str,
-    target: &str,
-    live: &Path,
-) -> Result<Entry, MergeError> {
-    Ok(Entry {
+/// Build a `sym` CONTENTS entry from a placed symlink's target and source mtime.
+pub(crate) fn sym_entry(install_path: &str, target: &str, mtime: i64) -> Entry {
+    Entry {
         path: install_path.to_string(),
         kind: EntryKind::Sym {
             target: target.to_string(),
-            mtime: mtime_secs(live)?,
+            mtime,
         },
-    })
+    }
 }
 
 /// Build a `dir` CONTENTS entry for `install_path`.
@@ -96,14 +92,11 @@ mod tests {
 
     #[test]
     fn obj_entry_carries_md5_and_mtime() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("f");
-        std::fs::write(&p, b"abc").unwrap();
-        let e = obj_entry("/f", b"abc", &p).unwrap();
+        let e = obj_entry("/f", b"abc", 1_700_000_000);
         match e.kind {
             EntryKind::Obj { md5, mtime } => {
                 assert_eq!(md5, "900150983cd24fb0d6963f7d28e17f72");
-                assert!(mtime > 0);
+                assert_eq!(mtime, 1_700_000_000, "recorded mtime is the source mtime");
             }
             _ => panic!("expected obj"),
         }

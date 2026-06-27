@@ -13,7 +13,7 @@
 //! dependency: each line is `cpv\tsoname\tpath`. It is rebuilt from installed
 //! soname data when it fails to parse.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use moraine_common::Interner;
@@ -106,6 +106,30 @@ impl PreservedLibs {
         moraine_common::fs::atomic_write(path, body.as_bytes())?;
         Ok(())
     }
+}
+
+/// Parse a package's verbatim `NEEDED.ELF.2` lines into a map from each object's
+/// install path to its recorded soname.
+///
+/// Each line has the form `arch;path;soname;rpath;needed-csv`, so the install
+/// path is field 1 and the soname field 2. A line whose path or soname is empty
+/// carries no usable mapping and is skipped. This lets the merge match a library
+/// file to its soname by its exact recorded linkage rather than by file basename,
+/// so a versioned library (`libfoo.so.1.2.3` whose soname is `libfoo.so.1`) is
+/// matched directly even when its soname symlink is absent from CONTENTS.
+pub(crate) fn needed_soname_map(needed: &[String]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in needed {
+        let mut fields = line.split(';');
+        let (_arch, path, soname) = (fields.next(), fields.next(), fields.next());
+        if let (Some(path), Some(soname)) = (path, soname)
+            && !path.is_empty()
+            && !soname.is_empty()
+        {
+            map.insert(path.to_string(), soname.to_string());
+        }
+    }
+    map
 }
 
 /// Whether `soname` is still required by any installed package other than
@@ -202,6 +226,21 @@ mod tests {
             PreservedLibs::load(&path),
             Err(MergeError::Registry { .. })
         ));
+    }
+
+    #[test]
+    fn needed_map_keys_path_to_soname() {
+        let needed = vec![
+            "x86_64;/usr/lib/libfoo.so.1.2.3;libfoo.so.1;;libc.so.6".to_string(),
+            // A line with no soname (an executable) carries no mapping.
+            "x86_64;/usr/bin/app;;;libfoo.so.1".to_string(),
+        ];
+        let map = needed_soname_map(&needed);
+        assert_eq!(
+            map.get("/usr/lib/libfoo.so.1.2.3").map(String::as_str),
+            Some("libfoo.so.1")
+        );
+        assert!(!map.contains_key("/usr/bin/app"));
     }
 
     #[test]
