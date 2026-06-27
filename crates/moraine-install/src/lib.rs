@@ -38,7 +38,7 @@ pub use lock::TransactionLock;
 pub use quickpkg::{QuickpkgInput, package_image_dir};
 pub use realize::{
     BinhostSource, BinpkgRunner, BinpkgSource, BuildOptions, BuildPlanner, LocalPkgdir,
-    SourceRunner, locate_local_gpkg, realize_binpkg,
+    SourceRunner, StoreVersionQuery, locate_local_gpkg, realize_binpkg,
 };
 pub use remove::{
     InstalledPackage, RemovalSet, depclean_orphans, prune_superseded, would_break_retained,

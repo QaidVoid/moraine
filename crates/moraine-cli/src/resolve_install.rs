@@ -322,8 +322,11 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     }
     let binpkg_source = crate::binhost::ChainSource::new(sources);
     let signature_policy = crate::config::signature_policy(&ctx.features);
+    // The build engine answers build-time has_version/best_version from the
+    // already-loaded installed store through this backend.
+    let version_query = moraine_install::StoreVersionQuery::new(&vdb);
     let runner = CombinedRunner {
-        source: SourceRunner::new(planner, &command_runner, options),
+        source: SourceRunner::new(planner, &command_runner, options, &version_query),
         binpkg: BinpkgRunner::new(binpkg_source, stage)
             .with_signature(signature_policy, signature_config(&ctx.vars)),
     };

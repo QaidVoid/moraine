@@ -55,7 +55,7 @@ pub use error::{BuildError, PhaseKind, Result};
 pub use fetch::{
     CustomMirrors, FetchConfig, FetchStatus, FetchedFile, Fetcher, MirrorLayout, RestrictFlags,
 };
-pub use ipc::{IpcHandler, Query, QueryRoot, Response as IpcResponse, VersionQuery};
+pub use ipc::{IpcEndpoint, IpcHandler, Query, QueryRoot, Response as IpcResponse, VersionQuery};
 pub use isolation::{Isolation, PrivilegeDrop};
 pub use layout::BuildLayout;
 pub use manifest::{Manifest, ManifestType, VerifyOutcome, verify_package};
@@ -147,8 +147,19 @@ pub struct BuildOutcome {
 /// The `runner` is the injectable external-command surface; pass
 /// [`SystemRunner`] in production or a fake in tests. The build stops at the
 /// image and metadata; it does not merge them into the live filesystem.
+///
+/// `version_query`, when `Some`, is the backend that answers the build-time
+/// `has_version`/`best_version` queries: the engine starts an [`IpcEndpoint`]
+/// responder over it for the lifetime of the phases and exports the client as
+/// `MORAINE_IPC_HELPER`. Pass `None` only when no phase issues version queries
+/// (the fake-runner unit tests); the real install path always passes a backend
+/// so the bash helpers reach the responder instead of running an empty command.
 #[instrument(name = "build_package", skip_all, fields(pf = %request.package.ident.pf))]
-pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Result<BuildOutcome> {
+pub fn build_package<R: CommandRunner>(
+    request: &BuildRequest,
+    runner: &R,
+    version_query: Option<&dyn VersionQuery>,
+) -> Result<BuildOutcome> {
     let pkg = &request.package;
 
     // 1. Build-tree layout.
@@ -222,6 +233,14 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
         .get("PROPERTIES")
         .map(|p| p.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
+    // When a version-query backend is present, lay out the IPC endpoint under
+    // `.ipc` and export its client into the phases as `MORAINE_IPC_HELPER`; the
+    // responder is started around `run_all` below.
+    let endpoint = match version_query {
+        Some(_) => Some(ipc::IpcEndpoint::create(&layout.ipc)?),
+        None => None,
+    };
+    let ipc_helper = endpoint.as_ref().map(|e| e.helper_path().to_path_buf());
     let driver = PhaseDriver::new(
         runner,
         &env,
@@ -232,7 +251,7 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
         pkg.defined_phases.clone(),
         request.run_tests,
         properties,
-        None,
+        ipc_helper,
     );
 
     let fetcher = Fetcher::new(runner, &request.fetch, &manifest, request.require_digest);
@@ -259,8 +278,19 @@ pub fn build_package<R: CommandRunner>(request: &BuildRequest, runner: &R) -> Re
     let generated = depend::generate_metadata(runner, &library, &pkg.ebuild_path, env.base())
         .unwrap_or_default();
 
-    // 5. Drive phases.
-    let report = driver.run_all()?;
+    // 5. Drive phases. When a version-query backend is present, run the IPC
+    // responder on a scoped thread for the lifetime of `run_all` so a phase's
+    // `has_version`/`best_version` call is answered from the live store; the
+    // responder is signaled to stop on every exit path so the scope can join it.
+    let report = match (endpoint.as_ref(), version_query) {
+        (Some(ep), Some(backend)) => std::thread::scope(|scope| {
+            scope.spawn(|| ep.serve(backend));
+            let result = driver.run_all();
+            ep.shutdown();
+            result
+        }),
+        _ => driver.run_all(),
+    }?;
 
     // 5b. Strip ELF objects in the image, gated on nostrip/RESTRICT=strip and
     // honoring the dostrip include/exclude lists recorded during src_install.

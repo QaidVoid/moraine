@@ -112,7 +112,7 @@ fn builds_fixture_and_writes_image_and_build_info() {
     };
 
     let runner = FakeRunner::always_ok();
-    let outcome = moraine_build::build_package(&request, &runner).unwrap();
+    let outcome = moraine_build::build_package(&request, &runner, None).unwrap();
 
     // The image directory exists and is empty (no real install ran).
     assert!(outcome.image_dir.is_dir());
@@ -221,7 +221,7 @@ fn restricted_fetch_missing_fails_build() {
     };
 
     let runner = FakeRunner::always_ok();
-    let err = moraine_build::build_package(&request, &runner);
+    let err = moraine_build::build_package(&request, &runner, None);
     assert!(matches!(
         err,
         Err(moraine_build::BuildError::RestrictedFetch { .. })
@@ -289,7 +289,7 @@ fn required_use_violation_aborts_before_phases() {
     };
 
     let runner = FakeRunner::always_ok();
-    let err = moraine_build::build_package(&request, &runner);
+    let err = moraine_build::build_package(&request, &runner, None);
     assert!(matches!(
         err,
         Err(moraine_build::BuildError::RequiredUse { .. })

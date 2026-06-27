@@ -343,7 +343,11 @@ impl<'a, R: CommandRunner> PhaseDriver<'a, R> {
         for (k, v) in &plan.sandbox_vars {
             env.insert(k.clone(), v.clone());
         }
-        if let Some(helper) = &self.ipc_helper {
+        // Export the IPC helper only for the phases that run in the build
+        // directory, matching the stock daemon's enabled set.
+        if let Some(helper) = &self.ipc_helper
+            && crate::ipc::ipc_enabled_phase(phase)
+        {
             env.insert(
                 "MORAINE_IPC_HELPER".to_string(),
                 helper.to_string_lossy().to_string(),

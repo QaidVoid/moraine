@@ -16,10 +16,15 @@
 //! `QueryCommand` exit codes.
 
 use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use moraine_atom::Atom;
 use moraine_common::{Interner, Symbol};
 use tracing::instrument;
+
+use crate::error::{BuildError, IoExt as _, Result};
 
 /// Which root an IPC query targets, mapping to a path variable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +92,16 @@ impl Response {
             None => format!("{}\n", self.code),
         }
     }
+
+    /// Render the response as a fixed two-line wire frame: a code line followed
+    /// by a value line that is empty when there is no value.
+    ///
+    /// The framing is fixed so the ebuild-side client can read both lines in a
+    /// single open of the response FIFO and never block waiting for a second
+    /// line that the variable [`Response::render`] form may not emit.
+    pub fn render_framed(&self) -> String {
+        format!("{}\n{}\n", self.code, self.value.as_deref().unwrap_or(""))
+    }
 }
 
 /// The query backend the IPC handler answers from. The orchestrator implements
@@ -101,16 +116,31 @@ pub trait VersionQuery: Send + Sync {
 
     /// The best matching installed `cpv` under `root`, if any.
     fn best_version(&self, root: QueryRoot, atom: &str, caller_use: &[String]) -> Option<String>;
+
+    /// Whether `atom` is malformed and cannot be parsed as a dependency atom.
+    ///
+    /// The handler answers an invalid atom with the exit-code `2` (invalid atom)
+    /// contract the bash `has_version`/`best_version` wrapper expects, mirroring
+    /// the `InvalidAtom` branch of the stock `QueryCommand`. The default returns
+    /// `false`, so a backend that does not validate atoms never produces the
+    /// invalid case.
+    fn invalid_atom(&self, atom: &str) -> bool {
+        let _ = atom;
+        false
+    }
 }
 
 /// Parse a request line into a [`Query`].
 ///
 /// The grammar is `op root atom use...`, where any trailing tokens are the
-/// caller's resolved `USE`. Returns `None` for a malformed line.
+/// caller's resolved `USE`. The bash wrapper resolves the root flag to a
+/// concrete path before relaying it, so a root token that is not a recognized
+/// selector falls back to the host store. Returns `None` only when the op or
+/// atom is missing.
 pub fn parse_request(line: &str) -> Option<Query> {
     let mut parts = line.split_whitespace();
     let op = parts.next()?;
-    let root = QueryRoot::parse(parts.next()?)?;
+    let root = QueryRoot::parse(parts.next()?).unwrap_or(QueryRoot::Host);
     let atom = parts.next()?.to_string();
     let caller_use: Vec<String> = parts.map(str::to_string).collect();
     match op {
@@ -172,11 +202,11 @@ fn resolve_atom_use(atom: &str, caller_use: &[String]) -> String {
 }
 
 /// The manager-side IPC handler.
-pub struct IpcHandler<'a, Q: VersionQuery> {
+pub struct IpcHandler<'a, Q: VersionQuery + ?Sized> {
     backend: &'a Q,
 }
 
-impl<'a, Q: VersionQuery> IpcHandler<'a, Q> {
+impl<'a, Q: VersionQuery + ?Sized> IpcHandler<'a, Q> {
     /// Construct a handler over a query backend.
     pub fn new(backend: &'a Q) -> Self {
         IpcHandler { backend }
@@ -185,17 +215,32 @@ impl<'a, Q: VersionQuery> IpcHandler<'a, Q> {
     /// Answer one parsed query.
     ///
     /// USE-conditional dependencies in the atom are evaluated against the
-    /// caller's `USE` before matching. `best_version` returns success with empty
-    /// output on no match, matching the stock `QueryCommand`.
+    /// caller's `USE` before matching. A malformed atom answers with code `2`
+    /// (invalid atom). `best_version` returns success with empty output on no
+    /// match, matching the stock `QueryCommand`.
     #[instrument(name = "ipc_query", skip(self))]
     pub fn answer(&self, query: &Query) -> Response {
-        match query {
+        let (root, atom, caller_use) = match query {
             Query::HasVersion {
                 root,
                 atom,
                 caller_use,
-            } => {
-                let resolved = resolve_atom_use(atom, caller_use);
+            }
+            | Query::BestVersion {
+                root,
+                atom,
+                caller_use,
+            } => (root, atom, caller_use),
+        };
+        let resolved = resolve_atom_use(atom, caller_use);
+        if self.backend.invalid_atom(&resolved) {
+            return Response {
+                code: 2,
+                value: None,
+            };
+        }
+        match query {
+            Query::HasVersion { .. } => {
                 let code = if self.backend.has_version(*root, &resolved, caller_use) {
                     0
                 } else {
@@ -203,23 +248,10 @@ impl<'a, Q: VersionQuery> IpcHandler<'a, Q> {
                 };
                 Response { code, value: None }
             }
-            Query::BestVersion {
-                root,
-                atom,
-                caller_use,
-            } => {
-                let resolved = resolve_atom_use(atom, caller_use);
-                match self.backend.best_version(*root, &resolved, caller_use) {
-                    Some(cpv) => Response {
-                        code: 0,
-                        value: Some(cpv),
-                    },
-                    None => Response {
-                        code: 0,
-                        value: None,
-                    },
-                }
-            }
+            Query::BestVersion { .. } => Response {
+                code: 0,
+                value: self.backend.best_version(*root, &resolved, caller_use),
+            },
         }
     }
 
@@ -229,11 +261,159 @@ impl<'a, Q: VersionQuery> IpcHandler<'a, Q> {
     }
 }
 
-/// The phases for which the IPC channel is enabled, mirroring the stock enabled
-/// set. The merge-time phases are out of scope for this crate.
+/// The phases for which the IPC channel is enabled: every build phase that runs
+/// in the build directory, namely the source-build phases together with
+/// `pkg_setup` and `pkg_pretend`.
+///
+/// This mirrors `AbstractEbuildProcess._enable_ipc_daemon`, which starts the
+/// daemon for every phase that has a build directory rather than only `pkg_setup`
+/// and `pkg_pretend`. `pkg_nofetch` runs outside the normal schedule and is the
+/// only build phase left out.
 pub fn ipc_enabled_phase(phase: crate::error::PhaseKind) -> bool {
     use crate::error::PhaseKind::*;
-    matches!(phase, PkgSetup | PkgPretend)
+    matches!(
+        phase,
+        PkgPretend
+            | PkgSetup
+            | SrcUnpack
+            | SrcPrepare
+            | SrcConfigure
+            | SrcCompile
+            | SrcTest
+            | SrcInstall
+    )
+}
+
+/// The sentinel request line [`IpcEndpoint::shutdown`] writes to wake the blocked
+/// responder so it can stop.
+const SHUTDOWN_LINE: &str = "__moraine_ipc_shutdown__";
+
+/// A live ebuild IPC endpoint: a request FIFO, a response FIFO, and the
+/// ebuild-side client script the driver exports as `MORAINE_IPC_HELPER`.
+///
+/// This mirrors Portage's split of a manager-side daemon
+/// (`lib/_emerge/EbuildIpcDaemon.py`) and a thin ebuild-side client
+/// (`bin/ebuild-ipc.py`), kept minimal. [`IpcEndpoint::serve`] answers one
+/// request at a time from a [`VersionQuery`] backend; the generated client
+/// relays the `op root atom use...` request to the FIFOs and exits with the
+/// answer's code, printing the `best_version` `cpv` on stdout.
+pub struct IpcEndpoint {
+    request: PathBuf,
+    response: PathBuf,
+    helper: PathBuf,
+}
+
+impl IpcEndpoint {
+    /// Create the request/response FIFOs and the client script under `ipc_dir`
+    /// (the build's `.ipc` directory).
+    ///
+    /// The client is written executable; its path is what the driver exports as
+    /// `MORAINE_IPC_HELPER`.
+    pub fn create(ipc_dir: &Path) -> Result<Self> {
+        let request = ipc_dir.join("request");
+        let response = ipc_dir.join("response");
+        let helper = ipc_dir.join("helper");
+        make_fifo(&request)?;
+        make_fifo(&response)?;
+        write_client(&helper, &request, &response)?;
+        Ok(IpcEndpoint {
+            request,
+            response,
+            helper,
+        })
+    }
+
+    /// The client path to export into the phase environment as
+    /// `MORAINE_IPC_HELPER`.
+    pub fn helper_path(&self) -> &Path {
+        &self.helper
+    }
+
+    /// Answer queries from `backend` until [`IpcEndpoint::shutdown`] is called.
+    ///
+    /// Blocks the calling thread, so run it on a dedicated thread for the
+    /// lifetime of the phases. Each request is read as one line, answered through
+    /// [`IpcHandler::handle_line`], and written back as a fixed two-line frame.
+    /// A request that cannot be parsed answers with code `2` (invalid atom).
+    pub fn serve(&self, backend: &dyn VersionQuery) {
+        let handler = IpcHandler::new(backend);
+        loop {
+            let Some(line) = read_line(&self.request) else {
+                continue;
+            };
+            if line == SHUTDOWN_LINE {
+                break;
+            }
+            let response = handler.handle_line(&line).unwrap_or(Response {
+                code: 2,
+                value: None,
+            });
+            write_frame(&self.response, &response.render_framed());
+        }
+    }
+
+    /// Signal the [`IpcEndpoint::serve`] loop to stop, unblocking it if it is
+    /// waiting for a request.
+    pub fn shutdown(&self) {
+        write_frame(&self.request, &format!("{SHUTDOWN_LINE}\n"));
+    }
+}
+
+/// Create a FIFO at `path`, removing any stale node from a previous build first.
+fn make_fifo(path: &Path) -> Result<()> {
+    use rustix::fs::{CWD, Mode, mkfifoat};
+    let _ = std::fs::remove_file(path);
+    mkfifoat(CWD, path, Mode::RUSR | Mode::WUSR).map_err(|e| BuildError::Ipc {
+        reason: format!("could not create IPC fifo {}: {e}", path.display()),
+    })
+}
+
+/// Write the ebuild-side client script, relaying its arguments to the request
+/// FIFO and reading the two-line answer frame from the response FIFO. The FIFO
+/// paths are baked in so only `MORAINE_IPC_HELPER` needs exporting.
+fn write_client(helper: &Path, request: &Path, response: &Path) -> Result<()> {
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         # moraine ebuild IPC client: relay has_version/best_version to the\n\
+         # manager responder over the build FIFOs and exit with its code.\n\
+         printf '%s\\n' \"$*\" > {req}\n\
+         {{ IFS= read -r __moraine_code; IFS= read -r __moraine_value; }} < {resp}\n\
+         [[ -n ${{__moraine_value}} ]] && printf '%s\\n' \"${{__moraine_value}}\"\n\
+         exit \"${{__moraine_code:-2}}\"\n",
+        req = sh_quote(&request.to_string_lossy()),
+        resp = sh_quote(&response.to_string_lossy()),
+    );
+    std::fs::write(helper, script).at(helper)?;
+    std::fs::set_permissions(helper, std::fs::Permissions::from_mode(0o755)).at(helper)?;
+    Ok(())
+}
+
+/// Single-quote a string for safe inclusion in the generated bash client.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r#"'\''"#))
+}
+
+/// Read one request line from a FIFO, blocking until a writer connects. Returns
+/// `None` on an empty read (a writer that opened and closed without data) or an
+/// I/O error, so the caller can loop and reopen.
+fn read_line(fifo: &Path) -> Option<String> {
+    let file = std::fs::File::open(fifo).ok()?;
+    let mut line = String::new();
+    BufReader::new(file).read_line(&mut line).ok()?;
+    let trimmed = line.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Write a response frame to a FIFO, blocking until a reader connects. A failure
+/// to open or write is dropped: the client side reports the missing answer.
+fn write_frame(fifo: &Path, frame: &str) {
+    if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(fifo) {
+        let _ = file.write_all(frame.as_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -417,9 +597,57 @@ mod tests {
     }
 
     #[test]
-    fn ipc_enabled_only_for_setup_phases() {
+    fn ipc_enabled_for_build_phases() {
         use crate::error::PhaseKind;
+        // pkg_setup/pkg_pretend and every source-build phase are enabled.
+        assert!(ipc_enabled_phase(PhaseKind::PkgPretend));
         assert!(ipc_enabled_phase(PhaseKind::PkgSetup));
-        assert!(!ipc_enabled_phase(PhaseKind::SrcCompile));
+        assert!(ipc_enabled_phase(PhaseKind::SrcConfigure));
+        assert!(ipc_enabled_phase(PhaseKind::SrcCompile));
+        assert!(ipc_enabled_phase(PhaseKind::SrcInstall));
+        // pkg_nofetch runs outside the schedule and stays disabled.
+        assert!(!ipc_enabled_phase(PhaseKind::PkgNofetch));
+    }
+
+    #[test]
+    fn invalid_atom_answers_code_two() {
+        struct Invalid;
+        impl VersionQuery for Invalid {
+            fn has_version(&self, _root: QueryRoot, _atom: &str, _use: &[String]) -> bool {
+                true
+            }
+            fn best_version(
+                &self,
+                _root: QueryRoot,
+                _atom: &str,
+                _use: &[String],
+            ) -> Option<String> {
+                Some("dev-libs/foo-1".into())
+            }
+            fn invalid_atom(&self, atom: &str) -> bool {
+                atom.contains('[')
+            }
+        }
+        let handler = IpcHandler::new(&Invalid);
+        let r = handler.handle_line("has_version host dev-libs/foo[").unwrap();
+        assert_eq!(r.code, 2);
+        assert_eq!(r.value, None);
+        // A valid atom still answers normally.
+        let ok = handler.handle_line("has_version host dev-libs/foo").unwrap();
+        assert_eq!(ok.code, 0);
+    }
+
+    #[test]
+    fn framed_response_is_two_lines() {
+        let with = Response {
+            code: 0,
+            value: Some("dev-libs/foo-2.0".into()),
+        };
+        assert_eq!(with.render_framed(), "0\ndev-libs/foo-2.0\n");
+        let without = Response {
+            code: 1,
+            value: None,
+        };
+        assert_eq!(without.render_framed(), "1\n\n");
     }
 }

@@ -15,9 +15,11 @@ use std::path::{Path, PathBuf};
 
 use moraine_binpkg::greenfield::WriteOptions;
 use moraine_binpkg::{MetadataMap, read_package_with_policy};
-use moraine_build::{BuildOutcome, BuildRequest, CommandRunner, build_package};
+use moraine_build::{BuildOutcome, BuildRequest, CommandRunner, QueryRoot, VersionQuery, build_package};
 use moraine_merge::state::PackageState;
 use moraine_merge::{MergeOp, Operation};
+use moraine_vdb::record::PackageRecord;
+use moraine_vdb::store::Store;
 
 use crate::error::{InstallError, Result};
 use crate::quickpkg::package_image_dir;
@@ -236,21 +238,90 @@ impl Default for BuildOptions {
     }
 }
 
+/// A [`VersionQuery`] answered from the installed [`Store`], the backend the
+/// build engine reaches for build-time `has_version`/`best_version` queries.
+///
+/// It mirrors the stock `QueryCommand`, which answers both queries from
+/// `vardb.match(atom)`: `has_version` is true when the atom matches an installed
+/// package, and `best_version` is the highest matching installed `cpv`. The
+/// queried atom is parsed against the store's own interner so its symbols compare
+/// equal to the recorded packages. A malformed atom surfaces as the invalid-atom
+/// case so the bash wrapper reports it rather than treating it as a match miss.
+///
+/// The root selector is honored for the host root and falls back to the single
+/// installed store for the cross roots, the seam where `ROOT`/`ESYSROOT`/`BROOT`
+/// would select distinct stores once cross-root installs are modeled.
+pub struct StoreVersionQuery<'a> {
+    store: &'a Store,
+}
+
+impl<'a> StoreVersionQuery<'a> {
+    /// Build the adapter over the loaded installed `store`.
+    pub fn new(store: &'a Store) -> Self {
+        StoreVersionQuery { store }
+    }
+
+    /// The installed records matching `atom`, parsed against the store interner.
+    /// An unparseable atom matches nothing.
+    fn matches(&self, atom: &str) -> Vec<&PackageRecord> {
+        match moraine_atom::Atom::parse(atom, moraine_eapi::PERMISSIVE, self.store.interner()) {
+            Ok(parsed) => self.store.match_atom(&parsed),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl VersionQuery for StoreVersionQuery<'_> {
+    fn has_version(&self, _root: QueryRoot, atom: &str, _caller_use: &[String]) -> bool {
+        !self.matches(atom).is_empty()
+    }
+
+    fn best_version(&self, _root: QueryRoot, atom: &str, _caller_use: &[String]) -> Option<String> {
+        let interner = self.store.interner();
+        self.matches(atom)
+            .into_iter()
+            .max_by(|a, b| a.version.cmp(&b.version))
+            .map(|record| {
+                let cat = interner
+                    .resolve(record.category)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let pkg = interner
+                    .resolve(record.package)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                format!("{cat}/{pkg}-{}", record.version.as_str())
+            })
+    }
+
+    fn invalid_atom(&self, atom: &str) -> bool {
+        moraine_atom::Atom::parse(atom, moraine_eapi::PERMISSIVE, self.store.interner()).is_err()
+    }
+}
+
 /// A [`StepRunner`] that builds from source through the build engine.
 pub struct SourceRunner<'r, P: BuildPlanner, R: CommandRunner> {
     planner: P,
     runner: &'r R,
     options: BuildOptions,
+    version_query: &'r dyn VersionQuery,
 }
 
 impl<'r, P: BuildPlanner, R: CommandRunner> SourceRunner<'r, P, R> {
-    /// Build a source runner over `planner`, the external-command `runner`, and
-    /// the binary-package `options`.
-    pub fn new(planner: P, runner: &'r R, options: BuildOptions) -> Self {
+    /// Build a source runner over `planner`, the external-command `runner`, the
+    /// binary-package `options`, and the `version_query` backend the build engine
+    /// answers `has_version`/`best_version` from.
+    pub fn new(
+        planner: P,
+        runner: &'r R,
+        options: BuildOptions,
+        version_query: &'r dyn VersionQuery,
+    ) -> Self {
         SourceRunner {
             planner,
             runner,
             options,
+            version_query,
         }
     }
 }
@@ -258,9 +329,11 @@ impl<'r, P: BuildPlanner, R: CommandRunner> SourceRunner<'r, P, R> {
 impl<P: BuildPlanner, R: CommandRunner> StepRunner for SourceRunner<'_, P, R> {
     fn realize(&self, task: &InstallTask) -> Result<Realized> {
         let request = self.planner.plan(task)?;
-        let outcome = build_package(&request, self.runner).map_err(|e| InstallError::Realize {
-            cpv: task.cpv.clone(),
-            reason: format!("build failed: {e}"),
+        let outcome = build_package(&request, self.runner, Some(self.version_query)).map_err(|e| {
+            InstallError::Realize {
+                cpv: task.cpv.clone(),
+                reason: format!("build failed: {e}"),
+            }
         })?;
 
         // Scan the staged image and read BUILD_TIME once, feeding both the binary
