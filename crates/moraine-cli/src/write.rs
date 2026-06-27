@@ -349,7 +349,7 @@ pub fn config_update(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()
 pub fn sync(cli: &Cli, roots: &Roots) -> Result<()> {
     use moraine_repo::discover;
     use moraine_sync::{
-        RepoRefresher, RevisionHistory, SyncEngine, SystemRunner, default_registry,
+        ExtrasMap, RepoRefresher, RevisionHistory, SyncEngine, SystemRunner, default_registry,
     };
 
     if cli.pretend {
@@ -373,7 +373,14 @@ pub fn sync(cli: &Cli, roots: &Roots) -> Result<()> {
     if let Some(generator) = &generator {
         refresher = refresher.with_generator(generator);
     }
-    let engine = SyncEngine::new(&repo_set, &registry, &refresher, &runner, &staging);
+    // Load the repos.conf extras (auto-sync, post-sync, volatile) and the config
+    // root so those controls and the postsync.d hooks take effect. A malformed
+    // repos.conf is surfaced rather than silently reverting to clobbering.
+    let extras = ExtrasMap::load(&repos_conf)
+        .map_err(|e| miette!("repos.conf extras failed to load: {e}"))?;
+    let engine = SyncEngine::new(&repo_set, &registry, &refresher, &runner, &staging)
+        .with_extras(extras)
+        .with_config_root(roots.config_dir());
 
     let history_path = wr.state_dir.join("sync-history.mrev");
     let mut history =

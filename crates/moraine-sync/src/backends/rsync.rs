@@ -19,12 +19,14 @@ use crate::error::SyncError;
 use crate::outcome::{SyncKind, SyncOutcome};
 use crate::verify::Verifier;
 
-/// The standard rsync excludes stock Portage applies to a tree transfer.
+/// The standard rsync excludes stock Portage applies to a tree transfer
+/// (`_set_rsync_defaults` / `_validate_rsync_opts`). Portage does not exclude
+/// `/.git`; a VCS-controlled target is handled by the `sync-rsync-vcs-ignore`
+/// abort in [`RsyncBackend::check_vcs`] instead.
 const STANDARD_EXCLUDES: &[&str] = &[
     "--exclude=/distfiles",
     "--exclude=/local",
     "--exclude=/packages",
-    "--exclude=/.git",
 ];
 
 /// The freshness decision derived from comparing server and local timestamps.
@@ -67,11 +69,15 @@ impl<R: CommandRunner> RsyncBackend<R> {
             .join("timestamp.chk")
             .to_string_lossy()
             .into_owned();
-        CommandSpec::new("rsync")
-            .arg(format!("--timeout={}", ctx.options.timeout_secs))
-            .arg(format!("--contimeout={}", ctx.options.timeout_secs))
-            .arg(src)
-            .arg(dst)
+        let mut cmd =
+            CommandSpec::new("rsync").arg(format!("--timeout={}", ctx.options.timeout_secs));
+        // `--contimeout` is a connection timeout that rsync accepts only when
+        // connecting to an rsync daemon, so it is added for `rsync://` sources
+        // only; a local `file://` or path source rejects it.
+        if ctx.options.uri.starts_with("rsync://") {
+            cmd = cmd.arg(format!("--contimeout={}", ctx.options.timeout_secs));
+        }
+        cmd.arg(src).arg(dst)
     }
 
     /// Build the tree-transfer command into the staging directory. The default
@@ -248,8 +254,6 @@ impl<R: CommandRunner> Backend for RsyncBackend<R> {
     }
 }
 
-/// Read the integer timestamp from a `timestamp.chk` file, ignoring a trailing
-/// human-readable suffix.
 /// Translate a `sync-uri` into an rsync source root: an `rsync://` URI is kept,
 /// a `file://` URI is stripped to its local path, and an `ssh://host/path` URI is
 /// rewritten to rsync's `host:/path` form. Any other value is returned trimmed.
@@ -337,13 +341,13 @@ fn source_with_addr(uri: &str, addr: Option<IpAddr>) -> String {
     base
 }
 
+/// Read `metadata/timestamp.chk` and parse its first line as Portage's
+/// `TIMESTAMP_FORMAT` date string into a UTC epoch in seconds. Returns `None`
+/// when the file is absent or malformed, which classifies as out of date.
 fn read_timestamp(path: &Path) -> Option<i64> {
     let content = std::fs::read_to_string(path).ok()?;
-    content
-        .split_whitespace()
-        .next()
-        .and_then(|t| t.parse::<i64>().ok())
-        .or_else(|| content.trim().parse::<i64>().ok())
+    let first = content.lines().next()?;
+    crate::timestamp::parse_timestamp_format(first)
 }
 
 /// Commit a staged tree into place by replacing the live location atomically on

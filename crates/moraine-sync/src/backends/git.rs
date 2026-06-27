@@ -4,9 +4,10 @@
 //! `sync-depth`/`clone-depth` where a depth of zero requests full history. For
 //! an existing repository it fetches and merges, sets `safe.directory` for the
 //! location first, and detects change by comparing the head revision before and
-//! after the operation. When commit-signature verification is enabled it checks
-//! the head commit signature before accepting the merged result. It shells out
-//! to `git` through the injectable [`CommandRunner`].
+//! after the operation. The fetched ref is verified (commit signature and head
+//! age, each independently when its key is set) before it is merged into the live
+//! tree, so an untrusted or stale commit never lands on disk. It shells out to
+//! `git` through the injectable [`CommandRunner`].
 
 use tracing::instrument;
 
@@ -91,6 +92,58 @@ impl<R: CommandRunner> GitBackend<R> {
         Ok(())
     }
 
+    /// Verify a fetched revision before it advances the live tree: check the
+    /// commit signature when `sync-git-verify-commit-signature` is set, and the
+    /// head age when `sync-git-verify-max-age-days` is set. Either check runs
+    /// independently of the other, matching Portage's `verify_head`, so a stale or
+    /// untrusted head is rejected before the merge.
+    fn verify_revision(&self, ctx: &SyncContext<'_>, rev: &str) -> Result<(), SyncError> {
+        if ctx.options.git_verify_max_age_days > 0 {
+            self.verify_max_age(ctx, rev)?;
+        }
+        if ctx.options.git_verify_commit_signature {
+            Verifier::new(&self.runner).verify_git_head(ctx.repo, ctx.location, rev)?;
+        }
+        Ok(())
+    }
+
+    /// Reject a fetched revision whose `metadata/timestamp.chk` is older than
+    /// `sync-git-verify-max-age-days`, reading it from the revision itself via
+    /// `git show <rev>:metadata/timestamp.chk`. A repository without the file is
+    /// not aged out, matching Portage's lenient handling of a missing timestamp.
+    fn verify_max_age(&self, ctx: &SyncContext<'_>, rev: &str) -> Result<(), SyncError> {
+        let max_days = ctx.options.git_verify_max_age_days as i64;
+        let spec = CommandSpec::new("git")
+            .arg("-C")
+            .arg(ctx.location.to_string_lossy().into_owned())
+            .arg("show")
+            .arg(format!("{rev}:metadata/timestamp.chk"));
+        let out = self.runner.run(&spec)?;
+        if !out.success() {
+            // No timestamp file in the tree: nothing to age out.
+            return Ok(());
+        }
+        let Some(head_ts) = out
+            .stdout
+            .lines()
+            .next()
+            .and_then(crate::timestamp::parse_timestamp_format)
+        else {
+            return Ok(());
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(head_ts);
+        if now - head_ts > max_days * 86_400 {
+            return Err(SyncError::Verification {
+                repo: ctx.repo.to_owned(),
+                reason: format!("fetched head is older than {max_days} days"),
+            });
+        }
+        Ok(())
+    }
+
     /// Read the current head revision, or `None` when the repository has no head
     /// yet.
     fn head(&self, ctx: &SyncContext<'_>) -> Result<Option<String>, SyncError> {
@@ -134,8 +187,12 @@ impl<R: CommandRunner> Backend for GitBackend<R> {
             });
         }
         self.set_safe_directory(ctx)?;
-        if ctx.options.git_verify_commit_signature {
-            Verifier::new(&self.runner).verify_git_head(ctx.repo, ctx.location)?;
+        // Gate the freshly cloned tree on the same signature and max-age checks.
+        // A clone checks out immediately, so on failure the cloned tree is removed
+        // rather than left on disk.
+        if let Err(e) = self.verify_revision(ctx, "HEAD") {
+            let _ = std::fs::remove_dir_all(ctx.location);
+            return Err(e);
         }
         let head = self.head(ctx)?;
         Ok(SyncOutcome::changed(SyncKind::Initial, head))
@@ -168,6 +225,11 @@ impl<R: CommandRunner> Backend for GitBackend<R> {
             });
         }
 
+        // Verify the fetched ref before it is merged into the live tree, so an
+        // untrusted or stale commit never lands on disk. The clobber above reset
+        // the tree to the previously verified head, which stays in place on abort.
+        self.verify_revision(ctx, "FETCH_HEAD")?;
+
         let merge = CommandSpec::new("git")
             .arg("-C")
             .arg(ctx.location.to_string_lossy().into_owned())
@@ -190,10 +252,6 @@ impl<R: CommandRunner> Backend for GitBackend<R> {
         // Prune a shallow repository's objects after the fetch.
         if matches!(ctx.options.depth, None | Some(1..)) && !ctx.options.volatile {
             let _ = self.git(ctx, &["gc", "--auto"]);
-        }
-
-        if ctx.options.git_verify_commit_signature {
-            Verifier::new(&self.runner).verify_git_head(ctx.repo, ctx.location)?;
         }
 
         let after = self.head(ctx)?;

@@ -20,7 +20,7 @@ use crate::command::fake::FakeRunner;
 use crate::engine::{RepoResult, SyncEngine};
 use crate::error::SyncError;
 use crate::options::{SyncDefaults, SyncOptions};
-use crate::outcome::SyncKind;
+use crate::outcome::{SyncKind, SyncOutcome};
 use crate::refresh::{MetadataRefresher, RefreshMode, RefreshReport};
 use crate::revision::RevisionHistory;
 
@@ -288,7 +288,11 @@ fn unchanged_tree_skips_refresh() {
     // rsync update with matching timestamp reports no change.
     let tmp = TempDir::new().unwrap();
     let loc = make_repo(tmp.path(), "g", "");
-    std::fs::write(loc.join("metadata/timestamp.chk"), "100\n").unwrap();
+    std::fs::write(
+        loc.join("metadata/timestamp.chk"),
+        "Sun, 21 Jun 2026 05:45:00 +0000\n",
+    )
+    .unwrap();
     let set = discover_set(
         tmp.path(),
         &format!(
@@ -302,7 +306,11 @@ fn unchanged_tree_skips_refresh() {
     let runner = FakeRunner::new().rule(move |s| {
         if s.program == "rsync" && s.args.iter().any(|a| a.contains("timestamp.chk")) {
             std::fs::create_dir_all(staging_for_rule.join("g")).ok();
-            std::fs::write(staging_for_rule.join("g/timestamp.chk"), "100\n").ok();
+            std::fs::write(
+                staging_for_rule.join("g/timestamp.chk"),
+                "Sun, 21 Jun 2026 05:45:00 +0000\n",
+            )
+            .ok();
             Some(ok(""))
         } else {
             None
@@ -349,7 +357,11 @@ fn rsync_server_out_of_date_preserves_tree() {
     let tmp = TempDir::new().unwrap();
     let loc = tmp.path().join("g");
     std::fs::create_dir_all(loc.join("metadata")).unwrap();
-    std::fs::write(loc.join("metadata/timestamp.chk"), "200\n").unwrap();
+    std::fs::write(
+        loc.join("metadata/timestamp.chk"),
+        "Mon, 22 Jun 2026 05:45:00 +0000\n",
+    )
+    .unwrap();
     std::fs::write(loc.join("marker"), "keep").unwrap();
     let staging = tmp.path().join("staging/g");
     std::fs::create_dir_all(&staging).unwrap();
@@ -357,7 +369,11 @@ fn rsync_server_out_of_date_preserves_tree() {
     let staging_for_rule = staging.clone();
     let runner = FakeRunner::new().rule(move |s| {
         if s.args.iter().any(|a| a.contains("timestamp.chk")) {
-            std::fs::write(staging_for_rule.join("timestamp.chk"), "150\n").ok();
+            std::fs::write(
+                staging_for_rule.join("timestamp.chk"),
+                "Sun, 21 Jun 2026 05:45:00 +0000\n",
+            )
+            .ok();
             Some(ok(""))
         } else {
             None
@@ -453,6 +469,8 @@ fn rsync_transfer_includes_standard_excludes_and_extra_opts() {
         .unwrap();
     assert!(call.args.iter().any(|a| a == "--exclude=/distfiles"));
     assert!(call.args.iter().any(|a| a == "--bwlimit=1000"));
+    // Portage does not exclude `/.git`; the VCS case is handled by check_vcs.
+    assert!(!call.args.iter().any(|a| a == "--exclude=/.git"));
 }
 
 #[test]
@@ -460,7 +478,11 @@ fn rsync_verification_failure_preserves_prior_tree() {
     let tmp = TempDir::new().unwrap();
     let loc = tmp.path().join("g");
     std::fs::create_dir_all(loc.join("metadata")).unwrap();
-    std::fs::write(loc.join("metadata/timestamp.chk"), "100\n").unwrap();
+    std::fs::write(
+        loc.join("metadata/timestamp.chk"),
+        "Sun, 21 Jun 2026 05:45:00 +0000\n",
+    )
+    .unwrap();
     std::fs::write(loc.join("marker"), "keep").unwrap();
     let staging = tmp.path().join("staging/g");
     std::fs::create_dir_all(&staging).unwrap();
@@ -469,7 +491,11 @@ fn rsync_verification_failure_preserves_prior_tree() {
     let runner = FakeRunner::new()
         .rule(move |s| {
             if s.program == "rsync" && s.args.iter().any(|a| a.contains("timestamp.chk")) {
-                std::fs::write(staging_for_rule.join("timestamp.chk"), "300\n").ok();
+                std::fs::write(
+                    staging_for_rule.join("timestamp.chk"),
+                    "Mon, 22 Jun 2026 05:45:00 +0000\n",
+                )
+                .ok();
                 Some(ok(""))
             } else {
                 None
@@ -1040,4 +1066,287 @@ fn failed_post_sync_action_reported_without_rollback() {
     ));
     // Refresh still ran (metadata left in place).
     assert_eq!(refresher.calls(), vec![("g".to_owned(), false)]);
+}
+
+// --- sync-cli-wiring additions ----------------------------------------------
+
+#[test]
+fn default_rsync_timeout_is_180() {
+    // Portage hardcodes the rsync transfer `--timeout=180`.
+    assert_eq!(SyncDefaults::default().timeout_secs, 180);
+}
+
+#[test]
+fn rsync_transfer_carries_timeout_and_no_git_exclude() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    let staging = tmp.path().join("staging/g");
+    std::fs::create_dir_all(&staging).unwrap();
+    let runner = FakeRunner::new().rule(|s| {
+        (s.program == "rsync" && s.args.iter().any(|a| a == "--recursive")).then(|| ok(""))
+    });
+    let backend = RsyncBackend::new(&runner);
+    let mut opts = rsync_verify_opts();
+    opts.verify_metamanifest = false;
+    opts.timeout_secs = 180;
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    backend.fetch(&ctx).unwrap();
+    let call = runner
+        .calls()
+        .into_iter()
+        .find(|c| c.args.iter().any(|a| a == "--recursive"))
+        .unwrap();
+    assert!(call.args.iter().any(|a| a == "--timeout=180"));
+    assert!(!call.args.iter().any(|a| a == "--exclude=/.git"));
+}
+
+#[test]
+fn rsync_opts_override_has_no_git_exclude() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    let staging = tmp.path().join("staging/g");
+    std::fs::create_dir_all(&staging).unwrap();
+    let runner = FakeRunner::new().rule(|s| {
+        (s.program == "rsync" && s.args.iter().any(|a| a == "--archive")).then(|| ok(""))
+    });
+    let backend = RsyncBackend::new(&runner);
+    let mut opts = rsync_verify_opts();
+    opts.verify_metamanifest = false;
+    opts.rsync_opts_override = Some(vec!["--archive".into()]);
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    backend.fetch(&ctx).unwrap();
+    let call = runner
+        .calls()
+        .into_iter()
+        .find(|c| c.args.iter().any(|a| a == "--archive"))
+        .unwrap();
+    assert!(!call.args.iter().any(|a| a == "--exclude=/.git"));
+}
+
+#[test]
+fn freshness_orders_by_epoch() {
+    use crate::backends::rsync::{Freshness, classify_freshness};
+    assert_eq!(classify_freshness(100, Some(100)), Freshness::Current);
+    assert_eq!(classify_freshness(100, Some(200)), Freshness::Older);
+    assert_eq!(classify_freshness(200, Some(100)), Freshness::Newer);
+    assert_eq!(classify_freshness(100, None), Freshness::Newer);
+}
+
+#[test]
+fn global_postsync_runs_once_after_all_repos() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = TempDir::new().unwrap();
+    let a = make_repo(tmp.path(), "a", "");
+    let b = make_repo(tmp.path(), "b", "");
+    let set = discover_set(
+        tmp.path(),
+        &format!(
+            "[a]\nlocation = {}\nsync-type = webrsync\nsync-uri = https://a\n\
+             [b]\nlocation = {}\nsync-type = webrsync\nsync-uri = https://b\n",
+            a.display(),
+            b.display()
+        ),
+    );
+    // Only the global postsync.d directory, no per-repo hooks.
+    let hooks = tmp.path().join("config/etc/portage/postsync.d");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("99-global");
+    std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let runner = FakeRunner::new()
+        .rule(|s| (s.program == "emerge-webrsync").then(|| ok("")))
+        .rule(|s| s.program.ends_with("99-global").then(|| ok("")));
+    let registry = BackendRegistry::new(vec![Box::new(WebrsyncBackend::new(&runner))]);
+    let refresher = FakeRefresher::new();
+    let staging = tmp.path().join("staging");
+    let engine = SyncEngine::new(&set, &registry, &refresher, &runner, &staging)
+        .with_config_root(tmp.path().join("config"));
+
+    let mut history = RevisionHistory::new();
+    engine.sync_all(&mut history);
+    let global_calls = runner
+        .calls()
+        .into_iter()
+        .filter(|c| c.program.ends_with("99-global"))
+        .count();
+    assert_eq!(
+        global_calls, 1,
+        "the global postsync.d hook runs exactly once"
+    );
+}
+
+/// Drive a git update with a rule that answers `git show <rev>:metadata/timestamp.chk`
+/// with `head_ts`, the signature query `--pretty=%G?` with `sig`, and every other
+/// git command with success. Returns the update result and the recorded calls.
+fn git_update_with(
+    opts: SyncOptions,
+    head_ts: &'static str,
+    sig: &'static str,
+) -> (
+    Result<SyncOutcome, SyncError>,
+    Vec<crate::command::CommandSpec>,
+) {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    std::fs::create_dir_all(loc.join(".git")).unwrap();
+    let staging = tmp.path().join("staging/g");
+    let runner = FakeRunner::new()
+        .rule(move |s| {
+            (s.program == "git" && s.args.iter().any(|a| a.contains("timestamp.chk")))
+                .then(|| ok(head_ts))
+        })
+        .rule(move |s| {
+            (s.program == "git" && s.args.iter().any(|a| a == "--pretty=%G?")).then(|| ok(sig))
+        })
+        .rule(|s| (s.program == "git").then(|| ok("h")));
+    let backend = GitBackend::new(&runner);
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    let result = backend.update(&ctx);
+    (result, runner.calls())
+}
+
+/// Whether any recorded call passed `arg`.
+fn calls_have_arg(calls: &[crate::command::CommandSpec], arg: &str) -> bool {
+    calls.iter().any(|c| c.args.iter().any(|a| a == arg))
+}
+
+/// Whether any recorded call passed an argument containing `needle`.
+fn calls_have_arg_containing(calls: &[crate::command::CommandSpec], needle: &str) -> bool {
+    calls
+        .iter()
+        .any(|c| c.args.iter().any(|a| a.contains(needle)))
+}
+
+#[test]
+fn git_stale_head_rejected_by_max_age_alone() {
+    let mut opts = git_opts(None);
+    opts.git_verify_commit_signature = false;
+    opts.git_verify_max_age_days = 1;
+    let (result, calls) = git_update_with(opts, "Fri, 01 Jan 1971 00:00:00 +0000\n", "G");
+    assert!(matches!(result, Err(SyncError::Verification { .. })));
+    // Verification runs before the merge, so the live tree is never advanced.
+    assert!(!calls_have_arg(&calls, "merge"));
+}
+
+#[test]
+fn git_fresh_head_accepted_under_max_age() {
+    let mut opts = git_opts(None);
+    opts.git_verify_commit_signature = false;
+    // A very large window accepts any plausible head date without a clock dependency.
+    opts.git_verify_max_age_days = 3_650_000;
+    let (result, _) = git_update_with(opts, "Sun, 21 Jun 2026 05:45:00 +0000\n", "G");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn git_max_age_unset_skips_the_check() {
+    let mut opts = git_opts(None);
+    opts.git_verify_commit_signature = false;
+    opts.git_verify_max_age_days = 0;
+    // An ancient head is accepted because the max-age check does not run.
+    let (result, calls) = git_update_with(opts, "Fri, 01 Jan 1971 00:00:00 +0000\n", "G");
+    assert!(result.is_ok());
+    assert!(!calls_have_arg_containing(&calls, "timestamp.chk"));
+}
+
+#[test]
+fn git_bad_signature_rejected_before_merge() {
+    let mut opts = git_opts(None);
+    opts.git_verify_commit_signature = true;
+    opts.git_verify_max_age_days = 0;
+    // `N` is a missing signature.
+    let (result, calls) = git_update_with(opts, "Sun, 21 Jun 2026 05:45:00 +0000\n", "N");
+    assert!(matches!(result, Err(SyncError::Verification { .. })));
+    assert!(!calls_have_arg(&calls, "merge"));
+}
+
+#[test]
+fn live_rsync_timestamp_fast_path_and_auto_sync_skip() {
+    // Opt-in (gated on MORAINE_CORPUS) end-to-end test against the real `rsync`
+    // binary and a local `file://` source whose `metadata/timestamp.chk` holds a
+    // real TIMESTAMP_FORMAT date. It asserts the no-change fast path on a second
+    // run and that an `auto-sync = no` repository is skipped.
+    if std::env::var_os("MORAINE_CORPUS").is_none() {
+        return;
+    }
+    if which_rsync().is_none() {
+        eprintln!("rsync not available; skipping live rsync test");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    // The upstream source tree with a real timestamp.chk date string.
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(source.join("metadata")).unwrap();
+    std::fs::write(
+        source.join("metadata/timestamp.chk"),
+        "Sun, 21 Jun 2026 05:45:00 +0000\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("profiles_repo_name"), "g\n").unwrap();
+
+    let local = tmp.path().join("local");
+    let skipped_local = tmp.path().join("skipped");
+    let body = format!(
+        "[g]\nlocation = {}\nsync-type = rsync\nsync-uri = file://{}\n\
+         [h]\nlocation = {}\nsync-type = rsync\nsync-uri = file://{}\nauto-sync = no\n",
+        local.display(),
+        source.display(),
+        skipped_local.display(),
+        source.display(),
+    );
+    let set = discover_set(tmp.path(), &body);
+    let extras = extras_for(tmp.path());
+
+    let runner = crate::command::SystemRunner;
+    let registry = BackendRegistry::new(vec![Box::new(RsyncBackend::new(&runner))]);
+    let refresher = FakeRefresher::new();
+    let staging = tmp.path().join("staging");
+    let engine = SyncEngine::new(&set, &registry, &refresher, &runner, &staging)
+        .with_extras(extras)
+        .with_metadata_transfer(false);
+
+    let mut history = RevisionHistory::new();
+    let first = engine.sync_all(&mut history);
+    assert!(first.get("g").unwrap().is_synced(), "{first:?}");
+    // `auto-sync = no` is honored: the second repository is skipped.
+    assert!(matches!(first.get("h"), Some(RepoResult::Skipped)));
+    assert!(local.join("metadata/timestamp.chk").exists());
+
+    // Second run: the server and local timestamp.chk parse to equal epochs, so the
+    // probe classifies the tree as current and transfers nothing.
+    let second = engine.sync_all(&mut history);
+    match second.get("g").unwrap() {
+        RepoResult::Synced { outcome, .. } => {
+            assert!(
+                !outcome.changed,
+                "second sync must hit the no-change fast path"
+            );
+        }
+        other => panic!("expected a synced (unchanged) result, got {other:?}"),
+    }
+}
+
+/// Whether a usable `rsync` binary is on PATH.
+fn which_rsync() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|p| p.join("rsync"))
+        .find(|p| p.exists())
 }

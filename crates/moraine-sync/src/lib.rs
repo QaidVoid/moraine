@@ -41,6 +41,7 @@ pub mod outcome;
 pub mod pool;
 pub mod refresh;
 pub mod revision;
+mod timestamp;
 pub mod verify;
 
 #[cfg(test)]

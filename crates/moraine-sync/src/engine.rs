@@ -78,8 +78,12 @@ pub struct SyncEngine<'a, 'b, R: CommandRunner, M: MetadataRefresher> {
     config_root: Option<PathBuf>,
     /// `sync-hooks-only-on-change`: when set, hooks run only on a changed sync.
     hooks_only_on_change: bool,
-    /// `FEATURES=metadata-transfer`: gate the post-sync cache transfer. Default
-    /// on; when off, the metadata refresh is skipped (matching `_sync_callback`).
+    /// Whether the post-sync metadata refresh runs. Default on, and it is kept on
+    /// in production because the refresh populates moraine's own resolver store
+    /// (`var/cache/moraine/repos`) that the resolver reads directly, so a changed
+    /// sync must always refresh to keep resolves correct. This is not Portage's
+    /// `FEATURES=metadata-transfer` gate; the flag exists only so tests can skip
+    /// the refresh.
     metadata_transfer: bool,
 }
 
@@ -159,6 +163,7 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
     /// repositories; those are synced regardless of `auto-sync`.
     fn run(&self, explicit: Option<&[String]>, history: &mut RevisionHistory) -> SyncReport {
         let mut report = SyncReport::default();
+        let mut any_changed = false;
         for cfg in self.repo_set.ordered() {
             let named = explicit.map(|names| names.iter().any(|n| n == &cfg.name));
             // When an explicit selection is given, only process named repos.
@@ -167,7 +172,14 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
             }
             let explicitly_named = named == Some(true);
             let result = self.process_repo(cfg, explicitly_named, history);
+            if let RepoResult::Synced { outcome, .. } = &result {
+                any_changed |= outcome.changed;
+            }
             report.results.push((cfg.name.clone(), result));
+        }
+        // The global `postsync.d` runs exactly once after the whole run.
+        if let Err(e) = self.run_global_postsync_hooks(any_changed) {
+            report.results.push((String::new(), RepoResult::Failed(e)));
         }
         report
     }
@@ -238,8 +250,9 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
             history.record(&cfg.name, head.as_deref());
         }
 
-        // The post-sync metadata refresh runs only on a changed sync and only
-        // when FEATURES=metadata-transfer is enabled (matching `_sync_callback`).
+        // The post-sync metadata refresh runs on a changed sync to repopulate
+        // moraine's resolver store. It is always on in production (the flag exists
+        // only so tests can skip it), since the resolver reads that store directly.
         let refresh = if outcome.changed && self.metadata_transfer {
             match self.refresher.refresh(&cfg.name, false) {
                 Ok(r) => Some(r),
@@ -277,10 +290,12 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
         })
     }
 
-    /// Run the `repo.postsync.d` (per-repo, argv `[name, uri, location]`) and
-    /// `postsync.d` (global, no args) hooks under `<config_root>/etc/portage/`,
-    /// in sorted order. Hooks run when the tree `changed` or when
-    /// `sync-hooks-only-on-change` is unset. A hook failure is reported.
+    /// Run the per-repository `repo.postsync.d` hooks (argv `[name, uri,
+    /// location]`) under `<config_root>/etc/portage/`, in sorted order. They run
+    /// when the tree `changed` or when `sync-hooks-only-on-change` is unset,
+    /// matching Portage's `perform_post_sync_hook(repo.name, ...)`. The global
+    /// `postsync.d` runs once after the whole run via [`Self::run_global_postsync_hooks`].
+    /// A hook failure is reported.
     fn run_postsync_hooks(
         &self,
         repo: &str,
@@ -303,9 +318,25 @@ impl<'a, 'b, R: CommandRunner, M: MetadataRefresher> SyncEngine<'a, 'b, R, M> {
                 .arg(&location);
             self.run_hook(repo, &spec)?;
         }
+        Ok(())
+    }
+
+    /// Run the global `postsync.d` hooks (no arguments) once after every
+    /// repository has been processed, matching Portage's
+    /// `perform_post_sync_hook("")` invoked exactly once at the end of a run. The
+    /// hooks run when any repository changed or when `sync-hooks-only-on-change`
+    /// is unset. A hook failure is reported.
+    fn run_global_postsync_hooks(&self, any_changed: bool) -> Result<(), SyncError> {
+        let Some(root) = &self.config_root else {
+            return Ok(());
+        };
+        if !any_changed && self.hooks_only_on_change {
+            return Ok(());
+        }
+        let portage = root.join("etc/portage");
         for hook in executable_hooks(&portage.join("postsync.d")) {
             let spec = CommandSpec::new(hook.to_string_lossy().into_owned());
-            self.run_hook(repo, &spec)?;
+            self.run_hook("", &spec)?;
         }
         Ok(())
     }

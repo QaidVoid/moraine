@@ -55,7 +55,8 @@ pub struct SyncDefaults {
 impl Default for SyncDefaults {
     fn default() -> Self {
         Self {
-            timeout_secs: 30,
+            // Portage hardcodes the rsync transfer `--timeout=180`.
+            timeout_secs: 180,
             retries: 3,
             depth: None,
             key_refresh: KeyRefresh::Keyserver,

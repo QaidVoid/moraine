@@ -244,16 +244,18 @@ impl<'a, R: CommandRunner> Verifier<'a, R> {
         }
     }
 
-    /// Verify the signature on the head commit of a git repository.
+    /// Verify the signature on a given revision of a git repository, for example
+    /// `FETCH_HEAD` (to gate a fetched ref before it is merged into the live tree)
+    /// or `HEAD`.
     #[instrument(skip(self), fields(repo = repo))]
-    pub fn verify_git_head(&self, repo: &str, location: &Path) -> Result<(), SyncError> {
+    pub fn verify_git_head(&self, repo: &str, location: &Path, rev: &str) -> Result<(), SyncError> {
         let spec = CommandSpec::new("git")
             .arg("-C")
             .arg(location.to_string_lossy().into_owned())
             .arg("log")
             .arg("-1")
             .arg("--pretty=%G?")
-            .arg("HEAD");
+            .arg(rev);
         let out = self.runner.run(&spec)?;
         if !out.success() {
             return Err(SyncError::Verification {
