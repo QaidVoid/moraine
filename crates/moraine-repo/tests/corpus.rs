@@ -1,7 +1,8 @@
 //! Corpus comparison tests, gated on the `MORAINE_CORPUS` environment variable.
 //!
-//! `MORAINE_CORPUS` must point at a directory containing a `repos.conf` (file or
-//! directory) describing the repositories to import. When the variable is unset
+//! `MORAINE_CORPUS` points at a captured system root (`EROOT`); the repository
+//! configuration is read from its `etc/portage/repos.conf` (a file or a
+//! `repos.conf` directory). When the variable is unset or that path is absent
 //! the tests are no-ops so they pass in environments without a real Gentoo tree.
 //!
 //! When `portageq` is also on `PATH` and `MORAINE_CORPUS_PORTAGE=1` is set, the
@@ -12,17 +13,19 @@ use std::process::Command;
 
 use moraine_repo::{build_index, discover};
 
-fn corpus_dir() -> Option<PathBuf> {
-    std::env::var_os("MORAINE_CORPUS").map(PathBuf::from)
+/// The corpus `repos.conf` path, when a corpus is configured and it exists.
+fn corpus_repos_conf() -> Option<PathBuf> {
+    let root = std::env::var_os("MORAINE_CORPUS").filter(|v| !v.is_empty())?;
+    let repos_conf = PathBuf::from(root).join("etc/portage/repos.conf");
+    repos_conf.exists().then_some(repos_conf)
 }
 
 #[test]
 fn repo_order_resolves_on_corpus() {
-    let Some(corpus) = corpus_dir() else {
-        eprintln!("MORAINE_CORPUS unset; skipping corpus test");
+    let Some(repos_conf) = corpus_repos_conf() else {
+        eprintln!("MORAINE_CORPUS unset or no etc/portage/repos.conf; skipping");
         return;
     };
-    let repos_conf = corpus.join("repos.conf");
     let set = discover(&repos_conf).expect("discover repos.conf");
     assert!(
         !set.is_empty(),
@@ -59,13 +62,14 @@ fn repo_order_resolves_on_corpus() {
 
 #[test]
 fn build_and_query_on_corpus() {
-    let Some(corpus) = corpus_dir() else {
-        eprintln!("MORAINE_CORPUS unset; skipping corpus test");
+    let Some(repos_conf) = corpus_repos_conf() else {
+        eprintln!("MORAINE_CORPUS unset or no etc/portage/repos.conf; skipping");
         return;
     };
-    let repos_conf = corpus.join("repos.conf");
-    let store_dir = corpus.join(".moraine-store");
-    let index = build_index(&repos_conf, &store_dir).expect("build index on corpus");
+    // Build the store into a temporary directory rather than polluting the
+    // corpus tree.
+    let store = tempfile::tempdir().expect("temp store dir");
+    let index = build_index(&repos_conf, store.path()).expect("build index on corpus");
     assert!(!index.repos().is_empty());
 
     // A broadly present package should resolve to at least one candidate.

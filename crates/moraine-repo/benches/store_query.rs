@@ -20,8 +20,12 @@ fn bench_store(c: &mut Criterion) {
         // No corpus configured: nothing to benchmark.
         return;
     };
-    let repos_conf = corpus.join("repos.conf");
-    let store_dir = corpus.join(".moraine-store");
+    let repos_conf = corpus.join("etc/portage/repos.conf");
+    if !repos_conf.exists() {
+        return;
+    }
+    let store = tempfile::tempdir().expect("temp store dir");
+    let store_dir = store.path().to_path_buf();
 
     // Cold import-and-load: builds every store from md5-cache and loads them.
     c.bench_function("build_index_cold", |b| {

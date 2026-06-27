@@ -1,12 +1,15 @@
-//! Corpus round-trip test over a real `/var/db/pkg` tree.
+//! Corpus round-trip test over a real installed-package database.
 //!
-//! Gated on the `MORAINE_CORPUS` environment variable. When it is unset the test
-//! no-ops so the gate stays green without a corpus. When set it imports the tree,
-//! writes the store, reloads it, and asserts field-level fidelity of recorded
-//! USE, SLOT and sub-slot, `:=` bindings, CONTENTS entries, and PROVIDES /
-//! REQUIRES against the freshly imported records.
+//! Gated on the `MORAINE_CORPUS` environment variable, which points at a
+//! captured system root (`EROOT`); the vdb is read from its `var/db/pkg`. When
+//! the variable is unset or that tree is absent the test no-ops so the gate
+//! stays green without a corpus. When present it imports the tree, writes the
+//! store, reloads it, and asserts field-level fidelity of recorded USE, SLOT and
+//! sub-slot, `:=` bindings, CONTENTS entries, and PROVIDES / REQUIRES against the
+//! freshly imported records.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use moraine_common::Interner;
@@ -14,14 +17,19 @@ use moraine_vdb::store::{Store, StorePaths};
 
 #[test]
 fn corpus_round_trips_resolver_fields() {
-    let Ok(corpus) = std::env::var("MORAINE_CORPUS") else {
+    let Some(root) = std::env::var_os("MORAINE_CORPUS").filter(|v| !v.is_empty()) else {
         eprintln!("MORAINE_CORPUS unset; skipping corpus round-trip");
         return;
     };
+    let vdb = PathBuf::from(root).join("var/db/pkg");
+    if !vdb.is_dir() {
+        eprintln!("no {} in corpus; skipping vdb round-trip", vdb.display());
+        return;
+    }
 
     // Import the stock tree into a fresh set of records.
     let src_interner = Arc::new(Interner::new());
-    let imported = moraine_vdb::import_vdb(&corpus, &src_interner).expect("import corpus");
+    let imported = moraine_vdb::import_vdb(&vdb, &src_interner).expect("import corpus");
     assert!(!imported.is_empty(), "corpus produced no records");
 
     // Index imported records by cpv for comparison after reload.

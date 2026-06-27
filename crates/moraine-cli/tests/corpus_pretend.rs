@@ -12,19 +12,38 @@ use moraine_cli::args::Cli;
 use moraine_cli::config::{ConfigContext, Roots};
 use moraine_cli::sets::{Modifiers, expand};
 
+/// The corpus system root, when configured and complete enough to resolve
+/// `@world`: it must hold `etc/portage` and a `make.profile` (the profile makes
+/// `@system`/`@world` meaningful). An incomplete corpus skips rather than fails.
 fn corpus_root() -> Option<PathBuf> {
-    let value = std::env::var_os("MORAINE_CORPUS")?;
-    if value.is_empty() {
+    let value = std::env::var_os("MORAINE_CORPUS").filter(|v| !v.is_empty())?;
+    let root = PathBuf::from(value);
+    if !root.join("etc/portage").is_dir() {
+        eprintln!("corpus has no etc/portage; skipping");
         return None;
     }
-    Some(PathBuf::from(value))
+    // `exists()` follows the symlink, so a make.profile pointing outside the
+    // corpus (a broken link) skips rather than resolving to an empty profile.
+    if !root.join("etc/portage/make.profile").exists() {
+        eprintln!("corpus make.profile is absent or unresolved; skipping @world tests");
+        return None;
+    }
+    Some(root)
 }
 
 /// Snapshot the mtimes of every file under a directory, for the read-only check.
+///
+/// Moraine's own derived store cache under `var/cache/moraine` is excluded: a
+/// `--pretend` run may build that cache (as Portage builds its metadata cache),
+/// which is not a modification of the installed system's persisted state.
 fn snapshot_mtimes(root: &Path) -> BTreeMap<PathBuf, std::time::SystemTime> {
+    let cache = root.join("var/cache/moraine");
     let mut out = BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        if dir == cache {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -82,10 +101,11 @@ fn pretend_world_leaves_state_unchanged() {
 
     let before = snapshot_mtimes(&root);
 
+    // `-p` already requests pretend; do not also pass `--pretend` (that is the
+    // same flag twice and clap rejects the conflict).
     let cli = Cli::parse_from_args(
         [
             "-puDN",
-            "--pretend",
             "--root",
             root.to_str().unwrap(),
             "--config-root",
