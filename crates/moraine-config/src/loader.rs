@@ -119,7 +119,8 @@ pub fn resolve_config(
         .with_arch(arch.clone())
         .with_nodes(use_nodes)
         .with_features_test(features_test)
-        .with_iuse_effective(iuse_effective(env));
+        .with_iuse_effective(iuse_effective(env))
+        .with_interner(Arc::clone(interner));
 
     // Repository-level USE configuration from each repository's `profiles/`
     // root, applied beneath the profile cascade and scoped to candidates from
@@ -470,18 +471,32 @@ fn read_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Parse a `package.use` line: `atom flag -flag ...`.
+/// Parse a `package.use` line: `cp flag -flag ...`.
+///
+/// The left token accepts an extended-wildcard cp (`*/*`, `dev-libs/*`, `*/pkg`,
+/// partial intra-segment forms) like the other per-package files, mirroring
+/// Portage's `allow_wildcard=True` for `/etc/portage/package.use`. The
+/// USE_EXPAND `prefix:` shorthand is expanded within the line: a token ending in
+/// `:` sets a lowercase `prefix_` applied to the following tokens, with a leading
+/// `-` kept ahead of the prefix, mirroring `UseManager._parse_file_to_dict`. The
+/// prefix resets at each call because each line is parsed independently.
 fn parse_pkg_use(line: &str, interner: &Interner) -> Option<PkgUseEntry> {
     let mut parts = line.split_whitespace();
     let atom_text = parts.next()?;
-    let atom = parse_atom(atom_text, interner)?;
-    let mods: Vec<(String, bool)> = parts
-        .map(|flag| match flag.strip_prefix('-') {
-            Some(rest) => (rest.to_owned(), false),
-            None => (flag.to_owned(), true),
-        })
-        .collect();
-    Some(PkgUseEntry { atom, mods })
+    let pattern = parse_mask_pattern(atom_text, interner, PERMISSIVE)?;
+    let mut prefix = String::new();
+    let mut mods: Vec<(String, bool)> = Vec::new();
+    for token in parts {
+        if let Some(name) = token.strip_suffix(':') {
+            prefix = format!("{}_", name.to_lowercase());
+            continue;
+        }
+        match token.strip_prefix('-') {
+            Some(rest) => mods.push((format!("{prefix}{rest}"), false)),
+            None => mods.push((format!("{prefix}{token}"), true)),
+        }
+    }
+    Some(PkgUseEntry { pattern, mods })
 }
 
 /// Apply one profile-chain `package.mask` line to the builder: `-*` clears, a
@@ -1079,6 +1094,80 @@ mod tests {
         );
         // The active file enables ssl; the dotfile's `-ssl` is ignored.
         assert!(eff.enabled.contains("ssl"));
+    }
+
+    #[test]
+    fn wildcard_package_use_applies_globally() {
+        let dir = tempfile::tempdir().unwrap();
+        let portage = dir.path().join("etc/portage");
+        std::fs::create_dir_all(&portage).unwrap();
+        // A `*/*` entry disables systemd for every candidate, and a per-category
+        // `dev-libs/*` entry adds foo only to dev-libs packages.
+        std::fs::write(
+            portage.join("package.use"),
+            "*/* -systemd\ndev-libs/* foo\n",
+        )
+        .unwrap();
+        let mut env = VarMap::new();
+        env.set("USE".to_owned(), "systemd".to_owned());
+        let interner = Arc::new(Interner::new());
+        let cfg = resolve_config(
+            &ProfileStack::default(),
+            &env,
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("1.0").unwrap();
+
+        // An unrelated candidate has systemd removed by `*/*`.
+        let unrelated = pref(&interner, "app-misc", "thing", &version);
+        let eff = cfg.effective_use(&unrelated, &[], false, false);
+        assert!(!eff.enabled.contains("systemd"));
+        assert!(!eff.enabled.contains("foo"));
+
+        // A dev-libs candidate also gains foo from `dev-libs/*`.
+        let devlib = pref(&interner, "dev-libs", "openssl", &version);
+        let eff = cfg.effective_use(&devlib, &[], false, false);
+        assert!(!eff.enabled.contains("systemd"));
+        assert!(eff.enabled.contains("foo"));
+    }
+
+    #[test]
+    fn package_use_expands_use_expand_prefix_shorthand() {
+        let dir = tempfile::tempdir().unwrap();
+        let portage = dir.path().join("etc/portage");
+        std::fs::create_dir_all(&portage).unwrap();
+        std::fs::write(
+            portage.join("package.use"),
+            "cat/pkg python_targets: python3_11 -python3_10\n",
+        )
+        .unwrap();
+        let interner = Arc::new(Interner::new());
+        let cfg = resolve_config(
+            &ProfileStack::default(),
+            &VarMap::new(),
+            dir.path(),
+            &[],
+            vec![],
+            vec![],
+            &interner,
+        );
+        let version = Version::parse("1.0").unwrap();
+        let eff = cfg.effective_use(
+            &pref(&interner, "cat", "pkg", &version),
+            &["python_targets_python3_10".to_owned()],
+            false,
+            false,
+        );
+        // The prefix is applied to the following tokens, and no literal
+        // `python_targets:` flag is recorded.
+        assert!(eff.enabled.contains("python_targets_python3_11"));
+        assert!(!eff.enabled.contains("python_targets_python3_10"));
+        assert!(!eff.enabled.contains("python_targets:"));
+        assert!(!eff.enabled.contains("python3_11"));
     }
 
     #[test]

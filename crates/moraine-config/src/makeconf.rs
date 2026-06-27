@@ -45,7 +45,7 @@ impl VarMap {
     /// Merge a single assignment, stacking incremental variables onto the current
     /// value and replacing non-incremental ones, as parsing a line would.
     pub fn merge_var(&mut self, key: &str, value: &str) {
-        if self.is_incremental(key) {
+        if self.is_incremental(key, false) {
             let merged = stack_incremental(self.vars.get(key), value);
             self.vars.insert(key.to_owned(), merged);
         } else {
@@ -56,6 +56,19 @@ impl VarMap {
     /// Parse the contents of one assignment file, merging into this map so that
     /// later assignments override and expansion sees earlier values.
     pub fn merge_str(&mut self, content: &str, path: &Path) -> Result<(), ConfigError> {
+        self.merge_str_layered(content, path, false)
+    }
+
+    /// Parse one assignment file's contents. When `user_layer` is set, a
+    /// USE_EXPAND value variable is treated as non-incremental so a `make.conf`
+    /// assignment replaces the profile-accumulated value instead of stacking
+    /// onto it.
+    fn merge_str_layered(
+        &mut self,
+        content: &str,
+        path: &Path,
+        user_layer: bool,
+    ) -> Result<(), ConfigError> {
         let joined = join_continuations(content);
         for raw_line in joined.lines() {
             let line = raw_line.trim_start();
@@ -76,7 +89,7 @@ impl VarMap {
                 });
             }
             let value = parse_value(rest, &self.vars);
-            if self.is_incremental(key) {
+            if self.is_incremental(key, user_layer) {
                 // Incremental variables (USE, ACCEPT_KEYWORDS, USE_EXPAND, the
                 // USE_EXPAND value vars, ...) accumulate across the profile
                 // cascade and make.conf: each token adds, `-token` removes, and
@@ -90,9 +103,15 @@ impl VarMap {
         Ok(())
     }
 
-    /// Whether `key` is an incremental variable: a fixed core set plus every
-    /// variable named in the current `USE_EXPAND` list.
-    fn is_incremental(&self, key: &str) -> bool {
+    /// Whether `key` stacks incrementally in the given layer.
+    ///
+    /// The fixed core set is always incremental. A USE_EXPAND value variable (any
+    /// variable named in the current `USE_EXPAND` list, such as `PYTHON_TARGETS`)
+    /// accumulates across `make.globals` and the profile `make.defaults` cascade,
+    /// but is non-incremental in the user `make.conf` layer so a `make.conf`
+    /// assignment replaces the profile-accumulated value, mirroring Portage
+    /// omitting these variables from `INCREMENTALS`.
+    fn is_incremental(&self, key: &str, user_layer: bool) -> bool {
         const CORE: &[&str] = &[
             "USE",
             "USE_EXPAND",
@@ -110,16 +129,33 @@ impl VarMap {
             "PROFILE_ONLY_VARIABLES",
             "ENV_UNSET",
         ];
-        CORE.contains(&key)
-            || self
-                .vars
-                .get("USE_EXPAND")
-                .map(|ue| ue.split_whitespace().any(|v| v == key))
-                .unwrap_or(false)
+        if CORE.contains(&key) {
+            return true;
+        }
+        if user_layer {
+            return false;
+        }
+        self.vars
+            .get("USE_EXPAND")
+            .map(|ue| ue.split_whitespace().any(|v| v == key))
+            .unwrap_or(false)
     }
 
     /// Parse a file or directory path into this map.
     pub fn merge_path(&mut self, path: &Path) -> Result<(), ConfigError> {
+        self.merge_path_layered(path, false)
+    }
+
+    /// Parse a `make.conf`-layer file or directory into this map: like
+    /// [`merge_path`](Self::merge_path), but a USE_EXPAND value variable
+    /// assignment replaces the profile-accumulated value instead of stacking
+    /// onto it, mirroring Portage omitting these variables from `INCREMENTALS`
+    /// and clearing the profile's prefixed flags before applying `make.conf`.
+    pub fn merge_conf(&mut self, path: &Path) -> Result<(), ConfigError> {
+        self.merge_path_layered(path, true)
+    }
+
+    fn merge_path_layered(&mut self, path: &Path, user_layer: bool) -> Result<(), ConfigError> {
         if path.is_dir() {
             // Skip files whose name starts with `.` (CONFIG_PROTECT merge
             // artifacts and other hidden files), matching Portage.
@@ -139,19 +175,19 @@ impl VarMap {
                 .collect();
             entries.sort();
             for entry in entries {
-                self.merge_file(&entry)?;
+                self.merge_file_layered(&entry, user_layer)?;
             }
             Ok(())
         } else {
-            self.merge_file(path)
+            self.merge_file_layered(path, user_layer)
         }
     }
 
-    fn merge_file(&mut self, path: &Path) -> Result<(), ConfigError> {
+    fn merge_file_layered(&mut self, path: &Path, user_layer: bool) -> Result<(), ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|_| ConfigError::Io {
             path: path.to_path_buf(),
         })?;
-        self.merge_str(&content, path)
+        self.merge_str_layered(&content, path, user_layer)
     }
 }
 
@@ -384,6 +420,39 @@ mod tests {
         // versa: only the most recent occurrence of a flag is kept.
         let m = parse("USE=\"-foo bar\"\nUSE=\"foo -bar\"\n");
         assert_eq!(m.get("USE"), Some("foo -bar"));
+    }
+
+    #[test]
+    fn make_conf_replaces_use_expand_value_but_cascade_unions() {
+        let dir = tempfile::tempdir().unwrap();
+        // make.globals declares which variables hold USE_EXPAND values.
+        let globals = dir.path().join("make.globals");
+        std::fs::write(&globals, "USE_EXPAND=\"PYTHON_TARGETS VIDEO_CARDS\"\n").unwrap();
+        // Two profile make.defaults layers contribute VIDEO_CARDS (which union)
+        // and set the profile PYTHON_TARGETS.
+        let defaults1 = dir.path().join("defaults1");
+        std::fs::write(
+            &defaults1,
+            "VIDEO_CARDS=\"amdgpu\"\nPYTHON_TARGETS=\"python3_11 python3_12\"\n",
+        )
+        .unwrap();
+        let defaults2 = dir.path().join("defaults2");
+        std::fs::write(&defaults2, "VIDEO_CARDS=\"fbdev\"\n").unwrap();
+        // make.conf replaces the profile-accumulated PYTHON_TARGETS.
+        let conf = dir.path().join("make.conf");
+        std::fs::write(&conf, "PYTHON_TARGETS=\"python3_13\"\n").unwrap();
+
+        let mut env = VarMap::new();
+        env.merge_path(&globals).unwrap();
+        env.merge_path(&defaults1).unwrap();
+        env.merge_path(&defaults2).unwrap();
+        env.merge_conf(&conf).unwrap();
+
+        // The make.conf value wins outright, not stacked onto the profile.
+        assert_eq!(env.get("PYTHON_TARGETS"), Some("python3_13"));
+        // The two profile-cascade layers of VIDEO_CARDS union.
+        let vc: Vec<&str> = env.get("VIDEO_CARDS").unwrap().split_whitespace().collect();
+        assert!(vc.contains(&"amdgpu") && vc.contains(&"fbdev"));
     }
 
     #[test]

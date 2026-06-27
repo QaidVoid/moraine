@@ -2,12 +2,14 @@
 //! `package.use` overrides, and `IUSE_EFFECTIVE` derivation.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
-use moraine_atom::{Atom, PackageRef};
-use moraine_common::Symbol;
+use moraine_atom::PackageRef;
+use moraine_common::{Interner, Symbol};
 
 use crate::makeconf::VarMap;
 use crate::stacking::stack_layers_signed;
+use crate::visibility::{MaskPattern, pattern_specificity};
 
 /// The effective USE flags for a package, plus the subset marked hidden.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -41,6 +43,10 @@ pub fn flatten_use_expand(env: &VarMap) -> (Vec<String>, BTreeSet<String>) {
         for value in tokens(env, var) {
             let flag = if unprefixed.contains(var) {
                 value.to_owned()
+            } else if let Some(rest) = value.strip_prefix('-') {
+                // A negative value keeps the sign ahead of the prefix so a later
+                // signed reader drops the matching `prefix_value` flag.
+                format!("-{}_{}", var.to_lowercase(), rest)
             } else {
                 format!("{}_{}", var.to_lowercase(), value)
             };
@@ -163,15 +169,17 @@ pub fn global_use(env: &VarMap) -> GlobalUse {
     }
 }
 
-/// A single `package.use`-style entry: an atom and its flag modifications.
+/// A single `package.use`-style entry: a pattern and its flag modifications.
 ///
 /// For `package.use` the modification flag means "enable"; for
 /// `package.use.mask`/`package.use.force` it means "add to the mask/force set"
-/// (a `-flag` token clears it again for matching packages).
+/// (a `-flag` token clears it again for matching packages). The pattern is a
+/// concrete atom or an extended cp wildcard (`*/*`, `dev-libs/*`, `*/pkg`),
+/// mirroring Portage's `allow_wildcard=True` for `/etc/portage/package.use`.
 #[derive(Debug, Clone)]
 pub struct PkgUseEntry {
-    /// The atom the entry applies to.
-    pub atom: Atom,
+    /// The pattern the entry applies to.
+    pub pattern: MaskPattern,
     /// `(flag, active)` modifications.
     pub mods: Vec<(String, bool)>,
 }
@@ -205,7 +213,7 @@ impl LayeredPkgEntries {
             UseLayer::User => &mut self.user,
         };
         bucket.push(entry);
-        bucket.sort_by_key(|e| specificity(&e.atom));
+        bucket.sort_by_key(|e| pattern_specificity(&e.pattern));
     }
 
     /// The entries to apply, profile layer first (specificity-ordered), then the
@@ -229,12 +237,13 @@ struct NodeSigned {
 impl NodeSigned {
     fn add_pkg(&mut self, entry: PkgUseEntry) {
         self.pkg.push(entry);
-        self.pkg.sort_by_key(|e| specificity(&e.atom));
+        self.pkg.sort_by_key(|e| pattern_specificity(&e.pattern));
     }
 
     fn add_stable_pkg(&mut self, entry: PkgUseEntry) {
         self.stable_pkg.push(entry);
-        self.stable_pkg.sort_by_key(|e| specificity(&e.atom));
+        self.stable_pkg
+            .sort_by_key(|e| pattern_specificity(&e.pattern));
     }
 }
 
@@ -353,6 +362,10 @@ pub struct UseManager {
     repo_pkg_stable_mask: Vec<(Symbol, PkgUseEntry)>,
     repo_pkg_stable_force: Vec<(Symbol, PkgUseEntry)>,
     iuse_effective: BTreeSet<String>,
+    // The interner used to resolve a candidate's symbols when matching an
+    // extended-cp (partial glob) `package.use` pattern. A concrete atom or a
+    // whole-segment wildcard never dereferences it.
+    interner: Arc<Interner>,
 }
 
 impl UseManager {
@@ -389,6 +402,13 @@ impl UseManager {
     /// Set the `IUSE_EFFECTIVE` set.
     pub fn with_iuse_effective(mut self, iuse: BTreeSet<String>) -> Self {
         self.iuse_effective = iuse;
+        self
+    }
+
+    /// Set the interner used to resolve a candidate's symbols when matching an
+    /// extended-cp (partial glob) `package.use` pattern.
+    pub fn with_interner(mut self, interner: Arc<Interner>) -> Self {
+        self.interner = interner;
         self
     }
 
@@ -474,17 +494,33 @@ impl UseManager {
             .filter_map(|f| f.strip_prefix('+').map(str::to_owned))
             .collect();
         // An explicit `-flag` in the global USE config overrides an IUSE `+`
-        // default for that flag.
+        // default; a `-prefix_*` clears the whole IUSE-default family so a
+        // value seeded by a USE_EXPAND default is also removed.
         for flag in &self.global_disabled {
-            enabled.remove(flag);
+            match family_prefix(flag) {
+                Some(prefix) => enabled.retain(|f| !f.starts_with(prefix)),
+                None => {
+                    enabled.remove(flag);
+                }
+            }
         }
         enabled.extend(self.global.iter().cloned());
 
+        // Expand a positive `prefix_*` token against IUSE, then re-apply the
+        // explicit `-prefix_value` negations so a wildcard cannot re-enable a
+        // value disabled later in token order.
+        expand_use_wildcards(&mut enabled, iuse);
+        for flag in &self.global_disabled {
+            if family_prefix(flag).is_none() {
+                enabled.remove(flag);
+            }
+        }
+
         // Repository-level `package.use` is applied beneath the profile cascade,
         // scoped to candidates from the owning repository.
-        apply_repo_pkg(&self.repo_pkg_use, pkg, &mut enabled);
+        apply_repo_pkg(&self.repo_pkg_use, pkg, &mut enabled, &self.interner);
         for entry in self.pkg_use.applied() {
-            if entry.atom.matches(pkg) {
+            if entry.pattern.matches(pkg, &self.interner) {
                 for (flag, enable) in &entry.mods {
                     if *enable {
                         enabled.insert(flag.clone());
@@ -552,9 +588,10 @@ fn apply_repo_pkg(
     entries: &[(Symbol, PkgUseEntry)],
     pkg: &PackageRef<'_>,
     enabled: &mut BTreeSet<String>,
+    interner: &Interner,
 ) {
     for (repo, entry) in entries {
-        if pkg.repo == Some(*repo) && entry.atom.matches(pkg) {
+        if pkg.repo == Some(*repo) && entry.pattern.matches(pkg, interner) {
             for (flag, enable) in &entry.mods {
                 if *enable {
                     enabled.insert(flag.clone());
@@ -595,13 +632,13 @@ impl UseManager {
             }
         }
         for (repo, entry) in repo_entries {
-            if pkg.repo == Some(*repo) && entry.atom.matches(pkg) {
+            if pkg.repo == Some(*repo) && entry.pattern.matches(pkg, &self.interner) {
                 apply_entry(&mut set, entry);
             }
         }
         if stable {
             for (repo, entry) in repo_stable_entries {
-                if pkg.repo == Some(*repo) && entry.atom.matches(pkg) {
+                if pkg.repo == Some(*repo) && entry.pattern.matches(pkg, &self.interner) {
                     apply_entry(&mut set, entry);
                 }
             }
@@ -613,13 +650,13 @@ impl UseManager {
                 apply_tokens(&mut set, &signed.stable_global);
             }
             for entry in &signed.pkg {
-                if entry.atom.matches(pkg) {
+                if entry.pattern.matches(pkg, &self.interner) {
                     apply_entry(&mut set, entry);
                 }
             }
             if stable {
                 for entry in &signed.stable_pkg {
-                    if entry.atom.matches(pkg) {
+                    if entry.pattern.matches(pkg, &self.interner) {
                         apply_entry(&mut set, entry);
                     }
                 }
@@ -629,25 +666,44 @@ impl UseManager {
     }
 }
 
-/// A specificity score for ordering `package.use` entries (more specific last).
-fn specificity(atom: &Atom) -> u32 {
-    let mut score = 0;
-    if atom.version().is_some() {
-        score += 4;
+/// The `prefix_` a `prefix_*` family-wildcard USE token expands, or `None` when
+/// `flag` is not a `_*`-suffixed wildcard. The trailing `_` keeps a bare `*`
+/// (which would clear every flag) from being treated as a family wildcard.
+fn family_prefix(flag: &str) -> Option<&str> {
+    flag.strip_suffix('*').filter(|p| p.ends_with('_'))
+}
+
+/// Expand each positive `prefix_*` token already enabled against the package
+/// `iuse`: enable every IUSE flag whose name begins with `prefix_` and drop the
+/// literal wildcard, but keep the literal when no IUSE flag matches so an unset
+/// USE_EXPAND group still triggers, mirroring `config.py`'s `linguas_*`
+/// fallback.
+fn expand_use_wildcards(enabled: &mut BTreeSet<String>, iuse: &[String]) {
+    let wildcards: Vec<String> = enabled
+        .iter()
+        .filter(|f| family_prefix(f).is_some())
+        .cloned()
+        .collect();
+    for wild in wildcards {
+        let prefix = family_prefix(&wild).expect("filtered to wildcards");
+        let mut matched = false;
+        for raw in iuse {
+            let name = raw.trim_start_matches(['+', '-']);
+            if name.starts_with(prefix) {
+                enabled.insert(name.to_owned());
+                matched = true;
+            }
+        }
+        if matched {
+            enabled.remove(&wild);
+        }
     }
-    if atom.slot().is_some() {
-        score += 2;
-    }
-    if atom.repo().is_some() {
-        score += 1;
-    }
-    score
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moraine_atom::Atom;
+    use crate::visibility::parse_mask_pattern;
     use moraine_common::Interner;
     use moraine_eapi::features_for_level;
     use moraine_version::Version;
@@ -765,7 +821,7 @@ mod tests {
         let mut mgr = UseManager::new(vec![], BTreeSet::new());
         mgr.add_pkg_use(
             PkgUseEntry {
-                atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
+                pattern: parse_mask_pattern("a/b", &i, moraine_eapi::PERMISSIVE).unwrap(),
                 mods: vec![("native-symlinks".to_owned(), false)],
             },
             UseLayer::User,
@@ -860,7 +916,7 @@ mod tests {
         let mgr =
             UseManager::new(vec!["ssl".into()], BTreeSet::new()).with_nodes(vec![node_with(|n| {
                 n.add_pkg_mask(PkgUseEntry {
-                    atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
+                    pattern: parse_mask_pattern("a/b", &i, moraine_eapi::PERMISSIVE).unwrap(),
                     mods: vec![("ssl".into(), true)],
                 });
             })]);
@@ -883,7 +939,7 @@ mod tests {
         let v = Version::parse("1.0").unwrap();
         let mgr = UseManager::new(vec![], BTreeSet::new()).with_nodes(vec![node_with(|n| {
             n.add_pkg_force(PkgUseEntry {
-                atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
+                pattern: parse_mask_pattern("a/b", &i, moraine_eapi::PERMISSIVE).unwrap(),
                 mods: vec![("forced".into(), true)],
             });
         })]);
@@ -906,7 +962,7 @@ mod tests {
         let mgr =
             UseManager::new(vec!["exp".into()], BTreeSet::new()).with_nodes(vec![node_with(|n| {
                 n.add_pkg_stable_mask(PkgUseEntry {
-                    atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
+                    pattern: parse_mask_pattern("a/b", &i, moraine_eapi::PERMISSIVE).unwrap(),
                     mods: vec![("exp".into(), true)],
                 });
             })]);
@@ -930,7 +986,7 @@ mod tests {
         // global use.mask `-clang` pops that mask.
         let base = node_with(|n| {
             n.add_pkg_mask(PkgUseEntry {
-                atom: Atom::parse("a/b", moraine_eapi::PERMISSIVE, &i).unwrap(),
+                pattern: parse_mask_pattern("a/b", &i, moraine_eapi::PERMISSIVE).unwrap(),
                 mods: vec![("clang".into(), true)],
             });
         });
@@ -951,14 +1007,14 @@ mod tests {
         let mut mgr = UseManager::new(vec![], BTreeSet::new());
         mgr.add_pkg_use(
             PkgUseEntry {
-                atom: Atom::parse("dev-libs/foo", f, &i).unwrap(),
+                pattern: parse_mask_pattern("dev-libs/foo", &i, f).unwrap(),
                 mods: vec![("ssl".into(), true)],
             },
             UseLayer::User,
         );
         mgr.add_pkg_use(
             PkgUseEntry {
-                atom: Atom::parse(">=dev-libs/foo-2", f, &i).unwrap(),
+                pattern: parse_mask_pattern(">=dev-libs/foo-2", &i, f).unwrap(),
                 mods: vec![("ssl".into(), false)],
             },
             UseLayer::User,
@@ -977,7 +1033,7 @@ mod tests {
         // A more specific profile entry enables foo.
         mgr.add_pkg_use(
             PkgUseEntry {
-                atom: Atom::parse("=cat/pkg-1.0", f, &i).unwrap(),
+                pattern: parse_mask_pattern("=cat/pkg-1.0", &i, f).unwrap(),
                 mods: vec![("foo".into(), true)],
             },
             UseLayer::Profile,
@@ -985,7 +1041,7 @@ mod tests {
         // A less specific user entry disables it.
         mgr.add_pkg_use(
             PkgUseEntry {
-                atom: Atom::parse("cat/pkg", f, &i).unwrap(),
+                pattern: parse_mask_pattern("cat/pkg", &i, f).unwrap(),
                 mods: vec![("foo".into(), false)],
             },
             UseLayer::User,
@@ -1008,5 +1064,82 @@ mod tests {
         // RESTRICT=test re-disables the injected flag.
         let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false, true);
         assert!(!eff.enabled.contains("test"));
+    }
+
+    /// Build a manager from a global USE configuration derived from `e`.
+    fn manager_from_env(e: &VarMap) -> UseManager {
+        let g = global_use(e);
+        UseManager::new(g.enabled, g.hidden).with_disabled(g.disabled)
+    }
+
+    #[test]
+    fn flatten_negative_use_expand_value_keeps_sign_ahead_of_prefix() {
+        let e = env(&[
+            ("USE_EXPAND", "PYTHON_TARGETS"),
+            ("PYTHON_TARGETS", "python3_12 -python3_9"),
+        ]);
+        let (flags, _) = flatten_use_expand(&e);
+        assert!(flags.contains(&"python_targets_python3_12".to_owned()));
+        assert!(flags.contains(&"-python_targets_python3_9".to_owned()));
+        assert!(!flags.iter().any(|f| f == "python_targets_-python3_9"));
+        // The effective USE drops the negated value.
+        let mgr = manager_from_env(&e);
+        let i = Interner::new();
+        let v = Version::parse("1.0").unwrap();
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false, false);
+        assert!(eff.enabled.contains("python_targets_python3_12"));
+        assert!(!eff.enabled.contains("python_targets_python3_9"));
+    }
+
+    #[test]
+    fn negative_wildcard_clears_use_expand_family() {
+        // CPU_FLAGS_X86 seeds two flags; `-cpu_flags_x86_*` clears the family.
+        let e = env(&[
+            ("USE_EXPAND", "CPU_FLAGS_X86"),
+            ("CPU_FLAGS_X86", "mmx sse"),
+            ("USE", "-cpu_flags_x86_*"),
+        ]);
+        let mgr = manager_from_env(&e);
+        let i = Interner::new();
+        let v = Version::parse("1.0").unwrap();
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false, false);
+        assert!(!eff.enabled.contains("cpu_flags_x86_mmx"));
+        assert!(!eff.enabled.contains("cpu_flags_x86_sse"));
+    }
+
+    #[test]
+    fn positive_wildcard_expands_against_iuse() {
+        // `linguas_*` enables every linguas_ IUSE flag, then `-linguas_en`
+        // disables one.
+        let e = env(&[("USE", "linguas_* -linguas_en")]);
+        let mgr = manager_from_env(&e);
+        let i = Interner::new();
+        let v = Version::parse("1.0").unwrap();
+        let iuse = vec!["linguas_en".to_owned(), "linguas_de".to_owned()];
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &iuse, false, false);
+        assert!(eff.enabled.contains("linguas_de"));
+        assert!(!eff.enabled.contains("linguas_en"));
+        // The literal wildcard does not leak into the effective USE.
+        assert!(!eff.enabled.contains("linguas_*"));
+    }
+
+    #[test]
+    fn negative_wildcard_then_explicit_value_selects_one() {
+        // A seeded single target is cleared by `-python_single_target_*`, then a
+        // single explicit value is selected.
+        let e = env(&[
+            ("USE_EXPAND", "PYTHON_SINGLE_TARGET"),
+            ("PYTHON_SINGLE_TARGET", "python3_11"),
+            (
+                "USE",
+                "-python_single_target_* python_single_target_python3_12",
+            ),
+        ]);
+        let mgr = manager_from_env(&e);
+        let i = Interner::new();
+        let v = Version::parse("1.0").unwrap();
+        let eff = mgr.effective_use(&pkg(&i, "a", "b", &v), &[], false, false);
+        assert!(eff.enabled.contains("python_single_target_python3_12"));
+        assert!(!eff.enabled.contains("python_single_target_python3_11"));
     }
 }

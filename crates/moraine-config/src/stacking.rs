@@ -65,7 +65,13 @@ where
                 acc.clear();
                 disabled.clear();
             } else if let Some(rest) = token.strip_prefix('-') {
-                acc.retain(|existing| existing != rest);
+                // A `-prefix_*` clears the whole family seeded earlier in token
+                // order (for example flattened USE_EXPAND values), not just a
+                // single matching flag.
+                match rest.strip_suffix('*').filter(|p| p.ends_with('_')) {
+                    Some(prefix) => acc.retain(|existing| !existing.starts_with(prefix)),
+                    None => acc.retain(|existing| existing != rest),
+                }
                 disabled.insert(rest.to_owned());
             } else {
                 disabled.remove(token);

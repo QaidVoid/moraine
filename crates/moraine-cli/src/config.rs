@@ -324,7 +324,7 @@ impl ConfigContext {
                 .iter()
                 .map(|key| (key.clone(), env.get(key).map(str::to_owned)))
                 .collect();
-            env.merge_path(&make_conf)
+            env.merge_conf(&make_conf)
                 .map_err(ConfigLoadError::MakeConf)?;
             for (key, value) in saved {
                 match value {
