@@ -229,3 +229,70 @@ fn restricted_fetch_missing_fails_build() {
     // run for the ebuild's manual-download instructions.
     assert_eq!(runner.call_count(), 1);
 }
+
+#[test]
+fn required_use_violation_aborts_before_phases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let distdir = tmp.path().join("distdir");
+    let buildroot = tmp.path().join("buildroot");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&distdir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    let ebuild = repo.join("fixture-1.0.ebuild");
+    std::fs::write(&ebuild, "EAPI=8\n").unwrap();
+    let manifest = repo.join("Manifest");
+    std::fs::write(&manifest, "").unwrap();
+
+    let mut vars = BTreeMap::new();
+    vars.insert(
+        "PORTAGE_TMPDIR".to_string(),
+        buildroot.to_string_lossy().to_string(),
+    );
+
+    // `^^ ( ssl gnutls )` requires exactly one, but both are enabled.
+    let mut reduced = BTreeMap::new();
+    reduced.insert("REQUIRED_USE".to_string(), "^^ ( ssl gnutls )".to_string());
+
+    let package = PackageSpec {
+        ident: ident(),
+        ebuild_path: ebuild,
+        src_uri: String::new(),
+        defined_phases: vec![],
+        restrict: vec![],
+        slot: "0".into(),
+        subslot: None,
+        iuse: vec!["ssl".into(), "gnutls".into()],
+        keywords: vec![],
+        inherited: vec![],
+        reduced_meta: reduced,
+        manifest_path: manifest,
+    };
+
+    let mut use_flags = HashSet::new();
+    use_flags.insert("ssl".to_string());
+    use_flags.insert("gnutls".to_string());
+
+    let request = BuildRequest {
+        package,
+        config: ConfigEnv {
+            vars,
+            ..ConfigEnv::rooted([])
+        },
+        use_flags,
+        iuse_effective: vec![],
+        fetch: FetchConfig::new(&distdir),
+        run_tests: false,
+        require_digest: false,
+        namespace_support: NamespaceSupport::default(),
+        slot_bindings: Vec::new(),
+    };
+
+    let runner = FakeRunner::always_ok();
+    let err = moraine_build::build_package(&request, &runner);
+    assert!(matches!(
+        err,
+        Err(moraine_build::BuildError::RequiredUse { .. })
+    ));
+    // The build aborted before any phase or fetch ran.
+    assert_eq!(runner.call_count(), 0);
+}
