@@ -166,10 +166,23 @@ pub fn apply_use_expand_groups(flags: &mut [UseFlag], groups: &[UseExpandGroup])
     }
 }
 
-/// Whether to emit ANSI color: true only when stdout is an interactive terminal,
-/// so captured output (tests, pipes, redirects) stays plain.
+/// Whether ANSI color is currently enabled. Defaults to off, so all rendered
+/// output is plain and deterministic under tests (lib and integration) and in
+/// pipes. The binary turns it on once at startup via [`init_color`].
+static COLOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable ANSI color when stdout is an interactive terminal and `NO_COLOR` is
+/// unset. Called once by the binary at startup; tests never call it, so their
+/// rendered output stays plain regardless of whether the harness's stdout is a
+/// terminal.
+pub fn init_color() {
+    let on = std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
+    COLOR.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether to emit ANSI color.
 fn color_enabled() -> bool {
-    std::io::stdout().is_terminal()
+    COLOR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Wrap `text` in an ANSI color when color is enabled.

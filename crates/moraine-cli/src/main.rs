@@ -10,6 +10,7 @@ fn main() -> miette::Result<()> {
     };
 
     init_tracing(cli.is_verbose());
+    moraine_cli::render::init_color();
 
     if cli.demo_error {
         return Err(DemoError {
