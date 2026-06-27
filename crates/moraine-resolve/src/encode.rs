@@ -101,9 +101,19 @@ pub(crate) fn use_deps_satisfied(
     true
 }
 
-/// An any-of group reduced against USE: a list of branches, each branch a
-/// conjunction of atoms.
-pub(crate) type Group<'a> = Vec<Vec<&'a NormAtom>>;
+/// A branch of an any-of group: its plain (top-level) atoms, all required
+/// together, plus any nested any-of groups, each of which contributes one
+/// satisfied alternative when the branch is selected.
+pub(crate) struct Branch<'a> {
+    /// The branch's top-level atoms, required as a conjunction.
+    pub atoms: Vec<&'a NormAtom>,
+    /// Nested any-of groups inside the branch, preserved as their own
+    /// disjunctions rather than flattened into the branch's conjunction.
+    pub nested: Vec<Group<'a>>,
+}
+
+/// An any-of group reduced against USE: a list of branches.
+pub(crate) type Group<'a> = Vec<Branch<'a>>;
 
 /// A solver disjunction alternative: a target `(cp, slot)` key and the term that
 /// constrains its candidate versions.
@@ -149,21 +159,17 @@ fn reduce<'a>(
         DepNode::AnyOf(branches)
         | DepNode::ExactlyOneOf(branches)
         | DepNode::AtMostOneOf(branches) => {
-            // Each branch reduces to its own conjunction of atoms (nested groups
-            // inside a branch are flattened into the branch's atom list, which is
-            // an acceptable approximation for the common corpus).
+            // Each branch reduces to its top-level atoms plus any nested any-of
+            // groups. A nested `||` group inside a branch is kept as its own
+            // disjunction (mirroring `dep_zapdeps` recursing into nested lists)
+            // rather than flattened into the branch's conjunction.
             let mut group: Group<'a> = Vec::new();
             for b in branches {
                 let mut atoms: Vec<&NormAtom> = Vec::new();
                 let mut nested: Vec<Group<'a>> = Vec::new();
                 reduce(b, parent_use, &mut atoms, &mut nested);
-                for g in nested {
-                    for branch in g {
-                        atoms.extend(branch);
-                    }
-                }
-                if !atoms.is_empty() {
-                    group.push(atoms);
+                if !atoms.is_empty() || !nested.is_empty() {
+                    group.push(Branch { atoms, nested });
                 }
             }
             if !group.is_empty() {
@@ -206,6 +212,12 @@ pub(crate) struct Encoder<'a, S: ResolveSource> {
     pub branch_mask: &'a BTreeSet<String>,
     /// Collector for the `||` branch decisions made during this encoding pass.
     pub branch_points: &'a std::cell::RefCell<Vec<BranchPoint>>,
+    /// The `(cp, slot)` keys already pulled into the partial solution, seeded
+    /// from the previous solve's decisions and grown as forced alternatives are
+    /// chosen during this pass. A slotless atom prefers a key already present
+    /// here, mirroring Portage's `preferred_in_graph` bin so a second consumer
+    /// reuses an existing slot rather than installing a redundant one.
+    pub in_graph: &'a std::cell::RefCell<BTreeSet<String>>,
     /// USE-autounmask overrides seeded by the resolve layer: `cp` to its
     /// proposed enabled USE.
     pub use_overrides: &'a BTreeMap<String, BTreeSet<String>>,
@@ -427,9 +439,12 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
     /// first atom. Overlapping branches are reordered so the branch adding the
     /// fewest new slots is preferred. The chosen (first, after ordering) branch
     /// is emitted as a conjunction of all its atoms (so `|| ( ( a b ) c )` pulls
-    /// in both `a` and `b`), and its blockers are asserted. An any-of over every
-    /// satisfiable branch's leading atom is also emitted so the solver can fall
-    /// back to another branch on a learned conflict.
+    /// in both `a` and `b`), and its blockers are asserted. A nested `||` group
+    /// inside the chosen branch is preserved as its own disjunction rather than
+    /// flattened, so `|| ( ( a || ( b c ) ) d )` requires `a` together with one
+    /// of `b` or `c`. An any-of over every satisfiable branch's leading atom is
+    /// also emitted so the solver can fall back to another branch on a learned
+    /// conflict.
     fn encode_group(
         &self,
         group: &Group,
@@ -447,7 +462,7 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
             let mut blockers: Vec<&NormAtom> = Vec::new();
             let mut satisfiable = true;
             let mut any_required = false;
-            for atom in branch {
+            for atom in &branch.atoms {
                 if atom.blocker != BlockerKind::None {
                     blockers.push(atom);
                     continue;
@@ -468,6 +483,19 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
                         satisfiable = false;
                         break;
                     }
+                }
+            }
+            // A nested any-of group with no satisfiable branch makes this branch
+            // unsatisfiable; a branch carrying a nested group always requires an
+            // install, so the free-branch shortcut below does not apply to it.
+            if satisfiable && !branch.nested.is_empty() {
+                any_required = true;
+                if !branch
+                    .nested
+                    .iter()
+                    .all(|g| self.group_satisfiable(g, parent_use, features))
+                {
+                    satisfiable = false;
                 }
             }
             // A branch with no required atom (all provided, or pure blockers)
@@ -492,7 +520,7 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
         let same_cp = {
             let mut lead = branches
                 .iter()
-                .filter_map(|(idx, _, _)| Self::branch_lead_cp(&group[*idx]));
+                .filter_map(|(idx, _, _)| Self::branch_lead_cp(&group[*idx].atoms));
             match lead.next() {
                 Some(first) => lead.all(|cp| cp == first),
                 None => false,
@@ -501,7 +529,7 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
         let best: std::collections::HashMap<usize, Option<Version>> = if same_cp {
             branches
                 .iter()
-                .map(|(idx, _, _)| (*idx, self.branch_best_version(&group[*idx])))
+                .map(|(idx, _, _)| (*idx, self.branch_best_version(&group[*idx].atoms)))
                 .collect()
         } else {
             std::collections::HashMap::new()
@@ -539,7 +567,8 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
 
         // The chosen branch is the first after ordering and masking: emit its full
         // conjunction (every atom required) and assert its blockers.
-        let (_, chosen_atoms, chosen_blockers) = &branches[0];
+        let (chosen_idx, chosen_atoms, chosen_blockers) = &branches[0];
+        let chosen_idx = *chosen_idx;
         let chosen_leader_keys = leader_keys(chosen_atoms);
         // Record the decision so the resolve layer can mask this branch and force
         // the next one if the chosen branch conflicts downstream.
@@ -557,7 +586,55 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
                 conflicts.push(alt);
             }
         }
+        // Encode the chosen branch's nested any-of groups, each as its own
+        // disjunction, so an inner `||` is preserved rather than flattened.
+        for nested in &group[chosen_idx].nested {
+            self.encode_group(nested, parent_use, parent, clauses, conflicts, features)?;
+        }
         Ok(())
+    }
+
+    /// Whether an any-of group has at least one satisfiable branch: a branch
+    /// whose required atoms all have alternatives and whose nested groups are
+    /// each satisfiable.
+    fn group_satisfiable(
+        &self,
+        group: &Group,
+        parent_use: &BTreeSet<String>,
+        features: EapiFeatures,
+    ) -> bool {
+        group
+            .iter()
+            .any(|branch| self.branch_satisfiable(branch, parent_use, features))
+    }
+
+    /// Whether a single any-of branch can be satisfied: every required atom has
+    /// at least one alternative and every nested group is satisfiable.
+    fn branch_satisfiable(
+        &self,
+        branch: &Branch,
+        parent_use: &BTreeSet<String>,
+        features: EapiFeatures,
+    ) -> bool {
+        for atom in &branch.atoms {
+            if atom.blocker != BlockerKind::None || self.atom_is_provided(atom) {
+                continue;
+            }
+            let available = if atom.cp.starts_with("virtual/") {
+                self.expand_virtual(atom, features).is_some()
+            } else {
+                !self
+                    .required_alternatives(atom, parent_use, features)
+                    .is_empty()
+            };
+            if !available {
+                return false;
+            }
+        }
+        branch
+            .nested
+            .iter()
+            .all(|g| self.group_satisfiable(g, parent_use, features))
     }
 
     /// Whether a branch requires installing at least one package not already
@@ -611,13 +688,21 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
         parent_use: &BTreeSet<String>,
         features: EapiFeatures,
     ) -> Vec<Alt> {
+        let installed = self.source.installed(&atom.cp);
         let mut by_slot: std::collections::BTreeMap<String, Vec<Version>> =
             std::collections::BTreeMap::new();
         for m in self.source.versions_of(&atom.cp) {
             if !version_satisfies(atom, &m.version) || !slot_matches(atom, &m) {
                 continue;
             }
-            if !self.source.is_visible(&m) {
+            // The installed version of a slot is always admitted as an
+            // alternative even when masked, so an already-satisfied dependency is
+            // not forced to change or downgraded (Portage's `_iter_match_pkgs_any`
+            // / `_downgrade_probe`); other masked versions stay excluded.
+            let installed_here = installed
+                .iter()
+                .any(|i| i.version == m.version && i.slot == m.slot);
+            if !self.source.is_visible(&m) && !installed_here {
                 continue;
             }
             let cand_use = self.effective_use(&m);
@@ -849,10 +934,11 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
             let mut groups: Vec<Group> = Vec::new();
             reduce(&vmeta.rdepend, &vuse, &mut atoms, &mut groups);
             let mut collected: Vec<&NormAtom> = atoms;
-            for g in groups {
-                for branch in g {
-                    collected.extend(branch);
-                }
+            // Every provider, including those inside a nested `||`, becomes a
+            // provider alternative, preserving the inner disjunction rather than
+            // dropping it.
+            for g in &groups {
+                flatten_group_atoms(g, &mut collected);
             }
             for pa in collected {
                 if pa.cp.starts_with("virtual/") {
@@ -888,32 +974,86 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
     }
 
     /// Push a disjunction over alternatives, forcing the most-preferred as a
-    /// positive requirement so the solver selects it, with the full disjunction
-    /// kept as a fallback for conflict-driven branch switching.
+    /// positive requirement so the solver selects it, with the disjunction over
+    /// the non-masked alternatives kept as a fallback for conflict-driven
+    /// switching.
     ///
     /// The generic solver only decides packages that are positively required, so
     /// a bare disjunction (whose alternatives appear only as negative terms)
     /// would never drive a selection. Following `dep_zapdeps`, the encoder forces
     /// one alternative using its preference bins: an alternative whose
-    /// `(cp, slot)` is already installed (preferred-installed) is chosen first;
-    /// otherwise the leading alternative, which `to_alternatives` has already
-    /// ordered highest-version-first (upgrade promotion). The graph-aware
-    /// "preferred-in-graph" bin has no analogue here, since the encoder runs
-    /// without access to the solver's partial solution.
+    /// `(cp, slot)` is already in the partial graph (preferred-in-graph) is
+    /// chosen first, then one whose `(cp, slot)` is installed
+    /// (preferred-installed), then the leading alternative, which
+    /// `to_alternatives` has already ordered highest-version-first (upgrade
+    /// promotion).
+    ///
+    /// An alternative the resolve layer has masked after a downstream conflict is
+    /// dropped from the choice, and a multi-alternative disjunction records a
+    /// [`BranchPoint`] so the resolve layer can mask the forced slot and fall
+    /// back to a lower one, exactly as it relaxes a `||` branch.
     fn push_disjunction(&self, clauses: &mut Vec<Clause<String, Version>>, alternatives: Vec<Alt>) {
-        let preferred = alternatives
-            .iter()
-            .find(|(key, _)| {
-                crate::provider::split_key(key)
-                    .map(|(cp, slot)| self.source.installed(cp).iter().any(|i| i.slot == slot))
-                    .unwrap_or(false)
-            })
-            .or_else(|| alternatives.first());
-        if let Some((cp, term)) = preferred {
-            clauses.push(Clause::single(cp.clone(), term.clone()));
+        if alternatives.is_empty() {
+            return;
         }
-        if alternatives.len() > 1 {
-            clauses.push(Clause::any_of(alternatives));
+        // Drop alternatives whose `(cp, slot)` the resolve layer has masked, so a
+        // re-solve forces a different slot. If every alternative is masked, fall
+        // back to all of them so the request still drives a selection.
+        let live: Vec<usize> = (0..alternatives.len())
+            .filter(|&i| !self.branch_mask.contains(&alternatives[i].0))
+            .collect();
+        let pool: Vec<usize> = if live.is_empty() {
+            (0..alternatives.len()).collect()
+        } else {
+            live
+        };
+
+        let in_graph = self.in_graph.borrow();
+        let pick = pool
+            .iter()
+            .copied()
+            .find(|&i| in_graph.contains(&alternatives[i].0))
+            .or_else(|| {
+                pool.iter().copied().find(|&i| {
+                    crate::provider::split_key(&alternatives[i].0)
+                        .map(|(cp, slot)| self.source.installed(cp).iter().any(|x| x.slot == slot))
+                        .unwrap_or(false)
+                })
+            })
+            .or_else(|| pool.first().copied());
+        drop(in_graph);
+
+        if let Some(i) = pick {
+            let (key, term) = &alternatives[i];
+            clauses.push(Clause::single(key.clone(), term.clone()));
+            // Record the forced slot in the graph so a later consumer of the same
+            // slotless atom reuses it rather than adding a redundant slot.
+            self.in_graph.borrow_mut().insert(key.clone());
+            // A multi-slot atom's forced slot is relaxable: record it so the
+            // resolve layer can mask it and re-solve onto a lower slot.
+            if alternatives.len() > 1 {
+                self.branch_points.borrow_mut().push(BranchPoint {
+                    chosen_leader_keys: std::iter::once(key.clone()).collect(),
+                    has_fallback: pool.len() > 1,
+                });
+            }
+        }
+        if pool.len() > 1 {
+            let alts: Vec<Alt> = pool.iter().map(|&i| alternatives[i].clone()).collect();
+            clauses.push(Clause::any_of(alts));
+        }
+    }
+}
+
+/// Collect every atom of an any-of group, descending through nested groups, into
+/// a flat alternative list. Virtual provider expansion treats a nested `||`
+/// group as additional provider alternatives, so the inner disjunction is
+/// preserved rather than dropped.
+fn flatten_group_atoms<'b>(group: &Group<'b>, out: &mut Vec<&'b NormAtom>) {
+    for branch in group {
+        out.extend(branch.atoms.iter().copied());
+        for nested in &branch.nested {
+            flatten_group_atoms(nested, out);
         }
     }
 }

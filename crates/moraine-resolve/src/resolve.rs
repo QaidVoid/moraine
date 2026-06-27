@@ -136,6 +136,10 @@ pub fn resolve_with<S: ResolveSource>(
     // `||` branch-leader keys masked so far, and a count of the fallback re-solves.
     let mut branch_mask: BTreeSet<String> = BTreeSet::new();
     let mut branch_fallbacks = 0u32;
+    // The `(cp, slot)` keys decided by the previous solve, threaded into the next
+    // so a slotless atom reuses a slot already in the graph rather than forcing a
+    // redundant one (Portage's `preferred_in_graph`).
+    let mut in_graph: BTreeSet<String> = BTreeSet::new();
     // USE-autounmask overrides accumulated so far (`cp` to proposed enabled USE)
     // and the per-flag changes to report, plus a count of the re-solves.
     let mut use_overrides: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -150,6 +154,7 @@ pub fn resolve_with<S: ResolveSource>(
             all_atoms,
             modifiers,
             branch_mask.clone(),
+            in_graph.clone(),
             use_overrides.clone(),
         );
 
@@ -187,6 +192,10 @@ pub fn resolve_with<S: ResolveSource>(
                 });
             }
         };
+
+        // Carry the decided `(cp, slot)` keys into any re-solve, so a slotless
+        // atom prefers a slot already chosen rather than a redundant higher one.
+        in_graph = decisions.keys().cloned().collect();
 
         // USE-autounmask: fold any newly proposed USE override into the
         // accumulated set and re-solve, so the candidate's own dependencies are

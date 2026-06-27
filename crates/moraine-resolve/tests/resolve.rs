@@ -1457,3 +1457,137 @@ fn use_autounmask_skips_locked_flag() {
         "a locked flag cannot be toggled, so the dependency is unsatisfiable"
     );
 }
+
+#[test]
+fn masked_installed_higher_version_is_not_downgraded() {
+    // The installed cat/foo-3 is masked and the only visible candidate in the
+    // slot is the lower cat/foo-2. The resolver must keep cat/foo-3 rather than
+    // downgrade to cat/foo-2, mirroring Portage's _downgrade_probe (a downgrade
+    // is permitted only when no available candidate is >= the installed one).
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/foo",
+        version: "3",
+        visible: false,
+        ..Default::default()
+    });
+    f.add(pkg("cat/foo", "2"));
+    f.add_installed(installed("cat/foo", "3", "0", None, &[]));
+
+    let sol = resolve(&f, &["cat/foo"]).expect("resolves");
+    assert_eq!(
+        sol.package("cat/foo").unwrap().version.as_str(),
+        "3",
+        "the masked installed higher version is kept, not downgraded to 2"
+    );
+}
+
+#[test]
+fn slotless_atom_falls_back_to_lower_slot() {
+    // cat/pkg:2 (the highest slot) forces =cat/lib-1, conflicting with cat/main's
+    // own =cat/lib-2; cat/pkg:1 is satisfiable. The slotless atom must fall back
+    // to slot 1 rather than report the request unsatisfiable.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/main",
+        version: "1",
+        depend: "=cat/lib-2",
+        rdepend: "cat/pkg",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "cat/pkg",
+        version: "2",
+        slot: "2",
+        depend: "=cat/lib-1",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "cat/pkg",
+        version: "1",
+        slot: "1",
+        ..Default::default()
+    });
+    f.add(pkg("cat/lib", "1"));
+    f.add(pkg("cat/lib", "2"));
+
+    let sol = resolve(&f, &["cat/main"]).expect("resolves to the lower slot");
+    let chosen = sol.package("cat/pkg").expect("cat/pkg selected");
+    assert_eq!(chosen.slot, "1", "the lower satisfiable slot is chosen");
+    assert_eq!(
+        sol.package("cat/lib")
+            .expect("cat/lib selected")
+            .version
+            .as_str(),
+        "2",
+        "the consistent cat/lib-2 is kept"
+    );
+}
+
+#[test]
+fn second_consumer_reuses_in_graph_slot() {
+    // A slotted requirement pulls cat/pkg:1 into the graph; a later slotless
+    // requirement must reuse that in-graph slot rather than add a redundant
+    // higher slot 2, mirroring Portage's preferred_in_graph bin.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/pkg",
+        version: "1",
+        slot: "1",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "cat/pkg",
+        version: "2",
+        slot: "2",
+        ..Default::default()
+    });
+
+    let sol = resolve(&f, &["cat/pkg:1", "cat/pkg"]).expect("resolves");
+    let pkgs: Vec<_> = sol.packages.iter().filter(|p| p.cp == "cat/pkg").collect();
+    assert_eq!(
+        pkgs.len(),
+        1,
+        "exactly one slot of cat/pkg is installed: {pkgs:?}"
+    );
+    assert_eq!(pkgs[0].slot, "1", "the in-graph slot 1 is reused");
+}
+
+#[test]
+fn nested_inner_disjunction_is_preserved() {
+    // `|| ( ( cat/a || ( cat/b cat/c ) ) cat/d )`: selecting the first branch
+    // requires cat/a together with one of cat/b or cat/c, not both. With cat/b
+    // absent the inner disjunction is satisfied by cat/c, so the first branch is
+    // chosen. The old flatten turned the branch into cat/a AND cat/b AND cat/c,
+    // which (cat/b absent) would have dropped the branch and fallen back to
+    // cat/d.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/main",
+        version: "1",
+        rdepend: "|| ( ( cat/a || ( cat/b cat/c ) ) cat/d )",
+        ..Default::default()
+    });
+    f.add(pkg("cat/a", "1"));
+    // cat/b is intentionally absent so the inner disjunction must use cat/c.
+    f.add(pkg("cat/c", "1"));
+    f.add(pkg("cat/d", "1"));
+
+    let sol = resolve(&f, &["cat/main"]).expect("resolves");
+    assert!(
+        sol.package("cat/a").is_some(),
+        "the first branch's cat/a is pulled in"
+    );
+    assert!(
+        sol.package("cat/c").is_some(),
+        "the inner disjunction is satisfied by cat/c"
+    );
+    assert!(
+        sol.package("cat/b").is_none(),
+        "cat/b is absent and not required"
+    );
+    assert!(
+        sol.package("cat/d").is_none(),
+        "the first branch is chosen, so the cat/d fallback is not used"
+    );
+}

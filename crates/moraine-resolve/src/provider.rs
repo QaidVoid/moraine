@@ -8,9 +8,13 @@
 //! a solver conflict.
 //!
 //! `candidates` enumerates versions from the source, filters by the accumulated
-//! range and by visibility, and ranks them in Portage `dep_zapdeps` order
-//! (installed-slot match first, then upgrades), with a relaxed second pass that
-//! includes masked-installed candidates when the strict pass is empty.
+//! range, and ranks them in Portage `dep_zapdeps` order (installed-slot match
+//! first, then upgrades). The installed version of a slot is always offered as a
+//! candidate even when it is masked, so an already-satisfied dependency is never
+//! forced to change and a masked installed higher version is not downgraded to a
+//! lower visible one (Portage's `_iter_match_pkgs_any` and `_downgrade_probe`),
+//! with an autounmask pass that admits soft-masked candidates when nothing else
+//! satisfies the atom.
 //!
 //! `dependencies` reduces the version's USE-conditional groups against its
 //! resolved USE, encodes the result into solver requirements, enforces
@@ -57,6 +61,10 @@ pub struct GentooProvider<'s, S: ResolveSource> {
     branch_mask: BTreeSet<String>,
     /// The `||` branch decisions made during the most recent encoding pass.
     branch_points: std::cell::RefCell<Vec<crate::encode::BranchPoint>>,
+    /// The `(cp, slot)` keys already pulled into the partial solution, seeded
+    /// from the previous solve's decisions and grown as the current pass forces
+    /// alternatives. A slotless atom prefers a key already present here.
+    in_graph: std::cell::RefCell<BTreeSet<String>>,
     /// USE-autounmask overrides seeded by the resolve layer: `cp` to its
     /// proposed enabled USE, consulted by [`Self::effective_use`] in place of
     /// `source.resolved_use`.
@@ -75,19 +83,22 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
             modifiers: crate::resolve::Modifiers::default(),
             branch_mask: BTreeSet::new(),
             branch_points: std::cell::RefCell::new(Vec::new()),
+            in_graph: std::cell::RefCell::new(BTreeSet::new()),
             use_overrides: BTreeMap::new(),
             use_proposals: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     /// Create a provider whose synthetic root depends on the given request
-    /// atoms, masking the given `||` branch-leader keys and seeding the given
-    /// USE-autounmask overrides.
+    /// atoms, masking the given `||` branch-leader keys, seeding the given
+    /// in-graph `(cp, slot)` keys, and seeding the given USE-autounmask
+    /// overrides.
     pub(crate) fn with_request(
         source: &'s S,
         request: Vec<crate::depnode::NormAtom>,
         modifiers: crate::resolve::Modifiers,
         branch_mask: BTreeSet<String>,
+        in_graph: BTreeSet<String>,
         use_overrides: BTreeMap<String, BTreeSet<String>>,
     ) -> Self {
         GentooProvider {
@@ -96,6 +107,7 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
             modifiers,
             branch_mask,
             branch_points: std::cell::RefCell::new(Vec::new()),
+            in_graph: std::cell::RefCell::new(in_graph),
             use_overrides,
             use_proposals: std::cell::RefCell::new(Vec::new()),
         }
@@ -139,16 +151,34 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
     fn ranked_candidates(&self, cp: &str, slot: &str, range: &Range<Version>) -> Vec<Version> {
         let installed = self.source.installed(cp);
 
-        // Strict pass: only visible candidates of this slot.
+        // Candidate pass: visible versions of this slot, plus the installed
+        // version of this slot even when masked, so long as the repository still
+        // carries it. Portage always offers the installed package as a candidate
+        // (`_iter_match_pkgs_any`), so an already-satisfied dependency is never
+        // forced to change. Offering the installed version also avoids a
+        // downgrade: when every visible candidate is strictly lower than the
+        // installed one, the installed version stays in the set and ranks first,
+        // matching `_downgrade_probe`, which permits a downgrade only when no
+        // available package is greater than or equal to the installed one.
         let mut strict: Vec<PackageMeta> = self
             .source
             .versions_of(cp)
             .into_iter()
-            .filter(|m| m.slot == slot && range.contains(&m.version) && self.source.is_visible(m))
+            .filter(|m| {
+                m.slot == slot
+                    && range.contains(&m.version)
+                    && (self.source.is_visible(m)
+                        || installed
+                            .iter()
+                            .any(|i| i.version == m.version && i.slot == m.slot))
+            })
             .collect();
 
         if strict.is_empty() {
-            // Relaxed pass: include masked-installed candidates of this slot.
+            // Autounmask pass: include soft-masked (keyword/license) candidates so
+            // the solver can resolve through them. The required acceptance change
+            // is reported after resolution; hard-masked (`package.mask`) versions
+            // stay excluded.
             let mut relaxed: Vec<PackageMeta> = self
                 .source
                 .versions_of(cp)
@@ -156,27 +186,9 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
                 .filter(|m| {
                     m.slot == slot
                         && range.contains(&m.version)
-                        && installed
-                            .iter()
-                            .any(|i| i.version == m.version && i.slot == m.slot)
+                        && self.source.acceptability(m).is_autounmaskable()
                 })
                 .collect();
-            if relaxed.is_empty() {
-                // Autounmask pass: include soft-masked (keyword/license)
-                // candidates so the solver can resolve through them. The required
-                // acceptance change is reported after resolution; hard-masked
-                // (`package.mask`) versions stay excluded.
-                relaxed = self
-                    .source
-                    .versions_of(cp)
-                    .into_iter()
-                    .filter(|m| {
-                        m.slot == slot
-                            && range.contains(&m.version)
-                            && self.source.acceptability(m).is_autounmaskable()
-                    })
-                    .collect();
-            }
             relaxed.sort_by(|a, b| {
                 let ab = self.source.has_binary(cp, &a.version);
                 let bb = self.source.has_binary(cp, &b.version);
@@ -188,7 +200,9 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
         // Prefer the version installed in this slot (Portage's default keeps an
         // installed package rather than needlessly upgrading or downgrading it),
         // then the highest version. Under `--update` the installed-version
-        // preference is dropped so the highest visible version wins.
+        // preference is dropped so the highest available version wins; an
+        // installed version higher than every visible one still ranks first
+        // there, since it is the highest candidate, so it is not downgraded.
         let installed_versions: BTreeSet<Version> = installed
             .iter()
             .filter(|i| i.slot == slot)
@@ -238,6 +252,7 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
                 source: self.source,
                 branch_mask: &self.branch_mask,
                 branch_points: &self.branch_points,
+                in_graph: &self.in_graph,
                 use_overrides: &self.use_overrides,
                 use_proposals: &self.use_proposals,
             };
@@ -260,6 +275,7 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
             source: self.source,
             branch_mask: &self.branch_mask,
             branch_points: &self.branch_points,
+            in_graph: &self.in_graph,
             use_overrides: &self.use_overrides,
             use_proposals: &self.use_proposals,
         };
