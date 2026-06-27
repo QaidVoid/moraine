@@ -41,7 +41,7 @@ use crate::error::{RepoError, Result};
 
 /// The on-disk format version. Bump when the encoding or the AST semantics
 /// baked into the import change, which forces a full reimport.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The magic tag identifying a Moraine metadata store.
 pub const MAGIC: [u8; 8] = *b"MORAREPO";
@@ -104,6 +104,13 @@ pub struct StoredEntry {
     pub mtime: String,
     /// The source cache file's `_md5_`, used for incremental reimport.
     pub md5: String,
+    /// The source cache file's `_eclasses_` value, as tab-separated
+    /// `name<TAB>md5hex` pairs. Used to invalidate incremental reuse when an
+    /// inherited eclass is bumped: the ebuild `_md5_` is unchanged by an eclass
+    /// bump, so the recorded eclass-md5 set is the second half of the validity
+    /// key the importer checks before reusing a previous entry.
+    #[serde(default)]
+    pub eclasses: String,
 }
 
 /// The complete on-disk document.
@@ -454,6 +461,7 @@ mod tests {
             inherited: vec!["toolchain".to_owned(), "multilib".to_owned()],
             mtime: "1700000000".to_owned(),
             md5: "deadbeef".to_owned(),
+            eclasses: "toolchain\tabc123\tmultilib\tdef456".to_owned(),
         }
     }
 
@@ -543,6 +551,38 @@ mod tests {
             }
             other => panic!("expected version mismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn previous_format_version_forces_rebuild() {
+        // A store written before the eclass-provenance field carried the prior
+        // format version; loading it must signal a rebuild rather than read it.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.mrepo");
+        let doc = OnDisk {
+            magic: MAGIC,
+            format_version: FORMAT_VERSION - 1,
+            checksum: String::new(),
+            entries: vec![],
+        };
+        let bytes = rmp_serde::to_vec(&doc).unwrap();
+        moraine_common::fs::atomic_write(&path, &bytes).unwrap();
+        match LoadedStore::load(&path) {
+            Err(RepoError::FormatVersionMismatch { found, expected }) => {
+                assert_eq!(found, FORMAT_VERSION - 1);
+                assert_eq!(expected, FORMAT_VERSION);
+            }
+            other => panic!("expected version mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eclasses_provenance_survives_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("s.mrepo");
+        write_store(&path, vec![entry("dev-libs", "a", "1")]).unwrap();
+        let raw = read_entries(&path).unwrap();
+        assert_eq!(raw[0].eclasses, "toolchain\tabc123\tmultilib\tdef456");
     }
 
     #[test]

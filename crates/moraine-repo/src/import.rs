@@ -8,11 +8,13 @@
 //! [`crate::store::StoredEntry`] values for the metadata store.
 //!
 //! Import runs data-parallel across category and package directories with rayon.
-//! Reimport is incremental: an existing entry whose `_mtime_` and `_md5_` match
-//! the source cache file is reused unchanged, so only changed entries are
-//! re-parsed. Per-entry problems are collected as [`ImportIssue`] rather than
-//! aborting the whole import; ebuilds with no cache entry are recorded as
-//! missing metadata and never sourced.
+//! Reimport is incremental: an existing entry is reused unchanged only when its
+//! `_md5_` and its recorded `_eclasses_` md5 set both match the source cache
+//! file (plus `_mtime_` for an mtime-based cache), so an eclass-driven cache
+//! regeneration with an unchanged ebuild `_md5_` is re-read rather than reused
+//! and only changed entries are re-parsed. Per-entry problems are collected as
+//! [`ImportIssue`] rather than aborting the whole import; ebuilds with no cache
+//! entry are recorded as missing metadata and never sourced.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -83,6 +85,12 @@ pub enum ImportIssue {
     /// An md5-dict entry's `_md5_` did not match the md5 of the on-disk ebuild,
     /// so the entry is stale and excluded for gap regeneration.
     EbuildMd5Mismatch {
+        /// The `<cat>/<P-V>` identifier.
+        cpv: String,
+    },
+    /// A PMS flat_list cache file's mtime did not match the on-disk ebuild's
+    /// mtime, so the entry is stale and excluded for gap regeneration.
+    StaleFlatListMtime {
         /// The `<cat>/<P-V>` identifier.
         cpv: String,
     },
@@ -247,30 +255,54 @@ fn import_one(
     // digest is the ebuild's content md5, so a mismatch means the committed
     // cache is stale; the entry is excluded and reported for gap regeneration.
     // Scoped to the md5-dict format and to entries that carry a non-empty
-    // `_md5_`; the PMS flat_list format validates by mtime/eclass and carries
-    // no ebuild `_md5_`.
+    // `_md5_`; the PMS flat_list format carries no ebuild `_md5_` and is
+    // validated below by the cache-file-versus-ebuild mtime check instead.
+    let ebuild_path = cfg
+        .location
+        .join(category)
+        .join(&package)
+        .join(format!("{pv}.ebuild"));
     if matches!(format, CacheFormat::Md5Dict)
         && !md5.is_empty()
-        && let Ok(bytes) = std::fs::read(
-            cfg.location
-                .join(category)
-                .join(&package)
-                .join(format!("{pv}.ebuild")),
-        )
+        && let Ok(bytes) = std::fs::read(&ebuild_path)
         && moraine_common::hash::md5(&bytes) != md5
     {
         return EntryOutcome::Rejected(ImportIssue::EbuildMd5Mismatch { cpv });
     }
 
-    // Incremental reuse: the md5-dict format's validation digest is `_md5_`, so
-    // reuse a previous entry whose `_md5_` matches (real gentoo md5-cache entries
-    // carry `_md5_` but no `_mtime_`). An mtime-based cache additionally requires
-    // a matching non-empty `_mtime_`.
+    // Validate the PMS flat_list format by mtime, mirroring Portage's
+    // `validation_chf="mtime"` for the flat_hash database. egencache sets the
+    // cache file's mtime equal to the ebuild's mtime (`cache/metadata.py`), and
+    // `flat_hash._getitem` derives `_mtime_` from the cache file stat, so an
+    // entry whose cache-file mtime no longer equals the ebuild's mtime is stale.
+    // It is excluded and reported as a gap, the same as a md5-dict `_md5_`
+    // mismatch. The check is skipped when the ebuild is absent, mirroring the
+    // md5-dict path that validates only when the ebuild can be read.
+    if matches!(format, CacheFormat::Pms)
+        && let (Some(cache_mtime), Some(ebuild_mtime)) =
+            (mtime_secs(file), mtime_secs(&ebuild_path))
+        && cache_mtime != ebuild_mtime
+    {
+        return EntryOutcome::Rejected(ImportIssue::StaleFlatListMtime { cpv });
+    }
+
+    // Incremental reuse: the md5-dict validity key is both the ebuild content
+    // hash (`_md5_`) and the inherited eclass md5 set (`_eclasses_`), mirroring
+    // `cache/template.py:_validate_entry`. Reuse a previous entry only when its
+    // `_md5_` matches (real gentoo md5-cache entries carry `_md5_` but no
+    // `_mtime_`) AND its recorded eclass provenance matches the current cache
+    // file's `_eclasses_` set. Because `_md5_` is unchanged by an eclass bump,
+    // an eclass-driven egencache regeneration changes `_eclasses_` (and the
+    // regenerated `RDEPEND`/`IUSE`/`KEYWORDS`) while `_md5_` stays the same, so
+    // the eclass comparison forces a re-read instead of reusing stale metadata.
+    // An mtime-based cache additionally requires a matching non-empty `_mtime_`.
+    let current_eclasses = fields.get("_eclasses_").copied().unwrap_or_default();
     let key = (category.to_owned(), package.clone(), version.clone());
     if let Some(prev) = previous.get(&key) {
         let md5_ok = !md5.is_empty() && prev.md5 == md5;
+        let eclasses_ok = prev.eclasses == current_eclasses;
         let mtime_ok = mtime.is_empty() || (prev.mtime == mtime);
-        if md5_ok && mtime_ok {
+        if md5_ok && eclasses_ok && mtime_ok {
             return EntryOutcome::Kept(Box::new(prev.clone()));
         }
     }
@@ -357,6 +389,7 @@ fn import_one(
         inherited: tokens("INHERITED"),
         mtime,
         md5,
+        eclasses: current_eclasses.to_owned(),
     }))
 }
 
@@ -461,6 +494,17 @@ fn split_pv(pv: &str) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// The integer-second modification time of `path`, mirroring Portage's
+/// integer mtime comparison for the flat_hash cache. Returns `None` when the
+/// path cannot be stat'd.
+fn mtime_secs(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
 }
 
 /// List the paths inside a directory, returning a typed error on failure.
@@ -734,6 +778,92 @@ mod tests {
     }
 
     #[test]
+    fn eclass_regen_with_same_md5_reparsed() {
+        // An eclass bump regenerates the cache entry (new RDEPEND and a new
+        // `_eclasses_` md5 set) while the ebuild `_md5_` is unchanged. A previous
+        // entry whose recorded eclass provenance differs must not be reused; the
+        // regenerated RDEPEND must win.
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "gentoo");
+        let md5 = r.eclass("toolchain", "# bumped toolchain\n");
+        r.cache(
+            "dev-libs",
+            "a-1",
+            &format!(
+                "EAPI=8\nSLOT=0\nRDEPEND=dev-libs/new\n_eclasses_=toolchain\t{md5}\n_md5_=samehash\n"
+            ),
+        );
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[gentoo]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        let first = import_repo(&set, "gentoo", &HashMap::new()).unwrap();
+        assert_eq!(first.entries.len(), 1);
+
+        // Simulate the pre-bump store entry: same ebuild `_md5_`, a marker
+        // RDEPEND, but a stale recorded eclass provenance.
+        let mut prev = first.entries[0].clone();
+        prev.rdepend = "dev-libs/REUSED-MARKER".to_owned();
+        prev.eclasses = "toolchain\tstalemd5".to_owned();
+        let mut previous = HashMap::new();
+        previous.insert(
+            (
+                prev.category.clone(),
+                prev.package.clone(),
+                prev.version.clone(),
+            ),
+            prev,
+        );
+
+        let second = import_repo(&set, "gentoo", &previous).unwrap();
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(
+            second.entries[0].rdepend, "dev-libs/new",
+            "eclass-driven regen must be re-read, not reused"
+        );
+        assert_eq!(second.entries[0].eclasses, format!("toolchain\t{md5}"));
+    }
+
+    #[test]
+    fn reuse_when_md5_and_eclasses_match() {
+        // Matching `_md5_` and matching `_eclasses_` provenance: the previous
+        // entry is reused unchanged, even with a non-empty eclass set.
+        let tmp = TempDir::new().unwrap();
+        let r = RepoBuilder::new(tmp.path(), "gentoo");
+        let md5 = r.eclass("toolchain", "# toolchain\n");
+        r.cache(
+            "dev-libs",
+            "a-1",
+            &format!(
+                "EAPI=8\nSLOT=0\nRDEPEND=dev-libs/zlib\n_eclasses_=toolchain\t{md5}\n_md5_=h1\n"
+            ),
+        );
+        let conf = repos_conf(
+            tmp.path(),
+            &format!("[gentoo]\nlocation = {}\n", r.loc.display()),
+        );
+        let set = discover(&conf).unwrap();
+        let first = import_repo(&set, "gentoo", &HashMap::new()).unwrap();
+
+        // The previous entry's recorded eclasses already equal the current cache
+        // file's `_eclasses_` from the first import, so reuse must fire.
+        let mut prev = first.entries[0].clone();
+        prev.rdepend = "dev-libs/REUSED".to_owned();
+        let mut previous = HashMap::new();
+        previous.insert(
+            (
+                prev.category.clone(),
+                prev.package.clone(),
+                prev.version.clone(),
+            ),
+            prev,
+        );
+        let second = import_repo(&set, "gentoo", &previous).unwrap();
+        assert_eq!(second.entries[0].rdepend, "dev-libs/REUSED");
+    }
+
+    #[test]
     fn banned_eapi_rejected_and_default_eapi_applied() {
         let tmp = TempDir::new().unwrap();
         let r = RepoBuilder::new(tmp.path(), "gentoo");
@@ -762,6 +892,13 @@ mod tests {
         );
         let def = report.entries.iter().find(|e| e.package == "def").unwrap();
         assert_eq!(def.eapi, "0");
+    }
+
+    /// Set `path`'s modification time to `secs` seconds since the epoch.
+    fn set_mtime(path: &Path, secs: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
     }
 
     #[test]
@@ -793,12 +930,29 @@ mod tests {
             "",              // BDEPEND
             "8",             // EAPI
         ];
-        fs::write(cache.join("foo-1.2"), lines.join("\n")).unwrap();
+        let cache_file = cache.join("foo-1.2");
+        fs::write(&cache_file, lines.join("\n")).unwrap();
+        r.ebuild("dev-libs", "foo", "foo-1.2");
+        let ebuild_file = r.loc.join("dev-libs/foo/foo-1.2.ebuild");
         let conf = repos_conf(
             tmp.path(),
             &format!("[overlay]\nlocation = {}\n", r.loc.display()),
         );
         let set = discover(&conf).unwrap();
+
+        // Stale: the ebuild's mtime is later than the cache file's, so the entry
+        // is excluded and reported as a flat_list staleness gap.
+        set_mtime(&cache_file, 1000);
+        set_mtime(&ebuild_file, 2000);
+        let stale = import_repo(&set, "overlay", &HashMap::new()).unwrap();
+        assert!(stale.entries.iter().all(|e| e.package != "foo"));
+        assert!(stale.issues.iter().any(|i| matches!(
+            i,
+            ImportIssue::StaleFlatListMtime { cpv } if cpv == "dev-libs/foo-1.2"
+        )));
+
+        // Fresh: equal mtimes admit the entry with its parsed fields.
+        set_mtime(&ebuild_file, 1000);
         let report = import_repo(&set, "overlay", &HashMap::new()).unwrap();
         let e = report.entries.iter().find(|e| e.package == "foo").unwrap();
         assert_eq!(e.version, "1.2");
@@ -1029,6 +1183,7 @@ mod tests {
                 inherited: vec![],
                 mtime: "OLD".to_owned(),
                 md5: "OLD".to_owned(),
+                eclasses: String::new(),
             },
         );
         let report = import_repo(&set, "gentoo", &prev).unwrap();

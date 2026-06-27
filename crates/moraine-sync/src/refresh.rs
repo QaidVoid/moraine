@@ -158,8 +158,8 @@ impl MetadataRefresher for RepoRefresher<'_> {
 
 impl RepoRefresher<'_> {
     /// Regenerate the entries named by `MissingMetadata`/`StaleEclass`/
-    /// `EbuildMd5Mismatch` issues through the attached generator, merging each
-    /// result into `entries`
+    /// `EbuildMd5Mismatch`/`StaleFlatListMtime` issues through the attached
+    /// generator, merging each result into `entries`
     /// (replacing any same-`cpv` entry). Returns the number regenerated. With no
     /// generator this is a no-op and the gaps stay excluded.
     fn regenerate_gaps(
@@ -198,7 +198,8 @@ fn regenerate_into(
         let cpv = match issue {
             ImportIssue::MissingMetadata { cpv }
             | ImportIssue::StaleEclass { cpv, .. }
-            | ImportIssue::EbuildMd5Mismatch { cpv } => cpv,
+            | ImportIssue::EbuildMd5Mismatch { cpv }
+            | ImportIssue::StaleFlatListMtime { cpv } => cpv,
             _ => continue,
         };
         if let Some(result) = generator.generate(repo, cpv, prev_by_cpv.get(cpv.as_str()).copied())
@@ -325,6 +326,27 @@ mod tests {
         let issues = vec![ImportIssue::StaleEclass {
             cpv: "dev-libs/foo-1".to_owned(),
             eclass: "toolchain".to_owned(),
+        }];
+        let mut stale = entry("dev-libs", "foo", "1");
+        stale.rdepend = "dev-libs/old".to_owned();
+        let mut entries = vec![stale];
+        let n = regenerate_into(&fake, "gentoo", &issues, &HashMap::new(), &mut entries);
+        assert_eq!(n, 1);
+        assert_eq!(entries.len(), 1, "no duplicate entry");
+        assert_eq!(entries[0].rdepend, "dev-libs/new");
+    }
+
+    #[test]
+    fn stale_flat_list_mtime_regeneration_replaces_existing_entry() {
+        // A flat_list staleness gap is regenerated like the other gap kinds: the
+        // stale entry is overwritten by the regenerated one in the merged set.
+        let mut fresh = entry("dev-libs", "foo", "1");
+        fresh.rdepend = "dev-libs/new".to_owned();
+        let fake = FakeGen {
+            by_cpv: HashMap::from([("dev-libs/foo-1".to_owned(), fresh)]),
+        };
+        let issues = vec![ImportIssue::StaleFlatListMtime {
+            cpv: "dev-libs/foo-1".to_owned(),
         }];
         let mut stale = entry("dev-libs", "foo", "1");
         stale.rdepend = "dev-libs/old".to_owned();

@@ -93,9 +93,12 @@ impl MetadataGenerator for EbuildMetadataGenerator<'_> {
         }
         let mut entry = to_stored_entry(&meta, &category, &pn, &pvr, repo);
         // Stamp provenance from the eclasses actually inherited so a later
-        // unchanged refresh reuses this entry rather than regenerating it.
+        // unchanged refresh reuses this entry rather than regenerating it. The
+        // `eclasses` field carries the resolved eclass-md5 provenance the
+        // importer now checks before reusing a previous entry.
         entry.md5 = provenance_stamp(self.repo_set, repo, &ebuild_path, &entry.inherited);
         entry.mtime = ebuild_mtime(&ebuild_path);
+        entry.eclasses = eclasses_provenance(self.repo_set, repo, &entry.inherited);
         Some(Generated {
             entry,
             regenerated: true,
@@ -168,6 +171,7 @@ fn to_stored_entry(
         inherited: tokens("INHERITED"),
         mtime: String::new(),
         md5: String::new(),
+        eclasses: String::new(),
     }
 }
 
@@ -204,6 +208,26 @@ fn provenance_stamp(repo_set: &RepoSet, repo: &str, ebuild: &Path, inherited: &[
         }
     }
     moraine_common::hash::md5(&bytes)
+}
+
+/// Build the `_eclasses_` provenance value, as tab-separated `name<TAB>md5hex`
+/// pairs for the eclasses the ebuild inherited, so a regenerated entry carries
+/// the same eclass-md5 provenance the importer records and checks for reuse.
+fn eclasses_provenance(repo_set: &RepoSet, repo: &str, inherited: &[String]) -> String {
+    let eclass_dirs = repo_set.eclass_search_path(repo);
+    let mut out = String::new();
+    for name in inherited {
+        let Some(md5) = eclass_md5(&eclass_dirs, name) else {
+            continue;
+        };
+        if !out.is_empty() {
+            out.push('\t');
+        }
+        out.push_str(name);
+        out.push('\t');
+        out.push_str(&md5);
+    }
+    out
 }
 
 /// The md5 of the first `<dir>/<name>.eclass` found across the eclass dirs.

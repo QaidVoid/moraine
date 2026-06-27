@@ -73,6 +73,7 @@ fn entry_with_rdepend(rdepend: &str) -> StoredEntry {
         inherited: vec![],
         mtime: "1".to_owned(),
         md5: "x".to_owned(),
+        eclasses: String::new(),
     }
 }
 

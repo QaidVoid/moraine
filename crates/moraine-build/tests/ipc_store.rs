@@ -35,6 +35,7 @@ fn entry(category: &str, package: &str, version: &str) -> StoredEntry {
         inherited: vec![],
         mtime: String::new(),
         md5: String::new(),
+        eclasses: String::new(),
     }
 }
 
