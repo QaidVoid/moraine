@@ -6,7 +6,8 @@
 //! path so callers can rely on complete directory coverage for ownership
 //! queries, matching stock Portage's `getcontents` behaviour.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 /// The kind and recorded fields of a single CONTENTS entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +100,55 @@ impl Contents {
         self.entries.contains_key(path)
     }
 
+    /// Resolve ownership of `path` against the live install root `eroot`,
+    /// following symlinked parent directories.
+    ///
+    /// This first tries the exact recorded lookup, then mirrors Portage's
+    /// `_match_contents`: it compares the queried path's basename against the
+    /// recorded basenames, stats the queried path's parent directory following
+    /// symlinks for its `(device, inode)` key, and treats a recorded entry as the
+    /// owner when a recorded parent directory shares that inode key and holds an
+    /// entry of the same basename. This recognizes a file recorded under `/lib`
+    /// when queried as `/lib64` with `/lib` a symlink to `lib64`. Returns the
+    /// owning entry kind when owned.
+    pub fn owner_resolved(&self, path: &str, eroot: &Path) -> Option<&EntryKind> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if let Some(kind) = self.entries.get(path) {
+            return Some(kind);
+        }
+        let (parent, basename) = split_parent(path);
+        // Shortcut: no recorded entry shares this basename, so this package is not
+        // the owner without examining parent inodes.
+        if !self.entries.keys().any(|k| split_parent(k).1 == basename) {
+            return None;
+        }
+        // Stat the queried parent following symlinks for its inode key.
+        let queried = live_join(eroot, parent);
+        let meta = std::fs::metadata(&queried).ok()?;
+        let queried_key = (meta.dev(), meta.ino());
+        // A recorded parent sharing that inode key and holding the basename owns
+        // the queried path.
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for key in self.entries.keys() {
+            let recorded_parent = split_parent(key).0;
+            if !seen.insert(recorded_parent) {
+                continue;
+            }
+            let Ok(rmeta) = std::fs::metadata(live_join(eroot, recorded_parent)) else {
+                continue;
+            };
+            if (rmeta.dev(), rmeta.ino()) != queried_key {
+                continue;
+            }
+            let candidate = join_path(recorded_parent, basename);
+            if let Some(kind) = self.entries.get(&candidate) {
+                return Some(kind);
+            }
+        }
+        None
+    }
+
     /// Iterate all entries in path order, including synthesized parents.
     pub fn iter(&self) -> impl Iterator<Item = Entry> + '_ {
         self.entries.iter().map(|(path, kind)| Entry {
@@ -111,6 +161,31 @@ impl Contents {
     pub(crate) fn from_map(entries: BTreeMap<String, EntryKind>) -> Self {
         Self { entries }
     }
+}
+
+/// Split `path` into its parent directory and basename. The root `/` is used as
+/// the parent when the path has no other parent component.
+fn split_parent(path: &str) -> (&str, &str) {
+    match path.rsplit_once('/') {
+        Some(("", base)) => ("/", base),
+        Some((parent, base)) => (parent, base),
+        None => ("", path),
+    }
+}
+
+/// Join an install-root-relative `parent` directory and `basename` into a path.
+fn join_path(parent: &str, basename: &str) -> String {
+    if parent == "/" {
+        format!("/{basename}")
+    } else {
+        format!("{parent}/{basename}")
+    }
+}
+
+/// Map an install-root-relative absolute path to its live filesystem path under
+/// `eroot`.
+fn live_join(eroot: &Path, path: &str) -> PathBuf {
+    eroot.join(path.trim_start_matches('/'))
 }
 
 /// Every ancestor directory of `path`, from the install root down to the
@@ -176,5 +251,25 @@ mod tests {
         let c = Contents::from_entries([obj("/usr/bin/foo")]);
         assert!(c.owner("/usr/bin/bar").is_none());
         assert!(!c.owns("/etc"));
+    }
+
+    #[test]
+    fn ownership_resolves_through_symlinked_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let eroot = dir.path();
+        // Live layout: /lib64 is the real directory and /lib is a symlink to it.
+        std::fs::create_dir_all(eroot.join("lib64")).unwrap();
+        std::fs::write(eroot.join("lib64/foo"), b"x").unwrap();
+        std::os::unix::fs::symlink("lib64", eroot.join("lib")).unwrap();
+
+        // The package recorded the file under /lib/foo.
+        let c = Contents::from_entries([obj("/lib/foo")]);
+
+        // Queried as /lib64/foo, ownership resolves through the symlinked parent.
+        assert!(c.owner_resolved("/lib64/foo", eroot).is_some());
+        // The exact recorded path is still owned without resolution.
+        assert!(c.owner_resolved("/lib/foo", eroot).is_some());
+        // An unrecorded basename is not owned.
+        assert!(c.owner_resolved("/lib64/bar", eroot).is_none());
     }
 }

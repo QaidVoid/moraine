@@ -308,15 +308,29 @@ pub fn resume(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
 pub fn unmerge(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let wr = WriteRoots::from(roots);
     let store = load_installed_store(&wr.vdb_dir)?;
+    let matched = match_unmerge_cpvs(&store, &cli.targets);
+    if matched.is_empty() {
+        println!("No installed packages matched.");
+        return Ok(());
+    }
+    run_removal(cli, ctx, &wr, &matched)?;
+    Ok(())
+}
+
+/// Select the installed `cpv`s matched by the unmerge `targets`.
+///
+/// Each target is parsed as a precise atom against the store interner so its
+/// symbols compare equal to the records', then every installed record whose
+/// category, package, version, and slot satisfy the atom is selected. A bare
+/// `cat/pkg` matches every installed version; `=cat/pkg-1.2` or `cat/pkg:2`
+/// matches only the named version or slot. Mirrors `vartree.dbapi.match`.
+fn match_unmerge_cpvs(store: &Store, targets: &[String]) -> Vec<String> {
     let interner = store.interner();
-    // Parse each target against the store interner so its symbols compare equal
-    // to the records'.
-    let atoms: Vec<Atom> = cli
-        .targets
+    let atoms: Vec<Atom> = targets
         .iter()
         .filter_map(|t| Atom::parse(t, moraine_eapi::PERMISSIVE, interner).ok())
         .collect();
-    let matched: Vec<String> = store
+    store
         .records()
         .iter()
         .filter(|record| {
@@ -331,13 +345,7 @@ pub fn unmerge(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
             atoms.iter().any(|atom| atom.matches(&pref))
         })
         .map(|record| record.cpv(interner))
-        .collect();
-    if matched.is_empty() {
-        println!("No installed packages matched.");
-        return Ok(());
-    }
-    run_removal(cli, ctx, &wr, &matched)?;
-    Ok(())
+        .collect()
 }
 
 /// Remove packages not needed by the world or system sets.
@@ -835,6 +843,49 @@ mod tests {
         // lower python slot does not, because a higher version survives.
         let removed = vec!["app/sole-1".to_owned(), "dev-lang/python-3.10".to_owned()];
         assert_eq!(world_deselect(&pkgs, &removed), vec!["app/sole".to_owned()]);
+    }
+
+    /// Build an in-memory store from a `(package-version, slot)` list under a
+    /// throwaway vdb tree. The tree is dropped on return; matching only reads the
+    /// loaded records.
+    fn store_from_tree(pkgs: &[(&str, &str)]) -> Store {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let vdb = dir.path();
+        for (pkg, slot) in pkgs {
+            let pdir = vdb.join("cat").join(pkg);
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::write(pdir.join("SLOT"), format!("{slot}\n")).unwrap();
+            std::fs::write(pdir.join("EAPI"), "8\n").unwrap();
+            std::fs::write(pdir.join("COUNTER"), "1\n").unwrap();
+        }
+        let interner = Arc::new(moraine_common::Interner::new());
+        let records = moraine_vdb::import_vdb(vdb, &interner).unwrap();
+        Store::from_records(StorePaths::in_dir(vdb), interner, records)
+    }
+
+    #[test]
+    fn unmerge_versioned_atom_selects_only_that_version() {
+        let store = store_from_tree(&[("pkg-1.2", "0"), ("pkg-1.3", "0")]);
+        // A precise versioned atom matches only the named version.
+        assert_eq!(
+            match_unmerge_cpvs(&store, &["=cat/pkg-1.2".to_owned()]),
+            vec!["cat/pkg-1.2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn unmerge_slot_atom_selects_only_that_slot() {
+        let store = store_from_tree(&[("pkg-1", "1"), ("pkg-2", "2")]);
+        // A slot atom matches only the version in that slot.
+        assert_eq!(
+            match_unmerge_cpvs(&store, &["cat/pkg:2".to_owned()]),
+            vec!["cat/pkg-2".to_owned()]
+        );
+        // A bare cp still matches every installed version.
+        let mut all = match_unmerge_cpvs(&store, &["cat/pkg".to_owned()]);
+        all.sort();
+        assert_eq!(all, vec!["cat/pkg-1".to_owned(), "cat/pkg-2".to_owned()]);
     }
 
     #[test]

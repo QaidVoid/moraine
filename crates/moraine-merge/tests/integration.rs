@@ -988,6 +988,55 @@ fn symlink_to_directory_preserved_while_used() {
 }
 
 #[test]
+fn unmerge_preserves_libdir_symlink() {
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    // A package ships /usr/local/lib as a symlink (bug #423127).
+    let image = build_image(tmp.path(), &[]);
+    add_symlink(&image, "/usr/local/lib", "lib64");
+    let engine = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()));
+    engine
+        .apply(&[merge_op(image, state("cat/lib", "1", "0"), None, false)])
+        .unwrap();
+    // The recorded libdir symlink is never unmerged, even though its target still
+    // matches and no other package owns a path through it.
+    engine
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "cat/lib-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+    let meta = std::fs::symlink_metadata(sb.live("/usr/local/lib")).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "libdir symlink must never be unmerged"
+    );
+}
+
+#[test]
+fn unmerge_removes_unmodified_symlink() {
+    let sb = Sandbox::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let image = build_image(tmp.path(), &[("/opt/app/.keep", b"")]);
+    add_symlink(&image, "/opt/app/link", "real");
+    let engine = MergeEngine::new(sb.context(Features::default(), ConfigProtect::default()));
+    engine
+        .apply(&[merge_op(image, state("cat/s", "1", "0"), None, false)])
+        .unwrap();
+    // The live symlink mtime matches CONTENTS, so unmerge removes it.
+    engine
+        .apply(&[Operation::Unmerge(UnmergeOp {
+            cpv: "cat/s-1".to_string(),
+            replaced: false,
+        })])
+        .unwrap();
+    assert!(
+        std::fs::symlink_metadata(sb.live("/opt/app/link")).is_err(),
+        "an unmodified symlink must be removed on unmerge"
+    );
+}
+
+#[test]
 fn unmerge_skips_files_now_owned_by_another_package() {
     let sb = Sandbox::new();
     let tmp = tempfile::tempdir().unwrap();

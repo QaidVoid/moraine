@@ -3,11 +3,11 @@
 //! Unmerge walks the package's recorded CONTENTS in reverse depth order and
 //! removes each path only when it is still safe: a regular file only when it
 //! still exists, is still owned by this package, and its md5 and mtime match
-//! CONTENTS; a symlink only when it still points to the recorded target. A path
-//! now owned by another package, a modified file, and a protected config are
-//! skipped and left in place. A directory is removed only when empty after its
-//! entries are processed. A still-needed shared library is deferred to the
-//! preserve-libs reconciliation.
+//! CONTENTS; a symlink only when its live mtime still matches CONTENTS, and never
+//! a critical library-directory symlink. A path now owned by another package, a
+//! modified file, and a protected config are skipped and left in place. A
+//! directory is removed only when empty after its entries are processed. A
+//! still-needed shared library is deferred to the preserve-libs reconciliation.
 
 use moraine_common::Interner;
 use moraine_vdb::contents::EntryKind;
@@ -135,8 +135,14 @@ pub(crate) fn unmerge(
                     Err(source) => return Err(MergeError::Io { path: live, source }),
                 }
             }
-            EntryKind::Sym { target, .. } => {
-                if should_skip_sym(ctx, store, interner, cpv, &entry.path, target)? {
+            EntryKind::Sym { mtime, .. } => {
+                // Never remove a critical library-directory symlink even when its
+                // recorded target still matches (bug #423127).
+                if LIBDIR_SYMLINKS.contains(&entry.path.as_str()) {
+                    result.skipped.push(entry.path.clone());
+                    continue;
+                }
+                if should_skip_sym(ctx, store, interner, cpv, &entry.path, *mtime)? {
                     result.skipped.push(entry.path.clone());
                     continue;
                 }
@@ -158,7 +164,8 @@ pub(crate) fn unmerge(
                 // Special files carry no content to verify; remove unless config
                 // protected or now owned by another package.
                 if ctx.config_protect.is_protected(&entry.path)
-                    || collision::owner_of(store, interner, &entry.path, Some(cpv)).is_some()
+                    || collision::owner_of(store, interner, &ctx.eroot, &entry.path, Some(cpv))
+                        .is_some()
                 {
                     result.skipped.push(entry.path.clone());
                     continue;
@@ -224,7 +231,7 @@ fn classify_obj(
         return Ok(ObjAction::Skip);
     }
     // Now owned by another package: skip.
-    if collision::owner_of(store, interner, path, Some(cpv)).is_some() {
+    if collision::owner_of(store, interner, &ctx.eroot, path, Some(cpv)).is_some() {
         return Ok(ObjAction::Skip);
     }
     // Defer a still-needed shared library to preserve-libs reconciliation,
@@ -259,23 +266,78 @@ fn classify_obj(
     Ok(ObjAction::Remove)
 }
 
+/// EROOT-relative symlink paths that are never removed on unmerge (bug #423127).
+const LIBDIR_SYMLINKS: [&str; 3] = ["/lib", "/usr/lib", "/usr/local/lib"];
+
+/// Whether a recorded symlink at `path` should be left in place rather than
+/// removed. Config-protected and now-foreign-owned symlinks are preserved, then
+/// a symlink whose live lstat mtime differs from the recorded mtime is treated as
+/// administrator-modified and preserved. Mirrors Portage, which decides this
+/// solely by mtime and never compares the live link target (vartree.py:2966).
 fn should_skip_sym(
     ctx: &MergeContext,
     store: &Store,
     interner: &Interner,
     cpv: &str,
     path: &str,
-    target: &str,
+    mtime: i64,
 ) -> Result<bool, MergeError> {
     if ctx.config_protect.is_protected(path) {
         return Ok(true);
     }
-    if collision::owner_of(store, interner, path, Some(cpv)).is_some() {
+    if collision::owner_of(store, interner, &ctx.eroot, path, Some(cpv)).is_some() {
         return Ok(true);
     }
     let live = ctx.live_path(path);
-    let Ok(current) = std::fs::read_link(&live) else {
-        return Ok(true);
-    };
-    Ok(current.to_string_lossy() != target)
+    match mtime_secs(&live) {
+        Ok(live_mtime) => Ok(live_mtime != mtime),
+        // Gone already or unreadable: nothing to remove, so leave it.
+        Err(_) => Ok(true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use moraine_vdb::store::StorePaths;
+
+    use super::*;
+    use crate::{ConfigProtect, Features};
+
+    fn empty_ctx(eroot: &std::path::Path) -> MergeContext {
+        MergeContext {
+            eroot: eroot.to_path_buf(),
+            vdb_dir: eroot.join("vdb"),
+            state_dir: eroot.join("state"),
+            features: Features::default(),
+            config_protect: ConfigProtect::default(),
+            collision_ignore: Vec::new(),
+            uninstall_ignore: Vec::new(),
+            install_mask: Default::default(),
+        }
+    }
+
+    #[test]
+    fn sym_skip_decided_by_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let eroot = dir.path();
+        std::os::unix::fs::symlink("target", eroot.join("link")).unwrap();
+        let recorded = mtime_secs(&eroot.join("link")).unwrap();
+
+        let interner = Arc::new(Interner::new());
+        let store = Store::from_records(
+            StorePaths::in_dir(eroot.join("vdb")),
+            interner.clone(),
+            Vec::new(),
+        );
+        let ctx = empty_ctx(eroot);
+
+        // A symlink whose live mtime matches the recorded mtime is removable.
+        assert!(!should_skip_sym(&ctx, &store, &interner, "cat/pkg-1", "/link", recorded).unwrap());
+        // A symlink whose live mtime differs is preserved as administrator-modified.
+        assert!(
+            should_skip_sym(&ctx, &store, &interner, "cat/pkg-1", "/link", recorded + 1).unwrap()
+        );
+    }
 }

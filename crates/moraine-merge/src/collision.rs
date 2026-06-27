@@ -45,14 +45,23 @@ pub struct Collision {
 
 /// Find the `category/package-version` of the installed package that owns
 /// `install_path`, excluding `exclude_cpv` (the version being replaced).
+///
+/// Ownership is resolved through symlinked parent directories against `eroot`, so
+/// a path recorded under `/lib` is recognized when queried as `/lib64` with
+/// `/lib` a symlink to `lib64`.
 pub(crate) fn owner_of(
     store: &Store,
     interner: &Interner,
+    eroot: &Path,
     install_path: &str,
     exclude_cpv: Option<&str>,
 ) -> Option<String> {
     for record in store.records() {
-        if !record.contents.owns(install_path) {
+        if record
+            .contents
+            .owner_resolved(install_path, eroot)
+            .is_none()
+        {
             continue;
         }
         let cpv = record.cpv(interner);
@@ -100,7 +109,7 @@ pub(crate) fn detect(
         // the `._cfg` variant logic during placement, so it is exempt from the
         // ownership-based collision check.
         let protected = config_protect.is_protected(path);
-        if !protected && let Some(owner) = owner_of(store, interner, path, exclude_cpv) {
+        if !protected && let Some(owner) = owner_of(store, interner, eroot, path, exclude_cpv) {
             out.push(Collision {
                 path: path.clone(),
                 kind: CollisionKind::OwnedByOther(owner),

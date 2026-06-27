@@ -780,9 +780,10 @@ fn to_install_task(
 struct ArgDetail {
     /// The repository qualifier the argument carried (`::repo`), if any.
     repo: Option<String>,
-    /// Whether the argument was precise enough to identify a single slot, that is
-    /// it carried a version operator, version, or slot.
-    precise: bool,
+    /// Whether the argument identifies exactly one slot: it carried a version
+    /// operator, version, or slot and matches a single slot among the available
+    /// versions, mirroring `create_world_atom`'s `matched_slots` check.
+    single_slot: bool,
 }
 
 /// The inputs needed to compute a world atom for a resolved task, mirroring
@@ -813,16 +814,22 @@ impl WorldAtomInputs {
             let cp = cp_of_atom(target);
             let detail = match moraine_atom::Atom::parse(target, moraine_eapi::PERMISSIVE, interner)
             {
-                Ok(atom) => ArgDetail {
-                    repo: atom
-                        .repo()
-                        .and_then(|r| interner.resolve(r))
-                        .map(|s| s.to_owned()),
-                    precise: atom.version().is_some() || atom.slot().is_some(),
-                },
+                Ok(atom) => {
+                    // A bare `cat/pkg` (no version, no slot) never records a slot
+                    // atom, matching `arg_atom.without_repo != cp`.
+                    let bare = atom.version().is_none() && atom.slot().is_none();
+                    ArgDetail {
+                        repo: atom
+                            .repo()
+                            .and_then(|r| interner.resolve(r))
+                            .map(|s| s.to_string()),
+                        single_slot: !bare
+                            && arg_single_slot(&atom, &cp, source, installed, interner),
+                    }
+                }
                 Err(_) => ArgDetail {
                     repo: None,
-                    precise: false,
+                    single_slot: false,
                 },
             };
             args.insert(cp, detail);
@@ -858,7 +865,7 @@ impl WorldAtomInputs {
         {
             return None;
         }
-        let mut atom = if slotted && arg.precise {
+        let mut atom = if slotted && arg.single_slot {
             format!("{}:{}", task.cp, task.slot)
         } else {
             task.cp.clone()
@@ -884,6 +891,57 @@ fn is_slotted<S: ResolveSource>(
         slots.extend(versions.iter().map(|(_, slot)| slot.clone()));
     }
     slots.len() > 1 || (slots.len() == 1 && !slots.contains("0"))
+}
+
+/// Whether `atom` matches exactly one slot among the repository candidates and
+/// installed versions of `cp`, mirroring `create_world_atom`'s `matched_slots`
+/// check. The candidate repository is treated as the atom's own, so a
+/// `::repo`-qualified argument still matches by version and slot.
+fn arg_single_slot<S: ResolveSource>(
+    atom: &moraine_atom::Atom,
+    cp: &str,
+    source: &S,
+    installed: &HashMap<String, Vec<(String, String)>>,
+    interner: &Interner,
+) -> bool {
+    let Some((category, package)) = cp.split_once('/') else {
+        return false;
+    };
+    let cat = interner.intern(category);
+    let pkg = interner.intern(package);
+    let mut slots: BTreeSet<String> = BTreeSet::new();
+    for meta in source.versions_of(cp) {
+        let pref = moraine_atom::PackageRef {
+            category: cat,
+            package: pkg,
+            version: &meta.version,
+            slot: Some(interner.intern(&meta.slot)),
+            subslot: meta.subslot.as_deref().map(|s| interner.intern(s)),
+            repo: atom.repo(),
+        };
+        if atom.matches(&pref) {
+            slots.insert(meta.slot);
+        }
+    }
+    if let Some(versions) = installed.get(cp) {
+        for (version, slot) in versions {
+            let Ok(parsed) = Version::parse(version) else {
+                continue;
+            };
+            let pref = moraine_atom::PackageRef {
+                category: cat,
+                package: pkg,
+                version: &parsed,
+                slot: Some(interner.intern(slot)),
+                subslot: None,
+                repo: atom.repo(),
+            };
+            if atom.matches(&pref) {
+                slots.insert(slot.clone());
+            }
+        }
+    }
+    slots.len() == 1
 }
 
 /// The binary candidates available for selection plus the target configuration
@@ -1616,6 +1674,64 @@ fn index_error(error: moraine_repo::RepoError, store_dir: &Path) -> miette::Repo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn world_atom_records_slot_repo_and_omits_system() {
+        let task = |cp: &str, slot: &str| Task {
+            kind: ResolveTaskKind::Merge,
+            cp: cp.to_owned(),
+            version: "1".to_owned(),
+            slot: slot.to_owned(),
+            use_enabled: Vec::new(),
+        };
+        let mut args = HashMap::new();
+        // A slotted package whose argument identifies a single slot.
+        args.insert(
+            "sys-devel/gcc".to_owned(),
+            ArgDetail {
+                repo: None,
+                single_slot: true,
+            },
+        );
+        // A ::repo-qualified argument.
+        args.insert(
+            "dev-libs/foo".to_owned(),
+            ArgDetail {
+                repo: Some("myrepo".to_owned()),
+                single_slot: false,
+            },
+        );
+        // An unslotted system member.
+        args.insert(
+            "sys-apps/sed".to_owned(),
+            ArgDetail {
+                repo: None,
+                single_slot: false,
+            },
+        );
+        let inputs = WorldAtomInputs {
+            args,
+            slotted: ["sys-devel/gcc".to_owned()].into_iter().collect(),
+            system: ["sys-apps/sed".to_owned()].into_iter().collect(),
+        };
+
+        // A slotted package with a precise argument records cp:slot.
+        assert_eq!(
+            inputs.world_atom(&task("sys-devel/gcc", "13"), false),
+            Some("sys-devel/gcc:13".to_owned())
+        );
+        // A ::repo argument records the repo qualifier.
+        assert_eq!(
+            inputs.world_atom(&task("dev-libs/foo", "0"), false),
+            Some("dev-libs/foo::myrepo".to_owned())
+        );
+        // An unslotted system member is not recorded.
+        assert_eq!(inputs.world_atom(&task("sys-apps/sed", "0"), false), None);
+        // A dependency that was not requested is not recorded.
+        assert_eq!(inputs.world_atom(&task("dev-libs/dep", "0"), false), None);
+        // A --oneshot target is not recorded.
+        assert_eq!(inputs.world_atom(&task("sys-devel/gcc", "13"), true), None);
+    }
 
     #[test]
     fn split_pf_finds_version() {
