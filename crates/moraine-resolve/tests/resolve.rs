@@ -4,7 +4,9 @@ mod fixture;
 
 use fixture::{Fixture, PkgSpec, installed};
 use moraine_resolve::solution::{DepClass, Root};
-use moraine_resolve::{Modifiers, ResolveError, resolve, resolve_with};
+use moraine_resolve::{
+    AutounmaskPolicy, Modifiers, ResolveError, UseChange, resolve, resolve_with,
+};
 
 fn pkg(cp: &'static str, version: &'static str) -> PkgSpec {
     PkgSpec {
@@ -189,17 +191,29 @@ fn use_dependency_atom_requires_flag() {
         rdepend: "cat/dep[foo]",
         ..Default::default()
     });
-    // Only a candidate with foo enabled satisfies the atom.
+    // The only candidate declares foo but has it off. USE autounmask proposes
+    // enabling the settable flag, so resolution now succeeds with the change.
     f.add(PkgSpec {
         cp: "cat/dep",
         version: "1",
         iuse: &["foo"],
-        use_enabled: &[], // foo off: does not satisfy [foo]
+        use_enabled: &[], // foo off: satisfied by a proposed USE change
         ..Default::default()
     });
 
-    let r = resolve(&f, &["cat/main"]);
-    assert!(matches!(r, Err(ResolveError::Unsatisfiable { .. })));
+    let sol = resolve(&f, &["cat/main"]).expect("resolves via USE autounmask");
+    let change = sol
+        .autounmask
+        .iter()
+        .find(|c| c.cp == "cat/dep")
+        .expect("a USE change is proposed");
+    assert_eq!(
+        change.change.use_changes,
+        vec![UseChange {
+            flag: "foo".to_owned(),
+            enable: true,
+        }]
+    );
 
     // Now with foo enabled it resolves.
     let mut f2 = Fixture::new();
@@ -1264,5 +1278,182 @@ fn changed_deps_forces_reinstall() {
     assert!(
         sol.package("cat/a").unwrap().subslot_rebuild,
         "a dependency change must force a reinstall under --changed-deps"
+    );
+}
+
+#[test]
+fn keyword_autounmask_refused_by_default() {
+    // A stable-profile dependency whose only candidate is visible solely through
+    // a `~arch` keyword: by default the resolver reports the change and does not
+    // auto-apply it.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/app",
+        version: "1",
+        rdepend: "cat/dep",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "cat/dep",
+        version: "1",
+        accept_keyword: Some("~amd64"),
+        ..Default::default()
+    });
+
+    let sol = resolve(&f, &["cat/app"]).expect("resolves through the keyword suggestion");
+    let change = sol
+        .autounmask
+        .iter()
+        .find(|c| c.cp == "cat/dep")
+        .expect("keyword change recorded");
+    assert_eq!(change.change.keyword.as_deref(), Some("~amd64"));
+    assert!(
+        !change.auto_applied,
+        "a keyword change is a suggestion under the default policy"
+    );
+
+    // With keyword autounmask explicitly enabled the change is applied.
+    let sol = resolve_with(
+        &f,
+        &["cat/app"],
+        Modifiers {
+            autounmask: AutounmaskPolicy {
+                keep_keywords: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("resolves with keyword autounmask enabled");
+    let change = sol
+        .autounmask
+        .iter()
+        .find(|c| c.cp == "cat/dep")
+        .expect("keyword change recorded");
+    assert!(
+        change.auto_applied,
+        "the keyword change is applied when keyword autounmask is enabled"
+    );
+}
+
+#[test]
+fn license_autounmask_refused_by_default() {
+    // A dependency whose only candidate carries a non-accepted license: by
+    // default the resolver reports the change and does not auto-apply it.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/app",
+        version: "1",
+        rdepend: "cat/dep",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "cat/dep",
+        version: "1",
+        accept_licenses: &["MyEULA"],
+        ..Default::default()
+    });
+
+    let sol = resolve(&f, &["cat/app"]).expect("resolves through the license suggestion");
+    let change = sol
+        .autounmask
+        .iter()
+        .find(|c| c.cp == "cat/dep")
+        .expect("license change recorded");
+    assert_eq!(change.change.licenses, vec!["MyEULA".to_owned()]);
+    assert!(
+        !change.auto_applied,
+        "a license change is a suggestion under the default policy"
+    );
+
+    // With license autounmask explicitly enabled the change is applied.
+    let sol = resolve_with(
+        &f,
+        &["cat/app"],
+        Modifiers {
+            autounmask: AutounmaskPolicy {
+                keep_license: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("resolves with license autounmask enabled");
+    let change = sol
+        .autounmask
+        .iter()
+        .find(|c| c.cp == "cat/dep")
+        .expect("license change recorded");
+    assert!(
+        change.auto_applied,
+        "the license change is applied when license autounmask is enabled"
+    );
+}
+
+#[test]
+fn use_autounmask_proposes_settable_flag() {
+    // dev-libs/foo declares ssl but has it off; the consumer needs [ssl]. USE
+    // autounmask proposes enabling the settable flag and resolves.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/app",
+        version: "1",
+        rdepend: "dev-libs/foo[ssl]",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "dev-libs/foo",
+        version: "1",
+        iuse: &["ssl"],
+        use_enabled: &[],
+        ..Default::default()
+    });
+
+    let sol = resolve(&f, &["cat/app"]).expect("resolves via USE autounmask");
+    let change = sol
+        .autounmask
+        .iter()
+        .find(|c| c.cp == "dev-libs/foo")
+        .expect("USE change recorded");
+    assert_eq!(
+        change.change.use_changes,
+        vec![UseChange {
+            flag: "ssl".to_owned(),
+            enable: true,
+        }]
+    );
+    assert!(
+        change.auto_applied,
+        "USE autounmask is applied under the default policy"
+    );
+    // foo is selected with the proposed flag enabled.
+    let foo = sol.package("dev-libs/foo").expect("foo is selected");
+    assert!(foo.use_enabled.contains("ssl"));
+}
+
+#[test]
+fn use_autounmask_skips_locked_flag() {
+    // The needed flag is pinned by use.mask/use.force, so it cannot be toggled
+    // and the dependency stays unsatisfiable.
+    let mut f = Fixture::new();
+    f.add(PkgSpec {
+        cp: "cat/app",
+        version: "1",
+        rdepend: "dev-libs/foo[ssl]",
+        ..Default::default()
+    });
+    f.add(PkgSpec {
+        cp: "dev-libs/foo",
+        version: "1",
+        iuse: &["ssl"],
+        use_enabled: &[],
+        locked_use: &["ssl"],
+        ..Default::default()
+    });
+
+    let r = resolve(&f, &["cat/app"]);
+    assert!(
+        matches!(r, Err(ResolveError::Unsatisfiable { .. })),
+        "a locked flag cannot be toggled, so the dependency is unsatisfiable"
     );
 }

@@ -30,10 +30,12 @@ pub use error::{MergeOrderError, ResidualCycle, ResolveError};
 pub use graph::{EdgeFlags, MergeGraph, MergeNode, NodeKind};
 pub use provider::GentooProvider;
 pub use realsource::RealSource;
-pub use resolve::{Modifiers, resolve, resolve_with};
+pub use resolve::{AutounmaskPolicy, Modifiers, resolve, resolve_with};
 pub use serialize::{Task, TaskKind, serialize};
 pub use solution::{
     AutounmaskChange, DepClass, DepEdge, RecordedBlocker, ResolvedPackage, ResolvedSolution, Root,
     SlotBinding, endpoint_cp,
 };
-pub use source::{AcceptChange, Acceptability, InstalledMeta, PackageMeta, ResolveSource};
+pub use source::{
+    AcceptChange, Acceptability, InstalledMeta, PackageMeta, ResolveSource, UseChange,
+};

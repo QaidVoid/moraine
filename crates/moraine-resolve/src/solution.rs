@@ -152,15 +152,20 @@ impl ResolvedPackage {
 }
 
 /// A configuration change autounmask must report for a selected package that is
-/// only installable after accepting a keyword or license.
+/// only installable after accepting a keyword or license, or after a proposed
+/// USE change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutounmaskChange {
     /// The `category/package`.
     pub cp: String,
     /// The exact version that needs the change.
     pub version: Version,
-    /// The keyword/license acceptance required.
+    /// The keyword/license/USE acceptance required.
     pub change: crate::source::AcceptChange,
+    /// Whether the resolver applied this change and resolved through it. A
+    /// not-auto-applied change is only a suggestion: the install path must
+    /// refuse to build or merge the candidate and present the change instead.
+    pub auto_applied: bool,
 }
 
 /// The full output of a successful resolution.

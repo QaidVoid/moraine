@@ -106,6 +106,7 @@ pub fn render_autounmask(
 
     let mut keyword_block: Vec<String> = Vec::new();
     let mut license_block: Vec<String> = Vec::new();
+    let mut use_block: Vec<String> = Vec::new();
     for c in changes {
         let atom = paint(&format!("={}-{}", c.cp, c.version), "32");
         if let Some(kw) = &c.change.keyword {
@@ -115,6 +116,23 @@ pub fn render_autounmask(
         if !c.change.licenses.is_empty() {
             license_block.extend(chain_for(&c.cp));
             license_block.push(format!("{atom} {}", c.change.licenses.join(" ")));
+        }
+        if !c.change.use_changes.is_empty() {
+            use_block.extend(chain_for(&c.cp));
+            let flags = c
+                .change
+                .use_changes
+                .iter()
+                .map(|u| {
+                    if u.enable {
+                        u.flag.clone()
+                    } else {
+                        format!("-{}", u.flag)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            use_block.push(format!("{atom} {flags}"));
         }
     }
 
@@ -146,6 +164,17 @@ pub fn render_autounmask(
         );
         out.push_str(" (see \"package.license\" in the portage(5) man page for more details)\n");
         for line in license_block {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    if !use_block.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{}",
+            paint("The following USE changes are necessary to proceed:", "33")
+        );
+        out.push_str(" (see \"package.use\" in the portage(5) man page for more details)\n");
+        for line in use_block {
             let _ = writeln!(out, "{line}");
         }
     }
@@ -812,6 +841,32 @@ mod tests {
         assert_eq!(human_size(1024), "1.00 KiB");
         assert_eq!(human_size(1536), "1.50 KiB");
         assert_eq!(human_size(5 * 1024 * 1024), "5.00 MiB");
+    }
+
+    #[test]
+    fn use_change_block_renders() {
+        use moraine_resolve::{AcceptChange, UseChange};
+        let change = AutounmaskChange {
+            cp: "dev-libs/foo".to_owned(),
+            version: moraine_version::Version::parse("1").unwrap(),
+            change: AcceptChange {
+                use_changes: vec![UseChange {
+                    flag: "ssl".to_owned(),
+                    enable: true,
+                }],
+                ..Default::default()
+            },
+            auto_applied: true,
+        };
+        let out = render_autounmask(&[change], &MergePlan::default(), &[], &BTreeSet::new());
+        assert!(
+            out.contains("The following USE changes are necessary to proceed:"),
+            "USE-change header present: {out}"
+        );
+        assert!(
+            out.contains("=dev-libs/foo-1 ssl"),
+            "version-specific flag line present: {out}"
+        );
     }
 
     #[test]

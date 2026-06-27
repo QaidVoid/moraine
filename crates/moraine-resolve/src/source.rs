@@ -70,6 +70,16 @@ pub struct InstalledMeta {
     pub recorded_deps: std::collections::BTreeMap<String, String>,
 }
 
+/// A single `package.use` toggle proposed by USE-dependency autounmask: a flag
+/// and whether it is to be enabled or disabled on the target package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UseChange {
+    /// The flag to toggle.
+    pub flag: String,
+    /// Whether the flag is to be enabled (`true`) or disabled (`false`).
+    pub enable: bool,
+}
+
 /// The configuration change needed to make a soft-masked package installable,
 /// for autounmask reporting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,12 +88,15 @@ pub struct AcceptChange {
     pub keyword: Option<String>,
     /// The licenses that must be accepted, if license-masked.
     pub licenses: Vec<String>,
+    /// The `package.use` toggles proposed to satisfy an unsatisfied
+    /// USE-dependency.
+    pub use_changes: Vec<UseChange>,
 }
 
 impl AcceptChange {
     /// Whether this change carries no required acceptance.
     pub fn is_empty(&self) -> bool {
-        self.keyword.is_none() && self.licenses.is_empty()
+        self.keyword.is_none() && self.licenses.is_empty() && self.use_changes.is_empty()
     }
 }
 
@@ -141,6 +154,14 @@ pub trait ResolveSource {
 
     /// The resolved enabled USE flags for the given package version.
     fn resolved_use(&self, meta: &PackageMeta) -> BTreeSet<String>;
+
+    /// The USE flags whose state is pinned by `use.mask`/`use.force` for the
+    /// given package, which USE-dependency autounmask must never propose to
+    /// toggle. The default is empty for sources without a force/mask
+    /// configuration.
+    fn locked_use(&self, _meta: &PackageMeta) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
 
     /// Whether an atom of `cp` constrained to `version` is satisfied by a
     /// `package.provided` entry (so no install is needed).

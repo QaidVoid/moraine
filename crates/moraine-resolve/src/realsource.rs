@@ -401,6 +401,46 @@ impl ResolveSource for RealSource<'_> {
         BTreeSet::new()
     }
 
+    fn locked_use(&self, meta: &PackageMeta) -> BTreeSet<String> {
+        let (category, package) = match Self::split_cp(&meta.cp) {
+            Some(p) => p,
+            None => return BTreeSet::new(),
+        };
+        for cand in self.repo.match_atom_str(&meta.cp) {
+            let store = &self.repo.repos()[cand.repo_order].store;
+            let interner = store.interner();
+            let entry = cand.entry;
+            if entry.version != meta.version {
+                continue;
+            }
+            let pref = PackageRef {
+                category: interner.intern(category),
+                package: interner.intern(package),
+                version: &entry.version,
+                slot: Some(entry.slot),
+                subslot: entry.subslot,
+                repo: Some(entry.repository),
+            };
+            let iuse: Vec<String> = entry
+                .iuse
+                .iter()
+                .filter_map(|s| interner.resolve(*s).map(|x| x.to_string()))
+                .collect();
+            let restrict_test = entry
+                .restrict
+                .iter()
+                .any(|r| interner.resolve(*r).as_deref() == Some("test"));
+            // `forced` is the union of `use.force` and `use.mask`: exactly the
+            // flags whose state the user cannot change, which autounmask must not
+            // propose to toggle.
+            return self
+                .config
+                .effective_use(&pref, &iuse, self.stable, restrict_test)
+                .forced;
+        }
+        BTreeSet::new()
+    }
+
     fn is_provided(&self, cp: &str, version: &Version) -> bool {
         let (category, package) = match Self::split_cp(cp) {
             Some(p) => p,

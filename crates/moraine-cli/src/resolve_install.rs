@@ -178,6 +178,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         newuse: request.newuse,
         changed_deps: cli.changed_deps,
         changed_slot: cli.changed_slot,
+        autounmask: Default::default(),
     };
     let solution = resolve_with(&source, &atom_refs, modifiers)
         .map_err(|e| miette!("resolution failed:\n{e}"))?;
@@ -240,6 +241,15 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         "{}",
         crate::render::render_autounmask(&solution.autounmask, &plan, &solution.edges, &explicit)
     );
+
+    // A change the policy keeps locked (a keyword or license change by default)
+    // is a suggestion only. Refuse to build or merge the masked candidate and
+    // present the required configuration change, mirroring emerge.
+    if solution.autounmask.iter().any(|c| !c.auto_applied) {
+        return Err(miette!(
+            "the changes shown above are required to proceed. Apply them and re-run."
+        ));
+    }
 
     if cli.pretend {
         return Ok(());

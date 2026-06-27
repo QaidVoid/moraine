@@ -14,10 +14,12 @@ use moraine_eapi::EapiFeatures;
 use moraine_solver::{Clause, Range, Requirements, Term};
 use moraine_version::Version;
 
+use std::collections::BTreeMap;
+
 use crate::depnode::{BlockerKind, DepNode, NormAtom, Op, SlotOpKind, UseReqKind};
 use crate::error::ResolveError;
 use crate::solution::{DepClass, Root};
-use crate::source::ResolveSource;
+use crate::source::{PackageMeta, ResolveSource, UseChange};
 
 /// The five dependency classes, each tagged with how its `:=` bindings resolve.
 pub(crate) const CLASSES: [DepClass; 5] = [
@@ -184,6 +186,18 @@ pub(crate) struct BranchPoint {
     pub has_fallback: bool,
 }
 
+/// A USE-autounmask proposal discovered while encoding: the target `cp`, its
+/// proposed enabled USE, and the per-flag toggles to record as a change.
+#[derive(Debug, Clone)]
+pub(crate) struct UseProposal {
+    /// The `category/package` whose USE is proposed to change.
+    pub cp: String,
+    /// The candidate's enabled USE after applying the toggles.
+    pub new_use: BTreeSet<String>,
+    /// The per-flag toggles, for reporting as a `package.use` change.
+    pub changes: Vec<UseChange>,
+}
+
 /// The encoder over a single package's metadata and resolved USE.
 pub(crate) struct Encoder<'a, S: ResolveSource> {
     pub source: &'a S,
@@ -192,6 +206,11 @@ pub(crate) struct Encoder<'a, S: ResolveSource> {
     pub branch_mask: &'a BTreeSet<String>,
     /// Collector for the `||` branch decisions made during this encoding pass.
     pub branch_points: &'a std::cell::RefCell<Vec<BranchPoint>>,
+    /// USE-autounmask overrides seeded by the resolve layer: `cp` to its
+    /// proposed enabled USE.
+    pub use_overrides: &'a BTreeMap<String, BTreeSet<String>>,
+    /// Collector for the USE-autounmask proposals made during this encoding pass.
+    pub use_proposals: &'a std::cell::RefCell<Vec<UseProposal>>,
 }
 
 impl<'a, S: ResolveSource> Encoder<'a, S> {
@@ -601,7 +620,7 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
             if !self.source.is_visible(&m) {
                 continue;
             }
-            let cand_use = self.source.resolved_use(&m);
+            let cand_use = self.effective_use(&m);
             if !use_deps_satisfied(atom, &cand_use, &m.iuse, parent_use, features) {
                 continue;
             }
@@ -618,14 +637,112 @@ impl<'a, S: ResolveSource> Encoder<'a, S> {
                 if !self.source.acceptability(&m).is_autounmaskable() {
                     continue;
                 }
-                let cand_use = self.source.resolved_use(&m);
+                let cand_use = self.effective_use(&m);
                 if !use_deps_satisfied(atom, &cand_use, &m.iuse, parent_use, features) {
                     continue;
                 }
                 by_slot.entry(m.slot.clone()).or_default().push(m.version);
             }
         }
+        if by_slot.is_empty() && !atom.use_deps.is_empty() {
+            // USE-dependency autounmask (Portage's level 0): no visible candidate's
+            // USE satisfies the atom, so propose toggling only settable flags on the
+            // best matching candidate and admit it under the proposed USE.
+            let mut matching: Vec<PackageMeta> = self
+                .source
+                .versions_of(&atom.cp)
+                .into_iter()
+                .filter(|m| {
+                    version_satisfies(atom, &m.version)
+                        && slot_matches(atom, m)
+                        && self.source.is_visible(m)
+                })
+                .collect();
+            // Highest version first, mirroring the visible candidate order.
+            matching.sort_by(|a, b| b.version.cmp(&a.version));
+            for m in matching {
+                let cand_use = self.effective_use(&m);
+                let locked = self.source.locked_use(&m);
+                if let Some((new_use, changes)) =
+                    self.use_toggles(atom, &cand_use, &m.iuse, &locked, parent_use, features)
+                {
+                    self.use_proposals.borrow_mut().push(UseProposal {
+                        cp: atom.cp.clone(),
+                        new_use,
+                        changes,
+                    });
+                    by_slot.entry(m.slot.clone()).or_default().push(m.version);
+                    break;
+                }
+            }
+        }
         self.to_alternatives(&atom.cp, by_slot)
+    }
+
+    /// The effective enabled USE for a candidate: the seeded USE-autounmask
+    /// override for its `cp` when present, otherwise the source's resolved USE.
+    fn effective_use(&self, meta: &PackageMeta) -> BTreeSet<String> {
+        self.use_overrides
+            .get(&meta.cp)
+            .cloned()
+            .unwrap_or_else(|| self.source.resolved_use(meta))
+    }
+
+    /// Derive the USE toggles that make a candidate satisfy an atom's
+    /// USE-dependency, considering only settable flags (declared in the
+    /// candidate's IUSE and not pinned by `use.mask`/`use.force`). Returns the
+    /// candidate's enabled USE after the toggles and the per-flag changes, or
+    /// `None` when no settable toggle makes the candidate satisfy the atom, so a
+    /// candidate whose dependency cannot be met stays unsatisfiable.
+    fn use_toggles(
+        &self,
+        atom: &NormAtom,
+        cand_use: &BTreeSet<String>,
+        cand_iuse: &BTreeSet<String>,
+        locked: &BTreeSet<String>,
+        parent_use: &BTreeSet<String>,
+        features: EapiFeatures,
+    ) -> Option<(BTreeSet<String>, Vec<UseChange>)> {
+        let mut new_use = cand_use.clone();
+        let mut changes: Vec<UseChange> = Vec::new();
+        for dep in &atom.use_deps {
+            // Only a settable flag can be toggled; a locked or undeclared flag is
+            // left as is and verified against the dependency below.
+            if !cand_iuse.contains(&dep.flag) || locked.contains(&dep.flag) {
+                continue;
+            }
+            let parent_enabled = parent_use.contains(&dep.flag);
+            let need = match dep.kind {
+                UseReqKind::Enabled => Some(true),
+                UseReqKind::Disabled => Some(false),
+                UseReqKind::EnabledIfParent => parent_enabled.then_some(true),
+                UseReqKind::DisabledIfParent => (!parent_enabled).then_some(false),
+                UseReqKind::EqualToParent => Some(parent_enabled),
+                UseReqKind::OppositeToParent => Some(!parent_enabled),
+            };
+            let Some(need) = need else { continue };
+            if new_use.contains(&dep.flag) == need {
+                continue;
+            }
+            if need {
+                new_use.insert(dep.flag.clone());
+            } else {
+                new_use.remove(&dep.flag);
+            }
+            changes.push(UseChange {
+                flag: dep.flag.clone(),
+                enable: need,
+            });
+        }
+        // No toggle helps, or the toggled USE still does not satisfy every
+        // dependency (an undeclared or locked flag the atom requires): leave the
+        // candidate unsatisfiable.
+        if changes.is_empty()
+            || !use_deps_satisfied(atom, &new_use, cand_iuse, parent_use, features)
+        {
+            return None;
+        }
+        Some((new_use, changes))
     }
 
     /// The blocker atom's matching versions (repository and installed) grouped

@@ -17,14 +17,14 @@
 //! REQUIRED_USE on the chosen USE, and reports a sub-slot rebuild trigger when
 //! the chosen provider's sub-slot differs from an installed `:=` binding.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use moraine_eapi::features_for;
 use moraine_solver::{Dependencies, DependencyProvider, Range};
 use moraine_version::Version;
 
 use crate::depnode::DepNode;
-use crate::encode::Encoder;
+use crate::encode::{Encoder, UseProposal};
 use crate::required_use::{RequiredUseOutcome, evaluate_required_use};
 use crate::source::{PackageMeta, ResolveSource};
 
@@ -57,6 +57,12 @@ pub struct GentooProvider<'s, S: ResolveSource> {
     branch_mask: BTreeSet<String>,
     /// The `||` branch decisions made during the most recent encoding pass.
     branch_points: std::cell::RefCell<Vec<crate::encode::BranchPoint>>,
+    /// USE-autounmask overrides seeded by the resolve layer: `cp` to its
+    /// proposed enabled USE, consulted by [`Self::effective_use`] in place of
+    /// `source.resolved_use`.
+    use_overrides: BTreeMap<String, BTreeSet<String>>,
+    /// USE-autounmask proposals discovered during the most recent encoding pass.
+    use_proposals: std::cell::RefCell<Vec<UseProposal>>,
 }
 
 impl<'s, S: ResolveSource> GentooProvider<'s, S> {
@@ -69,16 +75,20 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
             modifiers: crate::resolve::Modifiers::default(),
             branch_mask: BTreeSet::new(),
             branch_points: std::cell::RefCell::new(Vec::new()),
+            use_overrides: BTreeMap::new(),
+            use_proposals: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     /// Create a provider whose synthetic root depends on the given request
-    /// atoms, masking the given `||` branch-leader keys.
+    /// atoms, masking the given `||` branch-leader keys and seeding the given
+    /// USE-autounmask overrides.
     pub(crate) fn with_request(
         source: &'s S,
         request: Vec<crate::depnode::NormAtom>,
         modifiers: crate::resolve::Modifiers,
         branch_mask: BTreeSet<String>,
+        use_overrides: BTreeMap<String, BTreeSet<String>>,
     ) -> Self {
         GentooProvider {
             source,
@@ -86,12 +96,28 @@ impl<'s, S: ResolveSource> GentooProvider<'s, S> {
             modifiers,
             branch_mask,
             branch_points: std::cell::RefCell::new(Vec::new()),
+            use_overrides,
+            use_proposals: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     /// The `||` branch decisions recorded during the most recent solve.
     pub(crate) fn branch_points(&self) -> Vec<crate::encode::BranchPoint> {
         self.branch_points.borrow().clone()
+    }
+
+    /// The USE-autounmask proposals recorded during the most recent solve.
+    pub(crate) fn use_proposals(&self) -> Vec<UseProposal> {
+        self.use_proposals.borrow().clone()
+    }
+
+    /// The effective enabled USE for a candidate: the seeded USE-autounmask
+    /// override for its `cp` when present, otherwise the source's resolved USE.
+    fn effective_use(&self, meta: &PackageMeta) -> BTreeSet<String> {
+        self.use_overrides
+            .get(&meta.cp)
+            .cloned()
+            .unwrap_or_else(|| self.source.resolved_use(meta))
     }
 
     /// Borrow the underlying source.
@@ -212,6 +238,8 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
                 source: self.source,
                 branch_mask: &self.branch_mask,
                 branch_points: &self.branch_points,
+                use_overrides: &self.use_overrides,
+                use_proposals: &self.use_proposals,
             };
             return Dependencies::Known(encoder.request_requirements(&self.request));
         }
@@ -223,13 +251,17 @@ impl<S: ResolveSource> DependencyProvider for GentooProvider<'_, S> {
         };
         let package = cp;
         let features = features_for(&meta.eapi);
-        let resolved_use = self.source.resolved_use(&meta);
+        // The candidate's own USE reflects any seeded USE-autounmask override, so
+        // its conditional dependencies are reduced against the proposed USE.
+        let resolved_use = self.effective_use(&meta);
 
         // Validate strong blockers against the EAPI feature table.
         let encoder = Encoder {
             source: self.source,
             branch_mask: &self.branch_mask,
             branch_points: &self.branch_points,
+            use_overrides: &self.use_overrides,
+            use_proposals: &self.use_proposals,
         };
         let nodes: [&DepNode; 5] = [
             &meta.bdepend,

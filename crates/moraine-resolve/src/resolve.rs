@@ -18,11 +18,44 @@ use crate::solution::{
     AutounmaskChange, BlockVictim, DepClass, DepEdge, RecordedBlocker, ResolvedPackage,
     ResolvedSolution, SlotBinding,
 };
-use crate::source::{Acceptability, PackageMeta, ResolveSource};
+use crate::source::{AcceptChange, Acceptability, PackageMeta, ResolveSource, UseChange};
 
 /// The package manager's own `category/package`, which a blocker may never
 /// uninstall.
 const PACKAGE_MANAGER: &str = "sys-apps/portage";
+
+/// The autounmask policy: which soft-mask dimensions the resolver may relax on
+/// its own, mirroring Portage's `autounmask_keep_*` `myparams` flags. A `keep`
+/// flag left on means the resolver reports the change as a suggestion and
+/// refuses to apply it, while a `keep` flag turned off means the resolver
+/// applies the change and proceeds.
+///
+/// The [`Default`] matches Portage's defaults (`create_depgraph_params`):
+/// keyword and license unmasking are kept locked (`keep_keywords` and
+/// `keep_license` on), while USE unmasking is enabled (`keep_use` off).
+#[derive(Debug, Clone, Copy)]
+pub struct AutounmaskPolicy {
+    /// Keep `~arch` keyword masks locked, reporting a keyword change as a
+    /// suggestion rather than applying it (Portage `autounmask_keep_keywords`).
+    pub keep_keywords: bool,
+    /// Keep non-accepted licenses locked, reporting a license change as a
+    /// suggestion rather than applying it (Portage `autounmask_keep_license`).
+    pub keep_license: bool,
+    /// Keep the active USE locked, suppressing USE-dependency autounmask
+    /// (Portage `autounmask_keep_use`). Off by default, so a USE change is
+    /// proposed and applied.
+    pub keep_use: bool,
+}
+
+impl Default for AutounmaskPolicy {
+    fn default() -> Self {
+        AutounmaskPolicy {
+            keep_keywords: true,
+            keep_license: true,
+            keep_use: false,
+        }
+    }
+}
 
 /// Resolution behavior modifiers, mirroring `emerge`'s `--deep`/`--update`/
 /// `--newuse`. The default (all `false`) keeps the conservative behavior: an
@@ -48,6 +81,9 @@ pub struct Modifiers {
     /// Reinstall an installed package whose ebuild slot or sub-slot changed
     /// (`--changed-slot`).
     pub changed_slot: bool,
+    /// The autounmask policy governing whether a keyword, license, or USE change
+    /// is applied or only reported.
+    pub autounmask: AutounmaskPolicy,
 }
 
 /// Resolve a set of request atom strings against the given source, producing a
@@ -91,18 +127,31 @@ pub fn resolve_with<S: ResolveSource>(
     // graph cannot loop forever. Each fallback masks at least one new branch
     // leader, so the number of distinct fallbacks is finite regardless.
     const MAX_BRANCH_FALLBACKS: u32 = 64;
+    // Bound on the USE-autounmask re-solves, mirroring the slot-restart cap. Each
+    // re-solve seeds at least one new override, so the count is finite.
+    const MAX_USE_RESTARTS: u32 = 8;
     let mut requested_cps: BTreeSet<String> = request_atoms.iter().map(|a| a.cp.clone()).collect();
     let mut extra_atoms: Vec<NormAtom> = Vec::new();
     let mut restarts = 0u32;
     // `||` branch-leader keys masked so far, and a count of the fallback re-solves.
     let mut branch_mask: BTreeSet<String> = BTreeSet::new();
     let mut branch_fallbacks = 0u32;
+    // USE-autounmask overrides accumulated so far (`cp` to proposed enabled USE)
+    // and the per-flag changes to report, plus a count of the re-solves.
+    let mut use_overrides: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut use_changes: BTreeMap<String, Vec<UseChange>> = BTreeMap::new();
+    let mut use_restarts = 0u32;
 
     loop {
         let mut all_atoms = request_atoms.clone();
         all_atoms.extend(extra_atoms.iter().cloned());
-        let provider =
-            GentooProvider::with_request(source, all_atoms, modifiers, branch_mask.clone());
+        let provider = GentooProvider::with_request(
+            source,
+            all_atoms,
+            modifiers,
+            branch_mask.clone(),
+            use_overrides.clone(),
+        );
 
         let (solution, stats) =
             solve_with_stats(&provider, REQUEST_CP.to_owned(), root_version.clone());
@@ -139,10 +188,33 @@ pub fn resolve_with<S: ResolveSource>(
             }
         };
 
-        let mut resolved = assemble_solution(source, &decisions, modifiers)?;
-        // Fold the `||` branch-fallback and slot-restart re-solves into the
-        // reported count, distinct from the solver's inner backjumps (`stats`).
-        resolved.backtracks = stats.backtracks + restarts + branch_fallbacks;
+        // USE-autounmask: fold any newly proposed USE override into the
+        // accumulated set and re-solve, so the candidate's own dependencies are
+        // reduced against the proposed USE. Bounded like the slot-restart loop.
+        if use_restarts < MAX_USE_RESTARTS {
+            let mut new_override = false;
+            for proposal in provider.use_proposals() {
+                let changed = use_overrides
+                    .get(&proposal.cp)
+                    .is_none_or(|existing| *existing != proposal.new_use);
+                if changed {
+                    use_overrides.insert(proposal.cp.clone(), proposal.new_use);
+                    use_changes.insert(proposal.cp, proposal.changes);
+                    new_override = true;
+                }
+            }
+            if new_override {
+                use_restarts += 1;
+                continue;
+            }
+        }
+
+        let mut resolved =
+            assemble_solution(source, &decisions, modifiers, &use_overrides, &use_changes)?;
+        // Fold the `||` branch-fallback, slot-restart, and USE-autounmask
+        // re-solves into the reported count, distinct from the solver's inner
+        // backjumps (`stats`).
+        resolved.backtracks = stats.backtracks + restarts + branch_fallbacks + use_restarts;
 
         if restarts < MAX_SLOT_RESTARTS {
             let pulled = rebuild_consumers(source, &resolved, &requested_cps);
@@ -226,6 +298,8 @@ fn assemble_solution<S: ResolveSource>(
     source: &S,
     decisions: &BTreeMap<String, Version>,
     modifiers: Modifiers,
+    use_overrides: &BTreeMap<String, BTreeSet<String>>,
+    use_changes: &BTreeMap<String, Vec<UseChange>>,
 ) -> Result<ResolvedSolution, ResolveError> {
     // The selected packages, grouped by cp so two slots of one cp both appear.
     let mut selected: BTreeMap<String, Vec<(Version, PackageMeta)>> = BTreeMap::new();
@@ -252,7 +326,12 @@ fn assemble_solution<S: ResolveSource>(
 
     for (cp, slots) in &selected {
         for (version, meta) in slots {
-            let resolved_use = source.resolved_use(meta);
+            // The selected package's USE reflects any USE-autounmask override, so
+            // its recorded USE and conditional edges match the proposed change.
+            let resolved_use = use_overrides
+                .get(cp)
+                .cloned()
+                .unwrap_or_else(|| source.resolved_use(meta));
             let features = features_for(&meta.eapi);
             // `--newuse` turns a USE change against the installed package into a
             // reinstall, so an unchanged-version install with a different USE set
@@ -262,13 +341,34 @@ fn assemble_solution<S: ResolveSource>(
 
             // Autounmask: a newly-merged package the solver could only reach via a
             // soft mask records the keyword/license change the user must accept.
+            // The change is auto-applied only when the policy unlocks its
+            // dimension, otherwise it is reported as a suggestion and the install
+            // path refuses it.
             if !already_installed
                 && let Acceptability::NeedsAccept(change) = source.acceptability(meta)
             {
+                let auto_applied = change_auto_applied(&change, &modifiers.autounmask);
                 autounmask.push(AutounmaskChange {
                     cp: cp.clone(),
                     version: version.clone(),
                     change,
+                    auto_applied,
+                });
+            }
+
+            // USE-dependency autounmask: a proposed `package.use` change, applied
+            // by default (`autounmask_keep_use` off) so resolution proceeded.
+            if let Some(changes) = use_changes.get(cp).filter(|c| !c.is_empty()) {
+                let change = AcceptChange {
+                    use_changes: changes.clone(),
+                    ..Default::default()
+                };
+                let auto_applied = change_auto_applied(&change, &modifiers.autounmask);
+                autounmask.push(AutounmaskChange {
+                    cp: cp.clone(),
+                    version: version.clone(),
+                    change,
+                    auto_applied,
                 });
             }
 
@@ -420,6 +520,16 @@ fn assemble_solution<S: ResolveSource>(
         backtracks: 0,
         autounmask,
     })
+}
+
+/// Whether an autounmask change is applied by the resolver under the policy: a
+/// change dimension is applied only when its matching keep flag is off,
+/// mirroring `_autounmask_levels` yielding a level only when the keep flag is
+/// false. A change carrying a kept-locked dimension is a suggestion, not applied.
+fn change_auto_applied(change: &AcceptChange, policy: &AutounmaskPolicy) -> bool {
+    (change.keyword.is_none() || !policy.keep_keywords)
+        && (change.licenses.is_empty() || !policy.keep_license)
+        && (change.use_changes.is_empty() || !policy.keep_use)
 }
 
 /// Whether the resolved USE for a `(cp, slot)` differs from the installed

@@ -10,7 +10,9 @@ use moraine_common::Interner;
 use moraine_eapi::PERMISSIVE;
 use moraine_resolve::depnode::DepNode;
 use moraine_resolve::normalize::normalize_depspec;
-use moraine_resolve::source::{InstalledMeta, PackageMeta, ResolveSource};
+use moraine_resolve::source::{
+    AcceptChange, Acceptability, InstalledMeta, PackageMeta, ResolveSource,
+};
 use moraine_version::Version;
 
 /// A package to register in the fixture.
@@ -31,6 +33,15 @@ pub struct PkgSpec {
     pub use_enabled: &'static [&'static str],
     /// Whether the package is visible (passes mask/keywords).
     pub visible: bool,
+    /// A `~arch` keyword that autounmask would have to accept. When set, the
+    /// package is not visible and its acceptability is a keyword change.
+    pub accept_keyword: Option<&'static str>,
+    /// Licenses that autounmask would have to accept. When non-empty, the package
+    /// is not visible and its acceptability is a license change.
+    pub accept_licenses: &'static [&'static str],
+    /// Flags pinned by `use.mask`/`use.force`, which USE autounmask must not
+    /// propose to toggle.
+    pub locked_use: &'static [&'static str],
 }
 
 impl Default for PkgSpec {
@@ -50,6 +61,9 @@ impl Default for PkgSpec {
             iuse: &[],
             use_enabled: &[],
             visible: true,
+            accept_keyword: None,
+            accept_licenses: &[],
+            locked_use: &[],
         }
     }
 }
@@ -59,6 +73,11 @@ struct Entry {
     use_enabled: BTreeSet<String>,
     visible: bool,
     provided: bool,
+    /// The keyword/license change autounmask must accept, when the package is
+    /// soft-masked rather than hard-masked.
+    accept: Option<AcceptChange>,
+    /// Flags pinned by `use.mask`/`use.force`.
+    locked_use: BTreeSet<String>,
 }
 
 /// An in-memory test source.
@@ -96,11 +115,29 @@ impl Fixture {
             license: String::new(),
             iuse: spec.iuse.iter().map(|s| (*s).to_owned()).collect(),
         };
+        // A soft-masked package (a keyword or license change) is not visible, so
+        // the visible passes skip it and autounmask admits it instead.
+        let accept = if spec.accept_keyword.is_some() || !spec.accept_licenses.is_empty() {
+            Some(AcceptChange {
+                keyword: spec.accept_keyword.map(|s| s.to_owned()),
+                licenses: spec
+                    .accept_licenses
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+        let visible = spec.visible && accept.is_none();
         self.entries.push(Entry {
             meta,
             use_enabled: spec.use_enabled.iter().map(|s| (*s).to_owned()).collect(),
-            visible: spec.visible,
+            visible,
             provided: false,
+            accept,
+            locked_use: spec.locked_use.iter().map(|s| (*s).to_owned()).collect(),
         });
         self
     }
@@ -142,6 +179,32 @@ impl ResolveSource for Fixture {
             .find(|e| e.meta.cp == meta.cp && e.meta.version == meta.version)
             .map(|e| e.use_enabled.clone())
             .unwrap_or_default()
+    }
+
+    fn locked_use(&self, meta: &PackageMeta) -> BTreeSet<String> {
+        self.entries
+            .iter()
+            .find(|e| e.meta.cp == meta.cp && e.meta.version == meta.version)
+            .map(|e| e.locked_use.clone())
+            .unwrap_or_default()
+    }
+
+    fn acceptability(&self, meta: &PackageMeta) -> Acceptability {
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|e| e.meta.cp == meta.cp && e.meta.version == meta.version)
+        else {
+            return Acceptability::HardMasked;
+        };
+        if entry.visible {
+            Acceptability::Visible
+        } else {
+            match &entry.accept {
+                Some(change) => Acceptability::NeedsAccept(change.clone()),
+                None => Acceptability::HardMasked,
+            }
+        }
     }
 
     fn is_provided(&self, cp: &str, version: &Version) -> bool {
