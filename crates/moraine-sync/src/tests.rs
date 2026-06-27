@@ -401,6 +401,10 @@ fn rsync_server_out_of_date_preserves_tree() {
         openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
+        refresh_retry_overall_timeout: None,
+        refresh_retry_delay_mult: 1.0,
+        refresh_retry_delay_exp_base: 2.0,
+        refresh_retry_delay_max: None,
         post_sync: None,
         volatile: false,
     };
@@ -451,6 +455,10 @@ fn rsync_transfer_includes_standard_excludes_and_extra_opts() {
         openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
+        refresh_retry_overall_timeout: None,
+        refresh_retry_delay_mult: 1.0,
+        refresh_retry_delay_exp_base: 2.0,
+        refresh_retry_delay_max: None,
         post_sync: None,
         volatile: false,
     };
@@ -527,6 +535,10 @@ fn rsync_verification_failure_preserves_prior_tree() {
         openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
+        refresh_retry_overall_timeout: None,
+        refresh_retry_delay_mult: 1.0,
+        refresh_retry_delay_exp_base: 2.0,
+        refresh_retry_delay_max: None,
         post_sync: None,
         volatile: false,
     };
@@ -648,6 +660,10 @@ fn rsync_verify_opts() -> SyncOptions {
         openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
+        refresh_retry_overall_timeout: None,
+        refresh_retry_delay_mult: 1.0,
+        refresh_retry_delay_exp_base: 2.0,
+        refresh_retry_delay_max: None,
         post_sync: None,
         volatile: false,
     }
@@ -834,6 +850,10 @@ fn git_opts(depth: Option<u32>) -> SyncOptions {
         openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
+        refresh_retry_overall_timeout: None,
+        refresh_retry_delay_mult: 1.0,
+        refresh_retry_delay_exp_base: 2.0,
+        refresh_retry_delay_max: None,
         post_sync: None,
         volatile: false,
     }
@@ -846,6 +866,8 @@ fn webrsync_signature_rejection_is_verification_error() {
     let tmp = TempDir::new().unwrap();
     let loc = tmp.path().join("g");
     let staging = tmp.path().join("staging/g");
+    let key = tmp.path().join("release.gpg");
+    std::fs::write(&key, "KEY").unwrap();
     let runner = FakeRunner::new()
         .rule(|s| (s.program == "emerge-webrsync").then(|| fail("gpg: BAD signature")));
     let backend = WebrsyncBackend::new(&runner);
@@ -866,10 +888,14 @@ fn webrsync_signature_rejection_is_verification_error() {
         git_verify_max_age_days: 0,
         webrsync_verify_signature: true,
         webrsync_keep_snapshots: false,
-        openpgp_key_path: None,
+        openpgp_key_path: Some(key),
         openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
+        refresh_retry_overall_timeout: None,
+        refresh_retry_delay_mult: 1.0,
+        refresh_retry_delay_exp_base: 2.0,
+        refresh_retry_delay_max: None,
         post_sync: None,
         volatile: false,
     };
@@ -907,8 +933,10 @@ fn webrsync_command_has_no_repo_and_default_no_pgp_verify() {
     assert!(!call.args.iter().any(|a| a == "--repo"));
 
     // Verify on: the GPG environment is exported and --no-pgp-verify is dropped.
+    let key = tmp.path().join("release.gpg");
+    std::fs::write(&key, "KEY").unwrap();
     opts.webrsync_verify_signature = true;
-    opts.openpgp_key_path = Some(std::path::PathBuf::from("/keys/release.gpg"));
+    opts.openpgp_key_path = Some(key);
     opts.openpgp_keyserver = Some("hkps://keys.gentoo.org".into());
     opts.webrsync_keep_snapshots = true;
     let runner2 = FakeRunner::new().rule(|s| (s.program == "emerge-webrsync").then(|| ok("")));
@@ -957,6 +985,10 @@ fn webrsync_opts() -> SyncOptions {
         openpgp_keyserver: None,
         key_refresh: crate::options::KeyRefresh::Disabled,
         refresh_retries: 0,
+        refresh_retry_overall_timeout: None,
+        refresh_retry_delay_mult: 1.0,
+        refresh_retry_delay_exp_base: 2.0,
+        refresh_retry_delay_max: None,
         post_sync: None,
         volatile: false,
     }
@@ -1010,15 +1042,180 @@ fn key_refresh_attempted_under_keyserver_policy() {
     let mut opts = git_opts(None);
     opts.openpgp_key_path = Some(key);
     opts.key_refresh = crate::options::KeyRefresh::Keyserver;
+    opts.openpgp_keyserver = Some("hkps://keys.gentoo.org".into());
     opts.refresh_retries = 2;
 
     verifier.prepare_keys("g", &opts, &home).unwrap();
+    // The configured keyserver is forwarded to gpg via `--keyserver`.
+    let refresh = runner
+        .calls()
+        .into_iter()
+        .find(|c| c.args.iter().any(|a| a == "--refresh-keys"))
+        .expect("keyserver policy must run a refresh");
+    let pos = refresh
+        .args
+        .iter()
+        .position(|a| a == "--keyserver")
+        .unwrap();
+    assert_eq!(refresh.args[pos + 1], "hkps://keys.gentoo.org");
+    // WKD is not attempted under the keyserver-only policy.
     assert!(
-        runner
+        !runner
             .calls()
             .iter()
-            .any(|c| c.args.iter().any(|a| a == "--refresh-keys"))
+            .any(|c| c.args.iter().any(|a| a == "--locate-external-key"))
     );
+}
+
+#[test]
+fn wkd_then_keyserver_falls_back_when_wkd_fails() {
+    use crate::verify::Verifier;
+    let tmp = TempDir::new().unwrap();
+    let key = tmp.path().join("key.gpg");
+    std::fs::write(&key, "KEY").unwrap();
+    let home = tmp.path().join("gnupg");
+
+    let runner = FakeRunner::new()
+        .rule(|s| (s.program == "gpg" && s.args.iter().any(|a| a == "--import")).then(|| ok("")))
+        .rule(|s| {
+            (s.program == "gpg" && s.args.iter().any(|a| a == "--locate-external-key"))
+                .then(|| fail("no WKD entry"))
+        })
+        .rule(|s| {
+            (s.program == "gpg" && s.args.iter().any(|a| a == "--refresh-keys")).then(|| ok(""))
+        });
+    let verifier = Verifier::new(&runner);
+    let mut opts = git_opts(None);
+    opts.openpgp_key_path = Some(key);
+    opts.key_refresh = crate::options::KeyRefresh::WkdThenKeyserver;
+
+    verifier.prepare_keys("g", &opts, &home).unwrap();
+    let calls = runner.calls();
+    // WKD is attempted first, then the keyserver refresh runs as the fallback.
+    let wkd = calls
+        .iter()
+        .position(|c| c.args.iter().any(|a| a == "--locate-external-key"))
+        .expect("WKD must be attempted first");
+    let keyserver = calls
+        .iter()
+        .position(|c| c.args.iter().any(|a| a == "--refresh-keys"))
+        .expect("keyserver fallback must run after WKD fails");
+    assert!(wkd < keyserver);
+}
+
+#[test]
+fn keyserver_refresh_honors_retry_count_then_fails() {
+    use crate::verify::Verifier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let tmp = TempDir::new().unwrap();
+    let key = tmp.path().join("key.gpg");
+    std::fs::write(&key, "KEY").unwrap();
+    let home = tmp.path().join("gnupg");
+
+    let refreshes = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = refreshes.clone();
+    let runner = FakeRunner::new()
+        .rule(|s| (s.program == "gpg" && s.args.iter().any(|a| a == "--import")).then(|| ok("")))
+        .rule(move |s| {
+            if s.program == "gpg" && s.args.iter().any(|a| a == "--refresh-keys") {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Some(fail("keyserver unreachable"))
+            } else {
+                None
+            }
+        });
+    let verifier = Verifier::new(&runner);
+    let mut opts = git_opts(None);
+    opts.openpgp_key_path = Some(key);
+    opts.key_refresh = crate::options::KeyRefresh::Keyserver;
+    opts.refresh_retries = 3;
+    // A zero multiplier exercises the retry count without any real sleep.
+    opts.refresh_retry_delay_mult = 0.0;
+
+    let err = verifier.prepare_keys("g", &opts, &home).unwrap_err();
+    assert!(matches!(err, SyncError::Verification { .. }));
+    assert_eq!(
+        refreshes.load(Ordering::SeqCst),
+        3,
+        "the configured retry count must be honored"
+    );
+}
+
+#[test]
+fn webrsync_verify_without_key_path_fails_fast() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    let staging = tmp.path().join("staging/g");
+    let runner = FakeRunner::new().rule(|s| (s.program == "emerge-webrsync").then(|| ok("")));
+    let backend = WebrsyncBackend::new(&runner);
+    let mut opts = webrsync_opts();
+    opts.webrsync_verify_signature = true;
+    opts.openpgp_key_path = None;
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    let err = backend.fetch(&ctx).unwrap_err();
+    assert!(matches!(err, SyncError::Verification { .. }));
+    assert!(
+        runner.calls().is_empty(),
+        "no helper call when the key path is unset"
+    );
+}
+
+#[test]
+fn webrsync_verify_with_missing_key_file_fails_fast() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    let staging = tmp.path().join("staging/g");
+    let runner = FakeRunner::new().rule(|s| (s.program == "emerge-webrsync").then(|| ok("")));
+    let backend = WebrsyncBackend::new(&runner);
+    let mut opts = webrsync_opts();
+    opts.webrsync_verify_signature = true;
+    opts.openpgp_key_path = Some(tmp.path().join("absent.gpg"));
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    let err = backend.fetch(&ctx).unwrap_err();
+    assert!(matches!(err, SyncError::Verification { .. }));
+    assert!(
+        runner.calls().is_empty(),
+        "no helper call when the key file is missing"
+    );
+}
+
+#[test]
+fn webrsync_verify_with_present_key_invokes_helper() {
+    let tmp = TempDir::new().unwrap();
+    let loc = tmp.path().join("g");
+    let staging = tmp.path().join("staging/g");
+    let key = tmp.path().join("release.gpg");
+    std::fs::write(&key, "KEY").unwrap();
+    let runner = FakeRunner::new().rule(|s| (s.program == "emerge-webrsync").then(|| ok("")));
+    let backend = WebrsyncBackend::new(&runner);
+    let mut opts = webrsync_opts();
+    opts.webrsync_verify_signature = true;
+    opts.openpgp_key_path = Some(key);
+    let ctx = SyncContext {
+        repo: "g",
+        location: &loc,
+        staging: &staging,
+        options: &opts,
+    };
+    backend.fetch(&ctx).unwrap();
+    let call = &runner.calls()[0];
+    assert_eq!(call.program, "emerge-webrsync");
+    assert!(
+        call.env
+            .iter()
+            .any(|(k, v)| k == "PORTAGE_SYNC_WEBRSYNC_GPG" && v == "1")
+    );
+    assert!(call.env.iter().any(|(k, _)| k == "PORTAGE_GPG_KEY"));
 }
 
 // --- corpus-gated live test -------------------------------------------------

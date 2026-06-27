@@ -15,22 +15,28 @@ use crate::error::SyncError;
 /// Whether OpenPGP key refresh is attempted before verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRefresh {
-    /// Refresh keys via a keyserver before verifying.
-    Keyserver,
-    /// Refresh keys via Web Key Directory before verifying.
-    Wkd,
-    /// Do not refresh; verify against the keys as currently loaded.
+    /// Skip refresh silently (`false-nowarn`).
     Disabled,
+    /// Skip refresh after a security warning that revoked keys cannot be
+    /// detected (`false`, `no`, `0`).
+    DisabledWarn,
+    /// Attempt a Web Key Directory refresh first and fall back to a keyserver
+    /// refresh when WKD fails (`true`, `yes`, `wkd`, and unrecognized values).
+    WkdThenKeyserver,
+    /// Refresh from the keyserver only (`keyserver`).
+    Keyserver,
 }
 
 impl KeyRefresh {
-    /// Parse the `sync-openpgp-key-refresh` family of values. Unknown values
-    /// default to keyserver refresh, matching stock behavior.
+    /// Parse the `sync-openpgp-key-refresh` family of values, mirroring
+    /// `lib/portage/repository/config.py` where `yes` maps to `true`, `no` maps
+    /// to `false`, and any unrecognized value defaults to `true`.
     fn parse(value: Option<&str>) -> Self {
         match value.map(str::trim) {
-            Some("no") | Some("false") | Some("0") => KeyRefresh::Disabled,
-            Some("wkd") => KeyRefresh::Wkd,
-            _ => KeyRefresh::Keyserver,
+            Some("false-nowarn") => KeyRefresh::Disabled,
+            Some("false") | Some("no") | Some("0") => KeyRefresh::DisabledWarn,
+            Some("keyserver") => KeyRefresh::Keyserver,
+            _ => KeyRefresh::WkdThenKeyserver,
         }
     }
 }
@@ -59,7 +65,7 @@ impl Default for SyncDefaults {
             timeout_secs: 180,
             retries: 3,
             depth: None,
-            key_refresh: KeyRefresh::Keyserver,
+            key_refresh: KeyRefresh::WkdThenKeyserver,
             refresh_retries: 1,
             verify: false,
         }
@@ -109,8 +115,16 @@ pub struct SyncOptions {
     pub openpgp_keyserver: Option<String>,
     /// The key-refresh policy.
     pub key_refresh: KeyRefresh,
-    /// The refresh retry count.
+    /// The refresh retry count from `sync-openpgp-key-refresh-retry-count`.
     pub refresh_retries: u32,
+    /// `sync-openpgp-key-refresh-retry-overall-timeout` in seconds, when set.
+    pub refresh_retry_overall_timeout: Option<f64>,
+    /// `sync-openpgp-key-refresh-retry-delay-mult`: the backoff multiplier.
+    pub refresh_retry_delay_mult: f64,
+    /// `sync-openpgp-key-refresh-retry-delay-exp-base`: the backoff exponential base.
+    pub refresh_retry_delay_exp_base: f64,
+    /// `sync-openpgp-key-refresh-retry-delay-max`: the per-delay cap in seconds, when set.
+    pub refresh_retry_delay_max: Option<f64>,
     /// The repository-level post-sync command from `post-sync`, when set.
     pub post_sync: Option<Vec<String>>,
     /// Whether the repository is `volatile` (user-managed): its revision history
@@ -209,6 +223,17 @@ impl SyncOptions {
 
         let refresh_retries = parse_u32(get("sync-openpgp-key-refresh-retry-count").as_deref())
             .unwrap_or(defaults.refresh_retries);
+        // The retry tuning defaults mirror Portage's `_key_refresh_retry_decorator`
+        // fallbacks: no overall timeout, multiplier 1, base 2, and no per-delay cap.
+        let refresh_retry_overall_timeout =
+            parse_f64(get("sync-openpgp-key-refresh-retry-overall-timeout").as_deref());
+        let refresh_retry_delay_mult =
+            parse_f64(get("sync-openpgp-key-refresh-retry-delay-mult").as_deref()).unwrap_or(1.0);
+        let refresh_retry_delay_exp_base =
+            parse_f64(get("sync-openpgp-key-refresh-retry-delay-exp-base").as_deref())
+                .unwrap_or(2.0);
+        let refresh_retry_delay_max =
+            parse_f64(get("sync-openpgp-key-refresh-retry-delay-max").as_deref());
 
         // `post-sync` is supplied by the engine from the extras map.
         let post_sync = None;
@@ -234,6 +259,10 @@ impl SyncOptions {
             openpgp_keyserver,
             key_refresh,
             refresh_retries,
+            refresh_retry_overall_timeout,
+            refresh_retry_delay_mult,
+            refresh_retry_delay_exp_base,
+            refresh_retry_delay_max,
             post_sync,
             volatile: false,
         })
@@ -246,4 +275,35 @@ fn parse_u64(value: Option<&str>) -> Option<u64> {
 
 fn parse_u32(value: Option<&str>) -> Option<u32> {
     value.and_then(|v| v.trim().parse().ok())
+}
+
+fn parse_f64(value: Option<&str>) -> Option<f64> {
+    value.and_then(|v| v.trim().parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeyRefresh;
+
+    #[test]
+    fn key_refresh_parse_maps_every_portage_value() {
+        assert_eq!(
+            KeyRefresh::parse(Some("false-nowarn")),
+            KeyRefresh::Disabled
+        );
+        assert_eq!(KeyRefresh::parse(Some("false")), KeyRefresh::DisabledWarn);
+        assert_eq!(KeyRefresh::parse(Some("no")), KeyRefresh::DisabledWarn);
+        assert_eq!(KeyRefresh::parse(Some("0")), KeyRefresh::DisabledWarn);
+        assert_eq!(
+            KeyRefresh::parse(Some("true")),
+            KeyRefresh::WkdThenKeyserver
+        );
+        assert_eq!(KeyRefresh::parse(Some("yes")), KeyRefresh::WkdThenKeyserver);
+        assert_eq!(KeyRefresh::parse(Some("wkd")), KeyRefresh::WkdThenKeyserver);
+        assert_eq!(KeyRefresh::parse(Some("keyserver")), KeyRefresh::Keyserver);
+        assert_eq!(
+            KeyRefresh::parse(Some("bogus")),
+            KeyRefresh::WkdThenKeyserver
+        );
+    }
 }

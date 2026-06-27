@@ -33,11 +33,25 @@ impl<R: CommandRunner> WebrsyncBackend<R> {
         let opts = ctx.options;
         let mut spec = CommandSpec::new("emerge-webrsync");
         if opts.webrsync_verify_signature {
+            // Portage's `WebRsync.sync` hard-fails before invoking the helper when
+            // verification is enabled but the key path is unset or missing, rather
+            // than letting the helper fall back to its ambient keyring.
+            let key = opts
+                .openpgp_key_path
+                .as_ref()
+                .filter(|path| path.is_file())
+                .ok_or_else(|| SyncError::Verification {
+                    repo: ctx.repo.to_owned(),
+                    reason: match &opts.openpgp_key_path {
+                        Some(path) => {
+                            format!("sync-openpgp-key-path file not found: {}", path.display())
+                        }
+                        None => "sync-openpgp-key-path is not set".to_owned(),
+                    },
+                })?;
             // Opt into signature verification via the GPG environment Portage uses.
             spec = spec.env("PORTAGE_SYNC_WEBRSYNC_GPG", "1");
-            if let Some(key) = &opts.openpgp_key_path {
-                spec = spec.env("PORTAGE_GPG_KEY", key.to_string_lossy().into_owned());
-            }
+            spec = spec.env("PORTAGE_GPG_KEY", key.to_string_lossy().into_owned());
             if let Some(server) = &opts.openpgp_keyserver {
                 spec = spec.env("PORTAGE_GPG_KEY_SERVER", server.clone());
             }
