@@ -106,6 +106,11 @@ pub struct BinaryCandidate {
     pub version: Version,
     /// The binary's embedded metadata, including the recorded dependency keys.
     pub metadata: MetadataMap,
+    /// The IUSE of the matching ebuild this binary would replace, empty when no
+    /// ebuild matched (for example under `--usepkgonly`). The USE check uses it
+    /// to reject a binary built against a different IUSE set than the tree's
+    /// current ebuild.
+    pub current_iuse: BTreeSet<String>,
 }
 
 impl BinaryCandidate {
@@ -235,13 +240,35 @@ fn check_use(candidate: &BinaryCandidate, target: &TargetConfig) -> Option<Rejec
         recorded_effective.retain(|f| iuse.contains(f));
     }
 
-    let extra: Vec<String> = recorded_effective.difference(&wanted).cloned().collect();
-    let missing: Vec<String> = wanted.difference(&recorded_effective).cloned().collect();
+    let mut extra: BTreeSet<String> = recorded_effective.difference(&wanted).cloned().collect();
+    let mut missing: BTreeSet<String> = wanted.difference(&recorded_effective).cloned().collect();
+
+    // IUSE-set-change term: a binary built against a different IUSE set than the
+    // tree's current ebuild, after subtracting forced flags, is rebuilt from
+    // source, mirroring `flags = set(orig_iuse); flags ^= cur_iuse; flags -=
+    // forced_flags` (`lib/_emerge/depgraph.py:2974-2978`). Skipped when the
+    // current ebuild's IUSE is unknown (no ebuild matched), since there is no
+    // source candidate to fall back to anyway.
+    if !candidate.current_iuse.is_empty() {
+        for flag in iuse.symmetric_difference(&candidate.current_iuse) {
+            if target.forced_use.contains(flag) {
+                continue;
+            }
+            if iuse.contains(flag) {
+                extra.insert(flag.clone());
+            } else {
+                missing.insert(flag.clone());
+            }
+        }
+    }
 
     if extra.is_empty() && missing.is_empty() {
         None
     } else {
-        Some(Rejection::UseMismatch { extra, missing })
+        Some(Rejection::UseMismatch {
+            extra: extra.into_iter().collect(),
+            missing: missing.into_iter().collect(),
+        })
     }
 }
 
@@ -299,6 +326,7 @@ mod tests {
             cp: "dev-libs/foo".into(),
             version: Version::parse("1.2.3").unwrap(),
             metadata: m,
+            current_iuse: BTreeSet::new(),
         }
     }
 
@@ -363,6 +391,46 @@ mod tests {
             }
             other => panic!("expected use mismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn changed_iuse_set_rejects_binary() {
+        // The current ebuild gained `zlib` in its IUSE since the binary was
+        // built, so the IUSE sets differ on a non-forced flag and the binary is
+        // rebuilt from source.
+        let mut c = candidate("ssl", "x86_64-pc-linux-gnu");
+        c.metadata.set_str(crate::metadata::KEY_IUSE, "ssl");
+        c.current_iuse = ["ssl", "zlib"].iter().map(|s| s.to_string()).collect();
+        let t = target(&["ssl"], "x86_64-pc-linux-gnu");
+        match check_compatibility(&c, &t) {
+            Verdict::Reject(Rejection::UseMismatch { missing, .. }) => {
+                assert_eq!(missing, vec!["zlib".to_string()]);
+            }
+            other => panic!("expected use mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn changed_iuse_on_forced_flag_does_not_reject() {
+        // The IUSE sets differ only on `zlib`, but `zlib` is forced, so the term
+        // subtracts it and the binary is accepted.
+        let mut c = candidate("ssl", "x86_64-pc-linux-gnu");
+        c.metadata.set_str(crate::metadata::KEY_IUSE, "ssl");
+        c.current_iuse = ["ssl", "zlib"].iter().map(|s| s.to_string()).collect();
+        let mut t = target(&["ssl"], "x86_64-pc-linux-gnu");
+        t.forced_use.insert("zlib".into());
+        assert_eq!(check_compatibility(&c, &t), Verdict::Accept);
+    }
+
+    #[test]
+    fn unknown_current_iuse_skips_change_check() {
+        // No ebuild matched, so `current_iuse` is empty and the IUSE-set-change
+        // term is skipped rather than rejecting the binary.
+        let mut c = candidate("ssl", "x86_64-pc-linux-gnu");
+        c.metadata.set_str(crate::metadata::KEY_IUSE, "ssl");
+        assert!(c.current_iuse.is_empty());
+        let t = target(&["ssl"], "x86_64-pc-linux-gnu");
+        assert_eq!(check_compatibility(&c, &t), Verdict::Accept);
     }
 
     #[test]

@@ -109,6 +109,14 @@ pub fn read_package_with_policy(
             })
         }
         Format::Xpak => {
+            // A legacy xpak/tbz2 carries no Manifest signature, so it cannot
+            // satisfy `binpkg-request-signature`. Reject it rather than install it
+            // unsigned, mirroring Portage's `gpkg_only = True` gate.
+            if policy == SignaturePolicy::RequestSignature {
+                return Err(ContainerError::Signature(
+                    "binpkg-request-signature: legacy xpak/tbz2 carries no signature".into(),
+                ));
+            }
             let pkg = xpak::read(bytes)?;
             Ok(Package {
                 format: Format::Xpak,
@@ -147,5 +155,17 @@ mod tests {
         let pkg = read_package(&file, None).unwrap();
         assert_eq!(pkg.format, Format::Xpak);
         assert_eq!(pkg.metadata, meta());
+    }
+
+    #[test]
+    fn request_signature_rejects_xpak() {
+        // An xpak/tbz2 carries no Manifest signature, so under
+        // `binpkg-request-signature` it must be rejected rather than installed
+        // unsigned.
+        let file = xpak::build_tbz2(b"img", &meta());
+        let res = read_package_with_policy(&file, None, SignaturePolicy::RequestSignature);
+        assert!(matches!(res, Err(ContainerError::Signature(_))));
+        // The default policy still reads the xpak.
+        assert!(read_package(&file, None).is_ok());
     }
 }

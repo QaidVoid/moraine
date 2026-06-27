@@ -85,6 +85,7 @@ fn corpus_local_gpkg_tar_install_path() {
             cp: cp.clone(),
             version: Version::parse("1").unwrap(),
             metadata: pkg.metadata.clone(),
+            current_iuse: BTreeSet::new(),
         };
         let mut available_sonames: BTreeSet<(String, String)> = BTreeSet::new();
         if let Some(requires) = pkg.metadata.get_str("REQUIRES") {

@@ -19,7 +19,7 @@ use moraine_common::Interner;
 use moraine_eapi::PERMISSIVE;
 
 use crate::error::IndexError;
-use crate::metadata::{KEY_DESCRIPTION, KEY_MTIME, KEY_REPOSITORY, MetadataMap};
+use crate::metadata::{KEY_CHOST, KEY_DESCRIPTION, KEY_MTIME, KEY_REPOSITORY, MetadataMap};
 
 /// The newest `Packages` index version this crate understands.
 ///
@@ -89,23 +89,34 @@ pub struct PackageEntry {
 }
 
 impl PackageEntry {
-    /// Resolve this package's full download URL: the stanza `PKGINDEX_URI` or
-    /// `BASE_URI`, else the header `URI`, with the stanza `PATH` appended as
-    /// `<base>/<PATH>` (`BASE_URI.rstrip("/") + "/" + PATH.lstrip("/")`), matching
-    /// Portage's `BinpkgFetcher`. Returns `None` when no base URI is configured.
-    pub fn download_base(&self, header: &BTreeMap<String, String>) -> Option<String> {
+    /// Resolve the base download URI this package fetches against: the stanza
+    /// `PKGINDEX_URI` or `BASE_URI`, else the header `URI`/`PKGINDEX_URI`, with any
+    /// trailing slash trimmed. This is the `pkgindex.header.get("URI", base_url)`
+    /// base Portage injects per stanza as `BASE_URI`. Returns `None` when no base
+    /// URI is configured.
+    pub fn download_base_uri(&self, header: &BTreeMap<String, String>) -> Option<String> {
         let base = self
             .metadata
             .get_str("PKGINDEX_URI")
             .or_else(|| self.metadata.get_str("BASE_URI"))
             .or_else(|| header.get("URI").cloned())
             .or_else(|| header.get("PKGINDEX_URI").cloned())?;
-        let base = base.trim_end_matches('/');
+        Some(base.trim_end_matches('/').to_string())
+    }
+
+    /// Resolve this package's full download URL: the [`download_base_uri`] with
+    /// the stanza `PATH` appended as `<base>/<PATH>`
+    /// (`BASE_URI.rstrip("/") + "/" + PATH.lstrip("/")`), matching Portage's
+    /// `BinpkgFetcher`. Returns `None` when no base URI is configured.
+    ///
+    /// [`download_base_uri`]: PackageEntry::download_base_uri
+    pub fn download_base(&self, header: &BTreeMap<String, String>) -> Option<String> {
+        let base = self.download_base_uri(header)?;
         match self.metadata.get_str("PATH") {
             Some(path) if !path.is_empty() => {
                 Some(format!("{base}/{}", path.trim_start_matches('/')))
             }
-            _ => Some(base.to_string()),
+            _ => Some(base),
         }
     }
 
@@ -184,6 +195,7 @@ impl PackagesIndex {
                 let canonical = from_index_key(&key);
                 metadata.set_str(canonical, value);
             }
+            inherit_header_keys(&mut metadata, &index.header);
             index.packages.push(PackageEntry { cpv, metadata });
         }
         tracing::info!(packages = index.packages.len(), "index parsed");
@@ -329,6 +341,29 @@ fn reduce_use(
     };
     let reduced = spec.evaluate(enabled);
     reduced.render(interner)
+}
+
+/// Re-inherit the binhost header keys `CHOST` and `repository` into a stanza
+/// that omits them, mirroring Portage's `_pkgindex_inherited_keys` applied in
+/// `IndexStanzas` reading. A real binhost records `CHOST` once in the header
+/// rather than in every stanza, so without this the parsed stanza carries no
+/// `CHOST` and the foreign-CHOST compatibility check cannot fire. A stanza that
+/// already records a key keeps its own value. The header may spell the
+/// repository key as `repository` or its serialized `REPO`.
+fn inherit_header_keys(metadata: &mut MetadataMap, header: &BTreeMap<String, String>) {
+    if metadata.get_str(KEY_CHOST).is_none()
+        && let Some(chost) = header.get(KEY_CHOST).filter(|v| !v.is_empty())
+    {
+        metadata.set_str(KEY_CHOST, chost);
+    }
+    if metadata.get_str(KEY_REPOSITORY).is_none()
+        && let Some(repo) = header
+            .get(KEY_REPOSITORY)
+            .or_else(|| header.get("REPO"))
+            .filter(|v| !v.is_empty())
+    {
+        metadata.set_str(KEY_REPOSITORY, repo);
+    }
 }
 
 /// Translate a canonical key name to its `Packages` index name.
@@ -575,6 +610,42 @@ mod tests {
         assert!(index.remove("a/b-1"));
         assert_eq!(index.packages.len(), 0);
         assert!(!index.remove("a/b-1"));
+    }
+
+    #[test]
+    fn stanza_inherits_header_chost_and_repository() {
+        use crate::metadata::KEY_CHOST;
+
+        let text = "VERSION: 0\nCHOST: x86_64-pc-linux-gnu\nrepository: gentoo\n\n\
+             CPV: dev-libs/foo-1\nSLOT: 0\n\n\
+             CPV: dev-libs/bar-1\nSLOT: 0\nCHOST: i686-pc-linux-gnu\n";
+        let parsed = PackagesIndex::parse(text).unwrap();
+
+        // The stanza that omits CHOST/repository inherits the header values.
+        let foo = parsed
+            .packages
+            .iter()
+            .find(|p| p.cpv == "dev-libs/foo-1")
+            .unwrap();
+        assert_eq!(
+            foo.metadata.get_str(KEY_CHOST).as_deref(),
+            Some("x86_64-pc-linux-gnu")
+        );
+        assert_eq!(
+            foo.metadata.get_str(KEY_REPOSITORY).as_deref(),
+            Some("gentoo")
+        );
+
+        // The stanza with its own CHOST keeps it rather than the header value.
+        let bar = parsed
+            .packages
+            .iter()
+            .find(|p| p.cpv == "dev-libs/bar-1")
+            .unwrap();
+        assert_eq!(
+            bar.metadata.get_str(KEY_CHOST).as_deref(),
+            Some("i686-pc-linux-gnu")
+        );
     }
 
     #[test]

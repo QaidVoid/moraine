@@ -154,7 +154,7 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     } else {
         None
     };
-    let bin_candidates = binary_candidates(&pkgdir, binhost.as_ref());
+    let bin_candidates = binary_candidates(&pkgdir, binhost.as_ref(), &repo_index);
     let bin_target = if bin_candidates.is_empty() {
         None
     } else {
@@ -991,11 +991,15 @@ impl BinaryContext {
 fn binary_candidates(
     pkgdir: &Path,
     binhost: Option<&crate::binhost::IndexedBinhost>,
+    repo_index: &RepoIndex,
 ) -> HashMap<String, moraine_binpkg::BinaryCandidate> {
     let mut map: HashMap<String, moraine_binpkg::BinaryCandidate> = HashMap::new();
     if let Some(bh) = binhost {
         for (cpv, metadata) in bh.candidate_metadata() {
-            map.insert(cpv.clone(), candidate_from(&cpv, metadata.clone()));
+            map.insert(
+                cpv.clone(),
+                candidate_from(&cpv, metadata.clone(), repo_index),
+            );
         }
     }
     // Local packages override binhost stanzas: the on-disk metadata is read
@@ -1004,10 +1008,35 @@ fn binary_candidates(
         if let Ok(bytes) = std::fs::read(&path)
             && let Ok(pkg) = moraine_binpkg::read_package(&bytes, None)
         {
-            map.insert(cpv.clone(), candidate_from(&cpv, pkg.metadata));
+            map.insert(cpv.clone(), candidate_from(&cpv, pkg.metadata, repo_index));
         }
     }
     map
+}
+
+/// The IUSE of the ebuild matching `cpv` in the repo index, with the `+`/`-`
+/// default prefix stripped, empty when no ebuild matches. Threaded onto a
+/// [`moraine_binpkg::BinaryCandidate`] so the USE check can reject a binary
+/// built against a different IUSE set than the tree's current ebuild.
+fn ebuild_iuse(repo_index: &RepoIndex, cpv: &str) -> BTreeSet<String> {
+    let candidates = repo_index.match_atom_str(&format!("={cpv}"));
+    let Some(candidate) = candidates.first() else {
+        return BTreeSet::new();
+    };
+    let Some(rs) = repo_index.repos().get(candidate.repo_order) else {
+        return BTreeSet::new();
+    };
+    let interner = rs.store.interner();
+    candidate
+        .entry
+        .iuse
+        .iter()
+        .filter_map(|s| {
+            interner
+                .resolve(*s)
+                .map(|x| x.trim_start_matches(['+', '-']).to_string())
+        })
+        .collect()
 }
 
 /// Every local `.gpkg.tar` package under `pkgdir` as `(cpv, path)` pairs,
@@ -1058,10 +1087,12 @@ fn strip_build_id(stem: &str) -> String {
     }
 }
 
-/// Build a [`moraine_binpkg::BinaryCandidate`] from a cpv and recorded metadata.
+/// Build a [`moraine_binpkg::BinaryCandidate`] from a cpv and recorded metadata,
+/// populating `current_iuse` from the matching ebuild in `repo_index`.
 fn candidate_from(
     cpv: &str,
     metadata: moraine_binpkg::MetadataMap,
+    repo_index: &RepoIndex,
 ) -> moraine_binpkg::BinaryCandidate {
     let (category, pf) = split_cpv(cpv);
     let (pn, pvr) = split_pf(&pf);
@@ -1071,10 +1102,12 @@ fn candidate_from(
         format!("{category}/{pn}")
     };
     let version = Version::parse(&pvr).unwrap_or_else(|_| Version::parse("0").unwrap());
+    let current_iuse = ebuild_iuse(repo_index, cpv);
     moraine_binpkg::BinaryCandidate {
         cp,
         version,
         metadata,
+        current_iuse,
     }
 }
 

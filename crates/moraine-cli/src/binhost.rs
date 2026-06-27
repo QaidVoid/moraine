@@ -87,27 +87,35 @@ fn parse_binrepos(path: &Path) -> Vec<String> {
     hosts.into_iter().map(|(_, uri)| uri).collect()
 }
 
-/// A binary-package source backed by a fetched and parsed `Packages` index.
+/// A binary-package source backed by the fetched and merged `Packages` indices
+/// of every configured binhost.
 pub struct IndexedBinhost {
-    base_uri: String,
     index: PackagesIndex,
     fetch: FetchCommand,
     stage: PathBuf,
 }
 
 impl IndexedBinhost {
-    /// Load the `Packages` index for the first reachable host in `uris`.
+    /// Load and merge the `Packages` index of every reachable host in `uris`.
     ///
-    /// The index is cached under `cache_dir` and reused as-is on later runs; it
-    /// is fetched only when missing, or when `refresh` is set (the `--sync`
-    /// path). This mirrors how repository metadata refreshes on sync rather than
-    /// on every invocation. Returns `None` when no host yields an index.
+    /// Each host's index is cached under `cache_dir` and reused as-is on later
+    /// runs; it is fetched only when missing, or when `refresh` is set (the
+    /// `--sync` path). The hosts are merged in the given descending-priority
+    /// order with first-seen-wins precedence: a cpv already contributed by a
+    /// higher-priority host is not overwritten, mirroring Portage's iteration
+    /// over `_binrepos_conf` with `cpv_exists`. Each merged stanza records its
+    /// own `BASE_URI`, set to the producing host's index header `URI` and falling
+    /// back to that host's sync-uri, so a merged index keeps every stanza
+    /// pointing at the host it came from. Returns `None` when no host yields an
+    /// index.
     pub fn load(
         uris: &[String],
         fetch: FetchCommand,
         cache_dir: &Path,
         refresh: bool,
     ) -> Option<IndexedBinhost> {
+        let mut merged = PackagesIndex::default();
+        let mut have_any = false;
         for base in uris {
             let host_dir = cache_dir.join(host_key(base));
             let dest = host_dir.join("Packages");
@@ -121,16 +129,46 @@ impl IndexedBinhost {
             let Ok(text) = std::fs::read_to_string(&dest) else {
                 continue;
             };
-            if let Ok(index) = PackagesIndex::parse(&text) {
-                return Some(IndexedBinhost {
-                    base_uri: base.trim_end_matches('/').to_owned(),
-                    index,
-                    fetch,
-                    stage: host_dir,
-                });
+            let Ok(mut index) = PackagesIndex::parse(&text) else {
+                continue;
+            };
+
+            // Each stanza downloads from this host's header `URI`, falling back to
+            // the host's sync-uri, mirroring `BASE_URI = pkgindex.header.get(
+            // "URI", base_url)`.
+            let remote_base = index
+                .header
+                .get("URI")
+                .cloned()
+                .unwrap_or_else(|| base.trim_end_matches('/').to_owned());
+            for entry in &mut index.packages {
+                entry.metadata.set_str("BASE_URI", &remote_base);
+            }
+
+            if !have_any {
+                merged.header = index.header.clone();
+                have_any = true;
+            }
+            // First-seen-wins: keep every stanza whose cpv was not already
+            // contributed by a higher-priority host. Stanzas within this host
+            // sharing a cpv (multi-instance builds) are all kept.
+            let existing: std::collections::BTreeSet<String> =
+                merged.packages.iter().map(|p| p.cpv.clone()).collect();
+            for entry in index.packages {
+                if !existing.contains(&entry.cpv) {
+                    merged.packages.push(entry);
+                }
             }
         }
-        None
+        if !have_any {
+            return None;
+        }
+        let _ = std::fs::create_dir_all(cache_dir);
+        Some(IndexedBinhost {
+            index: merged,
+            fetch,
+            stage: cache_dir.to_path_buf(),
+        })
     }
 
     /// Whether the binhost index lists a package for `cpv`.
@@ -215,12 +253,21 @@ impl IndexedBinhost {
 
 impl BinpkgSource for IndexedBinhost {
     fn fetch(&self, task: &InstallTask) -> Result<Option<Vec<u8>>> {
+        let Some(entry) = self.entry(&task.cpv) else {
+            return Ok(None);
+        };
         let Some(path) = self.path_of(&task.cpv) else {
+            return Ok(None);
+        };
+        // Resolve the download base from the stanza/header `BASE_URI`/`URI`
+        // injected at load time rather than a sync-uri, then join the derived
+        // path, mirroring Portage's per-stanza `BASE_URI`.
+        let Some(base) = entry.download_base_uri(&self.index.header) else {
             return Ok(None);
         };
         let pf = task.cpv.rsplit('/').next().unwrap_or(&task.cpv);
         let dest = self.stage.join(format!("{pf}.gpkg.tar"));
-        let url = format!("{}/{}", self.base_uri, path);
+        let url = format!("{base}/{}", path.trim_start_matches('/'));
         if self.fetch.run(&url, &dest).is_err() {
             return Ok(None);
         }
@@ -231,10 +278,10 @@ impl BinpkgSource for IndexedBinhost {
         // Bind the downloaded bytes to the published index digests before the
         // container is trusted. A mismatch reports the container unavailable so
         // the resolver falls back to a source candidate.
-        match self.entry(&task.cpv) {
-            Some(entry) if !container_matches_entry(entry, &bytes) => Ok(None),
-            _ => Ok(Some(bytes)),
+        if !container_matches_entry(entry, &bytes) {
+            return Ok(None);
         }
+        Ok(Some(bytes))
     }
 }
 
@@ -330,7 +377,6 @@ mod tests {
             });
         }
         let binhost = IndexedBinhost {
-            base_uri: "https://binhost".into(),
             index,
             fetch: FetchCommand::default(),
             stage: PathBuf::from("/tmp"),
@@ -339,6 +385,97 @@ mod tests {
             binhost.build_id("app-text/xmlto-0.0.28-r11").as_deref(),
             Some("21")
         );
+    }
+
+    #[test]
+    fn merges_all_hosts_by_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path();
+        let high = "https://high/binpkgs";
+        let low = "https://low/binpkgs";
+
+        // High-priority host: foo (only here) and shared.
+        let high_dir = cache.join(host_key(high));
+        std::fs::create_dir_all(&high_dir).unwrap();
+        std::fs::write(
+            high_dir.join("Packages"),
+            "VERSION: 0\n\nCPV: dev-libs/foo-1\nSLOT: 0\n\nCPV: dev-libs/shared-1\nSLOT: 0\n",
+        )
+        .unwrap();
+        // Low-priority host: bar (only here) and shared (must lose to high).
+        let low_dir = cache.join(host_key(low));
+        std::fs::create_dir_all(&low_dir).unwrap();
+        std::fs::write(
+            low_dir.join("Packages"),
+            "VERSION: 0\n\nCPV: dev-libs/bar-1\nSLOT: 0\n\nCPV: dev-libs/shared-1\nSLOT: 0\n",
+        )
+        .unwrap();
+
+        let uris = vec![high.to_string(), low.to_string()];
+        let binhost = IndexedBinhost::load(&uris, FetchCommand::default(), cache, false).unwrap();
+
+        // A package present only on the lower-priority host is still offered.
+        assert!(binhost.contains("dev-libs/bar-1"));
+        // The package present only on the high host is offered too.
+        assert!(binhost.contains("dev-libs/foo-1"));
+        // The colliding cpv is taken from the higher-priority host: its BASE_URI
+        // is the high host's base, not the low host's.
+        let shared = binhost.entry("dev-libs/shared-1").unwrap();
+        assert_eq!(
+            shared.metadata.get_str("BASE_URI").as_deref(),
+            Some("https://high/binpkgs")
+        );
+        // Exactly one stanza for the colliding cpv survives.
+        let count = binhost
+            .index
+            .packages
+            .iter()
+            .filter(|p| p.cpv == "dev-libs/shared-1")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn fetch_uses_header_uri_not_sync_uri() {
+        use moraine_binpkg::{MetadataMap, PackageEntry, PackagesIndex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = MetadataMap::new();
+        // The stanza's injected BASE_URI (a package mirror) differs from the
+        // index host; the fetch must use it plus the stanza PATH.
+        meta.set_str("BASE_URI", "https://mirror/pkgs");
+        meta.set_str("PATH", "dev-libs/foo-1.gpkg.tar");
+        let mut index = PackagesIndex::new();
+        index
+            .header
+            .insert("URI".into(), "https://indexhost/pkgs".into());
+        index.packages.push(PackageEntry {
+            cpv: "dev-libs/foo-1".into(),
+            metadata: meta,
+        });
+
+        // A fetch command that records the requested URI and writes some bytes,
+        // so the test can assert which URL the download targeted.
+        let fetch = FetchCommand {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '%s' \"$2\" > \"$1.url\"; printf 'DATA' > \"$1\"".into(),
+                "sh".into(),
+                "{file}".into(),
+                "{uri}".into(),
+            ],
+        };
+        let binhost = IndexedBinhost {
+            index,
+            fetch,
+            stage: dir.path().to_path_buf(),
+        };
+        let task = InstallTask::merge("dev-libs/foo-1", "dev-libs/foo", "0");
+        let bytes = binhost.fetch(&task).unwrap();
+        assert_eq!(bytes.as_deref(), Some(b"DATA".as_slice()));
+        let url = std::fs::read_to_string(dir.path().join("foo-1.gpkg.tar.url")).unwrap();
+        assert_eq!(url, "https://mirror/pkgs/dev-libs/foo-1.gpkg.tar");
     }
 
     #[test]

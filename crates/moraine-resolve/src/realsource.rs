@@ -594,6 +594,7 @@ mod tests {
             cp: "dev-libs/foo".into(),
             version: Version::parse("1").unwrap(),
             metadata: m,
+            current_iuse: BTreeSet::new(),
         }
     }
 

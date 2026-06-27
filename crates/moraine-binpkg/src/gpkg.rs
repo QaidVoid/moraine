@@ -379,6 +379,7 @@ fn verify_member(
             actual: bytes.len().to_string(),
         });
     }
+    let mut verified_hash_count = 0u32;
     if let Some(expected) = &entry.blake2b {
         let actual = blake2b(bytes);
         if &actual != expected {
@@ -388,6 +389,7 @@ fn verify_member(
                 actual,
             });
         }
+        verified_hash_count += 1;
     }
     if let Some(expected) = &entry.sha512 {
         let actual = sha512(bytes);
@@ -398,6 +400,15 @@ fn verify_member(
                 actual,
             });
         }
+        verified_hash_count += 1;
+    }
+    // Require at least one supported checksum to have been matched, so a Manifest
+    // record that lists only a SIZE and no digest is rejected rather than trusted
+    // on the size alone, mirroring Portage's `verified_hash_count < 1` rejection.
+    if verified_hash_count < 1 {
+        return Err(ContainerError::MalformedGpkg(format!(
+            "member `{rel}` has no supported checksum in the Manifest"
+        )));
     }
     Ok(())
 }
@@ -924,6 +935,46 @@ mod tests {
         let meta = sample_metadata();
         let file = build_gpkg(&meta, Compression::Gzip, false);
         assert!(read_with_policy(&file, None, SignaturePolicy::RequestSignature).is_err());
+    }
+
+    #[test]
+    fn size_only_manifest_record_rejected() {
+        // A Manifest record that lists a SIZE but no BLAKE2B/SHA512 digest must
+        // be rejected: the member cannot be verified on the size alone.
+        let meta = sample_metadata();
+        let comp = Compression::Gzip;
+        let basename = "cat_pkg-1-2";
+        let meta_tar = comp.compress(&build_inner_metadata_tar(&meta)).unwrap();
+        let image_tar = comp.compress(&build_inner_image_tar()).unwrap();
+        let meta_name = format!("metadata.tar.{}", comp.suffix());
+        let image_name = format!("image.tar.{}", comp.suffix());
+        let marker: &[u8] = b"";
+        let manifest = format!(
+            "DATA {MARKER_PREFIX} 0 BLAKE2B {} SHA512 {}\n\
+             DATA {meta_name} {} BLAKE2B {} SHA512 {}\n\
+             DATA {image_name} {}\n",
+            blake2b(marker),
+            sha512(marker),
+            meta_tar.len(),
+            blake2b(&meta_tar),
+            sha512(&meta_tar),
+            image_tar.len(),
+        );
+        let mut builder = tar::Builder::new(Vec::new());
+        append_member(&mut builder, &format!("{basename}/gpkg-1"), b"");
+        append_member(&mut builder, &format!("{basename}/{meta_name}"), &meta_tar);
+        append_member(
+            &mut builder,
+            &format!("{basename}/{image_name}"),
+            &image_tar,
+        );
+        append_member(
+            &mut builder,
+            &format!("{basename}/Manifest"),
+            manifest.as_bytes(),
+        );
+        let file = builder.into_inner().unwrap();
+        assert!(read(&file, None).is_err());
     }
 
     #[test]

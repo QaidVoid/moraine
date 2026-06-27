@@ -55,6 +55,7 @@ fn candidate(use_str: &str, chost: &str, requires: Option<&str>) -> BinaryCandid
         cp: "dev-libs/foo".into(),
         version: Version::parse("1.2.3").unwrap(),
         metadata: m,
+        current_iuse: BTreeSet::new(),
     }
 }
 
