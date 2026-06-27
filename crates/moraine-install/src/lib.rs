@@ -30,7 +30,9 @@ pub mod task;
 pub use apply::EngineApplier;
 pub use commit::{WorldUpdate, env_update, mark_news_read};
 pub use config_update::{PendingUpdate, Resolution, resolve_update};
-pub use engine::{PackageElog, TaskOutcome, TransactionEngine, TransactionReport, has_pending};
+pub use engine::{
+    PackageElog, PackageFailure, TaskOutcome, TransactionEngine, TransactionReport, has_pending,
+};
 pub use error::{InstallError, Result};
 pub use global_update::{GlobalUpdateReport, global_update, update_config_files};
 pub use journal::Journal;

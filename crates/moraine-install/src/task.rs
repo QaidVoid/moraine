@@ -46,6 +46,10 @@ pub struct InstallTask {
     /// The `category/package-version` of a prior version replaced in the same
     /// slot, if any.
     pub replaces: Option<String>,
+    /// The `category/package` keys this task depends on within the same
+    /// transaction, used by `--keep-going` to drop a failed package's
+    /// in-transaction dependents.
+    pub requires: Vec<String>,
 }
 
 impl InstallTask {
@@ -59,6 +63,7 @@ impl InstallTask {
             source: SourceKind::Source,
             world_atom: None,
             replaces: None,
+            requires: Vec::new(),
         }
     }
 
@@ -76,6 +81,7 @@ impl InstallTask {
             source: SourceKind::Source,
             world_atom: None,
             replaces: None,
+            requires: Vec::new(),
         }
     }
 }

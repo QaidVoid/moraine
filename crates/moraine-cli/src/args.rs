@@ -124,6 +124,12 @@ pub struct Cli {
     #[arg(short = '1', long)]
     pub oneshot: bool,
 
+    /// Continue the transaction after a package fails, dropping the failed
+    /// package and its dependents and merging the independent remainder, then
+    /// exiting non-zero.
+    #[arg(long = "keep-going")]
+    pub keep_going: bool,
+
     /// Ignore the options persisted in `EMERGE_DEFAULT_OPTS`, honoring only the
     /// literal command line.
     #[arg(long = "ignore-default-opts")]
@@ -480,5 +486,12 @@ mod tests {
         let cli = parse(&["-vv", "@world"]);
         assert_eq!(cli.verbose, 2);
         assert!(cli.show_tree());
+    }
+
+    #[test]
+    fn keep_going_sets_flag_and_keeps_target() {
+        let cli = parse(&["--keep-going", "@world"]);
+        assert!(cli.keep_going);
+        assert_eq!(cli.targets, vec!["@world".to_owned()]);
     }
 }

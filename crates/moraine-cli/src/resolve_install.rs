@@ -264,12 +264,19 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     // world-atom inputs mirror `create_world_atom`: the requesting argument's
     // repo and precision, the slotted `cp`s, and the system set.
     let world_inputs = WorldAtomInputs::compute(&qualified, &source, &installed, ctx, &interner);
+    // The in-transaction dependency edges as a `category/package` requires map,
+    // from the solution's non-optional edges, so `--keep-going` can drop a failed
+    // package's dependents.
+    let requires = requires_map(&solution.edges);
+    let order_cps: BTreeSet<String> = order.iter().map(|task| task.cp.clone()).collect();
     let tasks: Vec<InstallTask> = order
         .iter()
         .map(|task| {
             to_install_task(
                 task,
                 &world_inputs,
+                &requires,
+                &order_cps,
                 &prefs,
                 cli.oneshot,
                 &pkgdir,
@@ -345,7 +352,8 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
             .with_signature(signature_policy, signature_config(&ctx.vars)),
     };
     let applier = EngineApplier::new(merge_context(ctx, &wr, cli.noconfmem));
-    let engine = TransactionEngine::new(&runner, &applier, &wr.state_dir);
+    let engine =
+        TransactionEngine::new(&runner, &applier, &wr.state_dir).with_keep_going(cli.keep_going);
     let report = engine
         .run(&Transaction::new(tasks))
         .map_err(|e| miette!("install failed: {e}"))?;
@@ -357,9 +365,27 @@ pub fn run(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
         ctx.vars.get("PORTAGE_ELOG_COMMAND"),
         &wr.eroot,
     );
-    println!("Installation complete.");
     // Surface relevant unread news for every repository after the install.
     crate::news_state::display_after_action(ctx, &wr.vdb_dir, &wr.eroot, &repo_set);
+    // Under `--keep-going` the independent remainder still merged, but a failure
+    // is reported and the run exits non-zero, matching `emerge --keep-going`.
+    if !report.failures.is_empty() {
+        println!("The following packages failed and were not installed:");
+        for failure in &report.failures {
+            println!("  {} ({})", failure.cpv, failure.reason);
+        }
+        if !report.skipped.is_empty() {
+            println!("The following packages were skipped because a dependency failed:");
+            for cpv in &report.skipped {
+                println!("  {cpv}");
+            }
+        }
+        return Err(miette!(
+            "{} package(s) failed to install",
+            report.failures.len()
+        ));
+    }
+    println!("Installation complete.");
     Ok(())
 }
 
@@ -753,9 +779,35 @@ fn usepkgonly_unsatisfiable(tasks: &[InstallTask]) -> Vec<String> {
         .collect()
 }
 
+/// Map each dependent `category/package` to the `category/package`s it depends
+/// on within the transaction, from the solution's non-optional edges. Optional
+/// `||` branches the solution did not strictly require are excluded so a
+/// satisfied alternative does not cause an over-drop.
+fn requires_map(edges: &[moraine_resolve::solution::DepEdge]) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in edges {
+        if edge.optional {
+            continue;
+        }
+        let from = moraine_resolve::solution::endpoint_cp(&edge.from);
+        let to = moraine_resolve::solution::endpoint_cp(&edge.to);
+        if from == to {
+            continue;
+        }
+        let entry = map.entry(from.to_owned()).or_default();
+        if !entry.iter().any(|e| e == to) {
+            entry.push(to.to_owned());
+        }
+    }
+    map
+}
+
+#[allow(clippy::too_many_arguments)]
 fn to_install_task(
     task: &Task,
     world: &WorldAtomInputs,
+    requires: &HashMap<String, Vec<String>>,
+    order_cps: &BTreeSet<String>,
     prefs: &BinaryPrefs,
     oneshot: bool,
     pkgdir: &Path,
@@ -771,6 +823,17 @@ fn to_install_task(
     // incompatible binary falls back to a source build.
     let (binary, _) = binary_choice(&task.cp, &task.version, prefs, pkgdir, binhost);
     let binary = binary && bctx.compatible(&cpv);
+    // Restrict the in-transaction requires to dependencies that name another
+    // task in the order, dropping edges to packages outside this transaction.
+    let requires = requires
+        .get(&task.cp)
+        .map(|deps| {
+            deps.iter()
+                .filter(|dep| dep.as_str() != task.cp && order_cps.contains(*dep))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     InstallTask {
         cpv,
         cp: task.cp.clone(),
@@ -783,6 +846,7 @@ fn to_install_task(
         },
         world_atom: world.world_atom(task, oneshot),
         replaces: None,
+        requires,
     }
 }
 
@@ -1816,6 +1880,7 @@ mod tests {
             source,
             world_atom: None,
             replaces: None,
+            requires: Vec::new(),
         };
         let tasks = vec![
             task(

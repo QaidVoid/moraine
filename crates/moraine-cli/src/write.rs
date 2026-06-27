@@ -333,7 +333,8 @@ pub fn resume(cli: &Cli, ctx: &ConfigContext, roots: &Roots) -> Result<()> {
     let runner = BinpkgRunner::new(LocalPkgdir { pkgdir }, stage);
     let mctx = merge_context(ctx, &wr, cli.noconfmem);
     let applier = EngineApplier::new(mctx);
-    let engine = TransactionEngine::new(&runner, &applier, &wr.state_dir);
+    let engine =
+        TransactionEngine::new(&runner, &applier, &wr.state_dir).with_keep_going(cli.keep_going);
     engine.resume().map_err(|e| miette!("resume failed: {e}"))?;
     println!("Resume complete.");
     Ok(())
