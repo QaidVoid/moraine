@@ -574,6 +574,45 @@ pub fn thirdparty_mirrors(repos: &RepoSet) -> std::collections::BTreeMap<String,
     groups
 }
 
+/// Load `CUSTOM_MIRRORS_FILE` (`<config-root>/etc/portage/mirrors`) into the
+/// custom-mirror tiers and named mirror groups. The `local` group splits into
+/// network hosts and `/`-prefixed filesystem directories; every other group is a
+/// named mirror group used for `mirror://group/path` resolution, mirroring
+/// `grabdict(CUSTOM_MIRRORS_FILE)`.
+pub fn custom_mirrors(config_root: &Path) -> moraine_build::CustomMirrors {
+    let mut mirrors = moraine_build::CustomMirrors::default();
+    let path = config_root.join("etc/portage/mirrors");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return mirrors;
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(group) = parts.next() else {
+            continue;
+        };
+        if group == "local" {
+            for host in parts {
+                if host.starts_with('/') {
+                    mirrors.filesystem.push(PathBuf::from(host));
+                } else {
+                    mirrors.local.push(host.to_owned());
+                }
+            }
+        } else {
+            mirrors
+                .named
+                .entry(group.to_owned())
+                .or_default()
+                .extend(parts.map(str::to_owned));
+        }
+    }
+    mirrors
+}
+
 /// A repository's default profile EAPI: `layout.conf`'s
 /// `profile_eapi_when_unspecified`, else the `profiles/eapi` file, else none.
 fn repo_default_eapi(location: &Path) -> Option<String> {

@@ -2,9 +2,9 @@
 //!
 //! `moraine-atom` parses dependency strings but not `SRC_URI`, whose grammar
 //! differs (bare URIs, `->` destination arrows, and EAPI 8 `fetch+`/`mirror+`
-//! selective restriction prefixes). This module implements a small dedicated
-//! parser and reducer with its own AST, gating the arrow and selective
-//! restriction syntax on the active EAPI's feature table from [`moraine_eapi`].
+//! grant-override prefixes). This module implements a small dedicated parser and
+//! reducer with its own AST, gating the arrow and grant-override syntax on the
+//! active EAPI's feature table from [`moraine_eapi`].
 //!
 //! The reduced result is a `{distfile -> DistFile}` table from which `A` (the
 //! USE-filtered set) and `AA` (the full set) are derived.
@@ -27,12 +27,12 @@ enum Node {
         body: Vec<Node>,
     },
     /// A single source URI with an optional explicit destination name and
-    /// per-file fetch and mirror overrides.
+    /// per-file fetch and mirror grant overrides.
     Uri {
         uri: String,
         dest: Option<String>,
-        fetch_restricted: bool,
-        mirror_restricted: bool,
+        fetch_override: bool,
+        mirror_override: bool,
     },
 }
 
@@ -43,12 +43,14 @@ pub struct DistFile {
     pub name: String,
     /// The candidate source URIs, in priority order.
     pub uris: Vec<String>,
-    /// Whether this file is fetch-restricted (no public-mirror fetch), set by an
-    /// EAPI 8 `fetch+` prefix on any of its URIs.
-    pub fetch_restricted: bool,
-    /// Whether this file is mirror-restricted, set by an EAPI 8 `mirror+`
-    /// prefix on any of its URIs.
-    pub mirror_restricted: bool,
+    /// Whether this file carries a fetch grant override, set by an EAPI 8
+    /// `fetch+` (or `mirror+`) prefix on any of its URIs. The override permits
+    /// fetching the URI even under `RESTRICT=fetch`.
+    pub fetch_override: bool,
+    /// Whether this file carries a mirror grant override, set by an EAPI 8
+    /// `mirror+` prefix on any of its URIs. The override keeps the file
+    /// mirrorable even under `RESTRICT=mirror`.
+    pub mirror_override: bool,
 }
 
 /// The result of reducing `SRC_URI` against a USE set.
@@ -184,15 +186,15 @@ fn parse_uri(tokens: &[&str], pos: &mut usize, features: EapiFeatures) -> Result
     let raw = tokens[*pos];
     *pos += 1;
 
-    let mut fetch_restricted = false;
-    let mut mirror_restricted = false;
+    let mut fetch_override = false;
+    let mut mirror_override = false;
     let uri = if let Some(rest) = raw.strip_prefix("fetch+") {
         if !features.selective_src_uri_restriction {
             return Err(BuildError::src_uri(
                 "fetch+ selective restriction requires EAPI 8 or later",
             ));
         }
-        fetch_restricted = true;
+        fetch_override = true;
         rest.to_string()
     } else if let Some(rest) = raw.strip_prefix("mirror+") {
         if !features.selective_src_uri_restriction {
@@ -200,7 +202,10 @@ fn parse_uri(tokens: &[&str], pos: &mut usize, features: EapiFeatures) -> Result
                 "mirror+ selective restriction requires EAPI 8 or later",
             ));
         }
-        mirror_restricted = true;
+        // mirror+ grants both the mirror override and the fetch override,
+        // matching `override_fetch = override_mirror or startswith("fetch+")`.
+        mirror_override = true;
+        fetch_override = true;
         rest.to_string()
     } else {
         raw.to_string()
@@ -235,8 +240,8 @@ fn parse_uri(tokens: &[&str], pos: &mut usize, features: EapiFeatures) -> Result
     Ok(Node::Uri {
         uri,
         dest,
-        fetch_restricted,
-        mirror_restricted,
+        fetch_override,
+        mirror_override,
     })
 }
 
@@ -266,8 +271,8 @@ fn add_uri(node: &Node, out: &mut BTreeMap<String, DistFile>) {
     let Node::Uri {
         uri,
         dest,
-        fetch_restricted,
-        mirror_restricted,
+        fetch_override,
+        mirror_override,
     } = node
     else {
         return;
@@ -276,14 +281,14 @@ fn add_uri(node: &Node, out: &mut BTreeMap<String, DistFile>) {
     let entry = out.entry(name.clone()).or_insert_with(|| DistFile {
         name,
         uris: Vec::new(),
-        fetch_restricted: false,
-        mirror_restricted: false,
+        fetch_override: false,
+        mirror_override: false,
     });
     if !entry.uris.contains(uri) {
         entry.uris.push(uri.clone());
     }
-    entry.fetch_restricted |= fetch_restricted;
-    entry.mirror_restricted |= mirror_restricted;
+    entry.fetch_override |= fetch_override;
+    entry.mirror_override |= mirror_override;
 }
 
 /// The trailing path component of a URI, used as the default distfile name.
@@ -346,7 +351,7 @@ mod tests {
             eapi(8),
         )
         .unwrap();
-        assert!(ok.get("foo.tar.gz").unwrap().fetch_restricted);
+        assert!(ok.get("foo.tar.gz").unwrap().fetch_override);
 
         let err = parse_and_reduce(
             "fetch+https://example.com/foo.tar.gz",
@@ -357,14 +362,17 @@ mod tests {
     }
 
     #[test]
-    fn mirror_plus_sets_mirror_restricted() {
+    fn mirror_plus_sets_overrides() {
         let m = parse_and_reduce(
             "mirror+https://example.com/foo.tar.gz",
             &use_set(&[]),
             eapi(8),
         )
         .unwrap();
-        assert!(m.get("foo.tar.gz").unwrap().mirror_restricted);
+        let f = m.get("foo.tar.gz").unwrap();
+        // mirror+ grants the mirror override and the fetch override.
+        assert!(f.mirror_override);
+        assert!(f.fetch_override);
     }
 
     #[test]

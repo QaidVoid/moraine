@@ -100,6 +100,10 @@ pub struct FetchConfig {
     /// Custom mirror tiers from `CUSTOM_MIRRORS_FILE`, preferred before the
     /// public Gentoo mirrors.
     pub custom_mirrors: CustomMirrors,
+    /// `FEATURES=force-mirror`: when the mirror network is usable, skip bare
+    /// upstream `SRC_URI` hosts so distfiles come only from the mirror network,
+    /// local custom mirrors, and `mirror://` expansions.
+    pub force_mirror: bool,
 }
 
 /// The custom-mirror tiers from `CUSTOM_MIRRORS_FILE`.
@@ -111,6 +115,10 @@ pub struct CustomMirrors {
     pub public: Vec<String>,
     /// Filesystem mirror directories: a verified match is copied in.
     pub filesystem: Vec<PathBuf>,
+    /// Arbitrary named mirror groups from `CUSTOM_MIRRORS_FILE`, consulted
+    /// before `profiles/thirdpartymirrors` during `mirror://group/path`
+    /// resolution.
+    pub named: BTreeMap<String, Vec<String>>,
 }
 
 impl FetchConfig {
@@ -147,6 +155,7 @@ impl FetchConfig {
             distlocks: false,
             ro_distdirs: Vec::new(),
             custom_mirrors: CustomMirrors::default(),
+            force_mirror: false,
         }
     }
 }
@@ -251,8 +260,10 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
             }
         }
 
-        // Fetch-restricted: never fetch from a public mirror.
-        let restricted = restrict.fetch || file.fetch_restricted;
+        // Fetch-restricted with no fetch override: never fetch from a public
+        // mirror. A `fetch+`/`mirror+` override lets the file proceed to normal
+        // resolution.
+        let restricted = restrict.fetch && !file.fetch_override;
         if restricted {
             if dest.exists() && self.verify_or_ok(entry, &dest)? {
                 return Ok(FetchedFile {
@@ -265,9 +276,12 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
             if let Some(found) = self.adopt_local_copy(file, entry)? {
                 return Ok(found);
             }
-            // Local custom mirrors are explicitly permitted under RESTRICT=fetch.
-            if !self.config.custom_mirrors.local.is_empty()
-                && let Ok(found) = self.fetch_from_local_mirrors(file, entry)
+            // Local custom mirrors and the distfile's `mirror://` SRC_URI hosts
+            // are still permitted under RESTRICT=fetch, since a `mirror://` host
+            // effectively overrides the restriction for specific mirrors.
+            let sources = self.restricted_sources(file, entry);
+            if !sources.is_empty()
+                && let Ok(found) = self.download_from(file, entry, &sources, &[])
             {
                 return Ok(found);
             }
@@ -301,8 +315,9 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
 
         let sources = self.resolve_sources(file, restrict);
         // The upstream URIs are passed for checksum-failure escalation; under
-        // `primaryuri` they are already at the front and no escalation is needed.
-        let upstream = if restrict.primaryuri {
+        // `primaryuri` they are already at the front and no escalation is needed,
+        // and under force-mirror bare upstream hosts are not used at all.
+        let upstream = if restrict.primaryuri || self.config.force_mirror {
             Vec::new()
         } else {
             self.upstream_uris(file)
@@ -310,13 +325,15 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
         self.download_from(file, entry, &sources, &upstream)
     }
 
-    /// Fetch a distfile from only the local custom mirrors, used under
-    /// `RESTRICT=fetch` where local mirrors are permitted.
-    fn fetch_from_local_mirrors(
+    /// The source list permitted under `RESTRICT=fetch` with no fetch override:
+    /// the local custom mirror sources plus the distfile's `mirror://` SRC_URI
+    /// expansions. A `mirror://` host effectively overrides the fetch
+    /// restriction for specific mirrors (portage `fetch.py:1118-1153`).
+    fn restricted_sources(
         &self,
         file: &DistFile,
         entry: Option<&manifest::DistEntry>,
-    ) -> Result<FetchedFile> {
+    ) -> Vec<String> {
         let digests = entry.map(|e| e.hashes.clone()).unwrap_or_default();
         let bases = self.config.custom_mirrors.local.clone();
         let layouts = self.resolve_mirror_layouts(&bases);
@@ -324,7 +341,13 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
         for base in &bases {
             sources.extend(self.mirror_sources(base, &layouts, &file.name, &digests));
         }
-        self.download_from(file, entry, &sources, &[])
+        for uri in &file.uris {
+            if let Some(rest) = uri.strip_prefix("mirror://") {
+                sources.extend(self.expand_mirror(rest));
+            }
+        }
+        sources.dedup();
+        sources
     }
 
     /// Try each source in order, downloading to a `.__download__` staging path and
@@ -468,33 +491,48 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
         Ok(file)
     }
 
-    /// Resolve the ordered source URIs for a distfile: local custom mirrors, the
-    /// Gentoo mirror network (through its directory layout), public custom
-    /// mirrors, `mirror://` expansions, and the upstream URIs. `RESTRICT=mirror`
-    /// drops the mirror network; `RESTRICT=primaryuri` moves the upstream URIs
-    /// ahead of the mirrors.
+    /// Resolve the ordered source URIs for a distfile: the local custom mirrors
+    /// (always), the Gentoo mirror network and public custom mirrors (only when
+    /// the file is mirrorable), the `mirror://` SRC_URI expansions, and the bare
+    /// upstream URIs. `RESTRICT=fetch`/`RESTRICT=mirror` drop the mirrorable tiers
+    /// unless a `mirror+` override applies; `RESTRICT=primaryuri` moves the
+    /// upstream URIs ahead of the mirrors; `FEATURES=force-mirror` drops the bare
+    /// upstream hosts when the mirror network is usable.
     fn resolve_sources(&self, file: &DistFile, restrict: RestrictFlags) -> Vec<String> {
-        let mirrorable = !restrict.mirror && !file.mirror_restricted;
+        let mirrorable = (!restrict.fetch && !restrict.mirror) || file.mirror_override;
         let digests = self
             .manifest
             .dist(&file.name)
             .map(|e| e.hashes.clone())
             .unwrap_or_default();
 
-        let upstream = self.upstream_uris(file);
+        // The `mirror://` SRC_URI expansions are always available; bare upstream
+        // hosts are dropped when force-mirror is active and the mirror network is
+        // usable, so distfiles come only from the mirror tiers.
+        let drop_bare = self.config.force_mirror && mirrorable;
+        let mut upstream = Vec::new();
+        for uri in &file.uris {
+            if let Some(rest) = uri.strip_prefix("mirror://") {
+                upstream.extend(self.expand_mirror(rest));
+            } else if !drop_bare {
+                upstream.push(uri.clone());
+            }
+        }
 
-        // The Gentoo mirror network, with each mirror's candidate path computed
-        // from that mirror's own resolved layout plus a flat fallback.
-        let mut mirror_net = Vec::new();
+        // Local custom mirrors are always usable; the Gentoo mirror network and
+        // public custom mirrors only when the file is mirrorable. Each mirror's
+        // candidate path is computed from its own resolved layout plus a flat
+        // fallback.
+        let mut bases = self.config.custom_mirrors.local.clone();
         if mirrorable {
-            let mut bases = self.config.custom_mirrors.local.clone();
             bases.extend(self.config.mirrors.clone());
             bases.extend(self.config.custom_mirrors.public.clone());
-            shuffle_seeded(&mut bases, seed_for(&file.name));
-            let layouts = self.resolve_mirror_layouts(&bases);
-            for base in &bases {
-                mirror_net.extend(self.mirror_sources(base, &layouts, &file.name, &digests));
-            }
+        }
+        shuffle_seeded(&mut bases, seed_for(&file.name));
+        let layouts = self.resolve_mirror_layouts(&bases);
+        let mut mirror_net = Vec::new();
+        for base in &bases {
+            mirror_net.extend(self.mirror_sources(base, &layouts, &file.name, &digests));
         }
 
         // primaryuri moves upstream ahead of the mirror network.
@@ -610,24 +648,33 @@ impl<'a, R: CommandRunner> Fetcher<'a, R> {
         layout
     }
 
-    /// Expand a `mirror://group/path` reference against the named third-party
-    /// mirror list, shuffling the host order.
+    /// Expand a `mirror://group/path` reference. User-defined named groups from
+    /// `CUSTOM_MIRRORS_FILE` are consulted first and kept in file order, then the
+    /// `profiles/thirdpartymirrors` hosts follow with their order shuffled,
+    /// matching `custommirrors[mirrorname]` before `thirdpartymirrors`.
     fn expand_mirror(&self, rest: &str) -> Vec<String> {
         let (group, path) = match rest.split_once('/') {
             Some((g, p)) => (g, p),
             None => (rest, ""),
         };
-        match self.config.thirdparty.get(group) {
-            Some(bases) => {
-                let mut hosts = bases.clone();
-                shuffle_seeded(&mut hosts, seed_for(path));
+        let mut out = Vec::new();
+        if let Some(bases) = self.config.custom_mirrors.named.get(group) {
+            out.extend(
+                bases
+                    .iter()
+                    .map(|b| format!("{}/{}", b.trim_end_matches('/'), path)),
+            );
+        }
+        if let Some(bases) = self.config.thirdparty.get(group) {
+            let mut hosts = bases.clone();
+            shuffle_seeded(&mut hosts, seed_for(path));
+            out.extend(
                 hosts
                     .iter()
-                    .map(|b| format!("{}/{}", b.trim_end_matches('/'), path))
-                    .collect()
-            }
-            None => Vec::new(),
+                    .map(|b| format!("{}/{}", b.trim_end_matches('/'), path)),
+            );
         }
+        out
     }
 
     /// Run the fetch (or resume) command for a single URI, downloading to the
@@ -999,8 +1046,8 @@ mod tests {
         DistFile {
             name: name.to_string(),
             uris: uris.iter().map(|s| s.to_string()).collect(),
-            fetch_restricted: false,
-            mirror_restricted: false,
+            fetch_override: false,
+            mirror_override: false,
         }
     }
 
@@ -1280,10 +1327,26 @@ mod tests {
             mirror: false,
             primaryuri: false,
         };
+        // A plain distfile with no fetch override stays restricted.
         let err = fetcher.fetch_one(&distfile("f.tar.gz", &["https://x/f.tar.gz"]), restrict);
         assert!(matches!(err, Err(BuildError::RestrictedFetch { .. })));
         // No public fetch attempted.
         assert_eq!(runner.call_count(), 0);
+
+        // A fetch+ distfile carries the fetch override, so it is fetched normally
+        // and never reports a fetch restriction even under RESTRICT=fetch.
+        let staging = dir.path().join("f.tar.gz.__download__");
+        let writer = FakeRunner::default();
+        writer.push(Response::WriteFile {
+            status: 0,
+            path: staging,
+            contents: data.to_vec(),
+        });
+        let fetcher = Fetcher::new(&writer, &cfg, &mani, true);
+        let mut granted = distfile("f.tar.gz", &["https://x/f.tar.gz"]);
+        granted.fetch_override = true;
+        let f = fetcher.fetch_one(&granted, restrict).unwrap();
+        assert_eq!(f.status, FetchStatus::Fetched);
     }
 
     #[test]
@@ -1332,18 +1395,27 @@ mod tests {
     }
 
     #[test]
-    fn mirror_restricted_skips_gentoo_mirrors() {
+    fn mirror_restrict_honors_mirror_override() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = FetchConfig::new(dir.path());
         cfg.mirrors = vec!["https://mirror.example".to_string()];
         let mani = Manifest::default();
         let runner = FakeRunner::always_ok();
         let fetcher = Fetcher::new(&runner, &cfg, &mani, false);
-        let mut file = distfile("foo.tar.gz", &["https://upstream/foo.tar.gz"]);
-        file.mirror_restricted = true;
-        let sources = fetcher.resolve_sources(&file, RestrictFlags::default());
+        let restrict = RestrictFlags::from_tokens(["mirror"]);
+
+        // A plain distfile under RESTRICT=mirror skips the Gentoo mirror network.
+        let plain = distfile("foo.tar.gz", &["https://upstream/foo.tar.gz"]);
+        let sources = fetcher.resolve_sources(&plain, restrict);
         assert!(!sources.iter().any(|s| s.contains("mirror.example")));
         assert_eq!(sources, vec!["https://upstream/foo.tar.gz"]);
+
+        // A mirror+ distfile keeps its mirror override, so it stays on the
+        // network even under RESTRICT=mirror.
+        let mut granted = distfile("foo.tar.gz", &["https://upstream/foo.tar.gz"]);
+        granted.mirror_override = true;
+        let sources = fetcher.resolve_sources(&granted, restrict);
+        assert!(sources.iter().any(|s| s.contains("mirror.example")));
     }
 
     #[test]
@@ -1501,5 +1573,129 @@ mod tests {
             manifest::verify_bytes(entry, data, &union),
             VerifyOutcome::MissingRequiredHash { .. }
         ));
+    }
+
+    #[test]
+    fn fetch_restrict_with_mirror_plus_uses_gentoo_network() {
+        // dev-util/radare2-6.0.4: RESTRICT=fetch with every distfile written as a
+        // `mirror+` URI is fetched from the Gentoo mirror network, not restricted.
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"radare2 payload";
+        let mani = manifest_for("radare2-6.0.4.tar.gz", data);
+        let mut cfg = FetchConfig::new(dir.path());
+        cfg.mirrors = vec!["https://mirror.example".to_string()];
+        // Pre-seed the mirror layout so layout resolution does not consume the
+        // queued download response.
+        let mut cache = MirrorCache::default();
+        cache.entries.insert(
+            "https://mirror.example".to_string(),
+            CachedMirrorLayout {
+                layout: MirrorLayout::Flat,
+                fetched_at: now_secs(),
+            },
+        );
+        cache.save(&dir.path().join(".mirror-cache.json"));
+
+        let staging = dir.path().join("radare2-6.0.4.tar.gz.__download__");
+        let runner = FakeRunner::default();
+        runner.push(Response::WriteFile {
+            status: 0,
+            path: staging,
+            contents: data.to_vec(),
+        });
+        let fetcher = Fetcher::new(&runner, &cfg, &mani, true);
+        let mut file = distfile(
+            "radare2-6.0.4.tar.gz",
+            &["https://github.com/radareorg/radare2/archive/6.0.4.tar.gz"],
+        );
+        file.fetch_override = true;
+        file.mirror_override = true;
+        let restrict = RestrictFlags::from_tokens(["fetch"]);
+        let f = fetcher.fetch_one(&file, restrict).unwrap();
+        assert_eq!(f.status, FetchStatus::Fetched);
+    }
+
+    #[test]
+    fn fetch_restrict_expands_mirror_uri() {
+        // RESTRICT=fetch with no override but a `mirror://group/path` SRC_URI
+        // expands the group hosts and attempts them rather than reporting a
+        // fetch restriction.
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"grouped payload";
+        let mani = manifest_for("foo.tar.gz", data);
+        let mut cfg = FetchConfig::new(dir.path());
+        cfg.thirdparty.insert(
+            "gnu".to_string(),
+            vec!["https://ftp.gnu.org/gnu".to_string()],
+        );
+        let staging = dir.path().join("foo.tar.gz.__download__");
+        let runner = FakeRunner::default();
+        runner.push(Response::WriteFile {
+            status: 0,
+            path: staging,
+            contents: data.to_vec(),
+        });
+        let fetcher = Fetcher::new(&runner, &cfg, &mani, true);
+        let file = distfile("foo.tar.gz", &["mirror://gnu/foo/foo.tar.gz"]);
+        let restrict = RestrictFlags::from_tokens(["fetch"]);
+        let f = fetcher.fetch_one(&file, restrict).unwrap();
+        assert_eq!(f.status, FetchStatus::Fetched);
+    }
+
+    #[test]
+    fn named_group_resolves_before_thirdparty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = FetchConfig::new(dir.path());
+        cfg.thirdparty.insert(
+            "gnu".to_string(),
+            vec!["https://ftp.gnu.org/gnu".to_string()],
+        );
+        cfg.custom_mirrors.named.insert(
+            "gnu".to_string(),
+            vec![
+                "https://local.example/a".to_string(),
+                "https://local.example/b".to_string(),
+            ],
+        );
+        let mani = Manifest::default();
+        let runner = FakeRunner::always_ok();
+        let fetcher = Fetcher::new(&runner, &cfg, &mani, false);
+        let hosts = fetcher.expand_mirror("gnu/foo.tar.gz");
+        // The user-defined hosts come first, in file order, before the
+        // thirdpartymirrors host.
+        assert_eq!(
+            hosts,
+            vec![
+                "https://local.example/a/foo.tar.gz".to_string(),
+                "https://local.example/b/foo.tar.gz".to_string(),
+                "https://ftp.gnu.org/gnu/foo.tar.gz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn force_mirror_drops_bare_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = FetchConfig::new(dir.path());
+        cfg.mirrors = vec!["https://mirror.example".to_string()];
+        cfg.thirdparty.insert(
+            "gnu".to_string(),
+            vec!["https://ftp.gnu.org/gnu".to_string()],
+        );
+        cfg.force_mirror = true;
+        let mani = Manifest::default();
+        let runner = FakeRunner::always_ok();
+        let fetcher = Fetcher::new(&runner, &cfg, &mani, false);
+        let file = distfile(
+            "foo.tar.gz",
+            &["https://upstream/foo.tar.gz", "mirror://gnu/foo.tar.gz"],
+        );
+        let sources = fetcher.resolve_sources(&file, RestrictFlags::default());
+        // The bare upstream host is excluded.
+        assert!(!sources.iter().any(|s| s == "https://upstream/foo.tar.gz"));
+        // The Gentoo mirror network is kept.
+        assert!(sources.iter().any(|s| s.contains("mirror.example")));
+        // The `mirror://` expansion is kept.
+        assert!(sources.iter().any(|s| s.contains("ftp.gnu.org")));
     }
 }

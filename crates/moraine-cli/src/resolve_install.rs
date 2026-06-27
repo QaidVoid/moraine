@@ -695,7 +695,8 @@ impl CliPlanner<'_> {
             checksum_try_mirrors,
             distlocks: self.ctx.features.iter().any(|f| f == "distlocks"),
             ro_distdirs,
-            custom_mirrors: moraine_build::CustomMirrors::default(),
+            custom_mirrors: crate::config::custom_mirrors(&self.eroot),
+            force_mirror: self.ctx.features.iter().any(|f| f == "force-mirror"),
         }
     }
 }
