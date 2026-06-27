@@ -39,7 +39,11 @@ pub fn system_set(layers: &[&str]) -> Vec<String> {
 }
 
 /// Materialize `@profile` from stacked `packages` files: the non-`*` survivors.
-/// Only meaningful under the `profile-set` profile format.
+///
+/// The caller passes only the `packages` layers of profile nodes whose own
+/// `profile-formats` include `profile-set`, mirroring `ProfilePackageSet.load`.
+/// A node without the format never contributes a layer here, even when a later
+/// node in the stack declares it.
 pub fn profile_set(layers: &[&str]) -> Vec<String> {
     stack_packages(layers)
         .into_iter()
@@ -178,6 +182,17 @@ mod tests {
         let layer = "*sys-apps/portage\napp-misc/profileonly\n";
         assert_eq!(profile_set(&[layer]), vec!["app-misc/profileonly"]);
         assert_eq!(system_set(&[layer]), vec!["sys-apps/portage"]);
+    }
+
+    #[test]
+    fn profile_set_stacks_only_passed_qualifying_layers() {
+        // The caller passes only the `packages` layers of nodes that declare
+        // `profile-set`. An inner qualifying node's non-`*` entry survives,
+        // while a node without the format is never passed and so never appears.
+        let inner_qualifying = "app-misc/required\n";
+        let members = profile_set(&[inner_qualifying]);
+        assert_eq!(members, vec!["app-misc/required".to_owned()]);
+        assert!(!members.contains(&"app-misc/excluded".to_owned()));
     }
 
     #[test]

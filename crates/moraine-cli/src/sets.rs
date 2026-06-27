@@ -32,7 +32,7 @@ pub enum ExpandError {
     #[diagnostic(
         code(moraine::sets::unknown),
         help(
-            "known sets are @world, @system, @selected, @profile, and @preserved-rebuild, plus any user sets"
+            "known sets are @world, @system, @selected, @profile, @preserved-rebuild, @installed, @live-rebuild, and @module-rebuild, plus any user sets"
         )
     )]
     UnknownSet {

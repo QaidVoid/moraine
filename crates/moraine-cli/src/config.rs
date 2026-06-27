@@ -16,6 +16,7 @@ use moraine_config::sets::{
     profile_set, resolve_user_set, selected_set, selected_sets, system_set, world_set,
 };
 use moraine_repo::{RepoConfig, RepoSet, discover};
+use moraine_vdb::store::Store;
 use thiserror::Error;
 use tracing::instrument;
 
@@ -256,7 +257,8 @@ pub struct ConfigContext {
     pub config_protect_mask: Vec<String>,
     /// The `@system` set members.
     pub system: Vec<String>,
-    /// The `@selected` set members (world file contents).
+    /// The `@selected` set members: the world file atoms unioned with the
+    /// `@name` references recorded in `world_sets`.
     pub selected: Vec<String>,
     /// The `@profile` set members (only under the `profile-set` format).
     pub profile_set: Vec<String>,
@@ -267,6 +269,10 @@ pub struct ConfigContext {
     pub preserved_rebuild: Vec<String>,
     /// The `/etc/portage/sets/` search directories for resolving named user sets.
     pub set_search_dirs: Vec<PathBuf>,
+    /// The installed-store directory (`<root>/var/db/pkg`), consulted lazily to
+    /// compute the dbapi-backed default sets (`@installed`, `@live-rebuild`,
+    /// `@module-rebuild`) only when one of them is requested.
+    pub vdb_dir: PathBuf,
 }
 
 impl ConfigContext {
@@ -362,34 +368,58 @@ impl ConfigContext {
             config_protect_mask.push("/etc/env.d".to_owned());
         }
 
-        let profile_layers: Vec<String> = profile
+        // `@system` stacks the `*`-prefixed entries across every profile node's
+        // `packages` file.
+        let system_layers: Vec<String> = profile
             .nodes
             .iter()
             .filter_map(|node| std::fs::read_to_string(node.path.join("packages")).ok())
             .collect();
-        let layer_refs: Vec<&str> = profile_layers.iter().map(String::as_str).collect();
-        let system = system_set(&layer_refs);
+        let system = system_set(&system_layers.iter().map(String::as_str).collect::<Vec<_>>());
+
+        // `@profile` stacks only the `packages` files of nodes whose own format
+        // includes `profile-set`, then keeps the non-`*` survivors. The decision
+        // is per node, so an inner profile-set node contributes regardless of the
+        // last node's format and a node without the format never contributes.
+        let profile_set_layers: Vec<String> = profile
+            .nodes
+            .iter()
+            .filter(|node| node.formats.iter().any(|f| f == "profile-set"))
+            .filter_map(|node| std::fs::read_to_string(node.path.join("packages")).ok())
+            .collect();
+        let profile_set_members = profile_set(
+            &profile_set_layers
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
 
         let world_path = roots.root_dir().join("var/lib/portage/world");
         let world_contents = std::fs::read_to_string(&world_path).unwrap_or_default();
-        let selected = selected_set(&world_contents);
 
-        // Under the profile-set format the non-`*` `packages` entries form the
-        // `@profile` set, which is part of world selection.
-        let profile_set_members = if profile_set_active(&profile, repos.as_ref()) {
-            profile_set(&layer_refs)
-        } else {
-            Vec::new()
-        };
-
-        // The `world_sets` file selects `@name` set references; expand each from
-        // the `/etc/portage/sets/` search path and union the members into world.
+        // The `world_sets` file records `@name` set references.
         let set_search_dirs = vec![config_dir.join("etc/portage/sets")];
         let world_sets_path = roots.root_dir().join("var/lib/portage/world_sets");
         let world_sets_contents = std::fs::read_to_string(&world_sets_path).unwrap_or_default();
+        let world_set_refs = selected_sets(&world_sets_contents);
+
+        // `@selected` unions the world file atoms with the recorded world-sets
+        // references, so a directly consumed `@selected` also sees the selected
+        // sets and expands them recursively.
+        let mut selected = selected_set(&world_contents);
+        for set_ref in &world_set_refs {
+            if !selected.contains(set_ref) {
+                selected.push(set_ref.clone());
+            }
+        }
+
+        // Resolve each referenced set's members from the `/etc/portage/sets/`
+        // search path so the world union also carries the expanded members. Both
+        // the raw `@name` reference (through `@selected`) and the resolved
+        // members de-duplicate when `@world` is expanded.
         let dir_refs: Vec<&Path> = set_search_dirs.iter().map(PathBuf::as_path).collect();
         let mut world_set_members: Vec<String> = Vec::new();
-        for set_ref in selected_sets(&world_sets_contents) {
+        for set_ref in &world_set_refs {
             let name = set_ref.trim_start_matches('@');
             if let Ok(members) = resolve_user_set(name, &dir_refs) {
                 for member in members {
@@ -415,6 +445,7 @@ impl ConfigContext {
             world,
             preserved_rebuild: Vec::new(),
             set_search_dirs,
+            vdb_dir: roots.root_dir().join("var/db/pkg"),
         })
     }
 }
@@ -459,18 +490,6 @@ fn load_profile(
         Err(moraine_config::ConfigError::Io { .. }) => Ok(ProfileStack::default()),
         Err(other) => Err(ConfigLoadError::Profile(other)),
     }
-}
-
-/// Whether the selected profile's owning repository declares the `profile-set`
-/// format, under which the `packages` file's non-`*` entries are the `@profile`
-/// set.
-fn profile_set_active(profile: &ProfileStack, repos: Option<&RepoSet>) -> bool {
-    let (Some(node), Some(set)) = (profile.nodes.last(), repos) else {
-        return false;
-    };
-    owning_repo(set, &node.path)
-        .map(|c| c.profile_formats.iter().any(|f| f == "profile-set"))
-        .unwrap_or(false)
 }
 
 /// The repository whose `profiles` directory is the longest ancestor of `path`,
@@ -635,6 +654,19 @@ fn repo_default_eapi(location: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+impl ConfigContext {
+    /// Resolve a dbapi-backed default set by lazily loading the installed store
+    /// and applying `query`. When the store cannot be loaded, the set resolves
+    /// as known but empty rather than as unknown, mirroring Portage loading
+    /// `vartree` only when a dbapi set is referenced.
+    fn dbapi_set(&self, query: impl FnOnce(&Store) -> Vec<String>) -> Vec<String> {
+        match crate::write::load_installed_store(&self.vdb_dir) {
+            Ok(store) => query(&store),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
 impl SetSource for ConfigContext {
     fn members(&self, name: &str) -> Option<Vec<String>> {
         match name {
@@ -643,6 +675,13 @@ impl SetSource for ConfigContext {
             "selected" => Some(self.selected.clone()),
             "profile" => Some(self.profile_set.clone()),
             "preserved-rebuild" => Some(self.preserved_rebuild.clone()),
+            // The dbapi-backed default sets compute their membership from the
+            // installed store, loaded lazily only when one is requested.
+            "installed" => Some(self.dbapi_set(Store::installed_slot_atoms)),
+            "live-rebuild" => Some(self.dbapi_set(|store| store.slot_atoms_with_property("live"))),
+            "module-rebuild" => Some(self.dbapi_set(|store| {
+                store.slot_atoms_owning_path("/lib/modules", &["/usr/src/linux*"])
+            })),
             // Any other name resolves as a file-backed user set from the
             // `/etc/portage/sets/` search path; `None` only when no file exists.
             other => {
@@ -771,6 +810,7 @@ mod tests {
             world: Vec::new(),
             preserved_rebuild: Vec::new(),
             set_search_dirs: vec![sets_dir],
+            vdb_dir: PathBuf::from("/var/db/pkg"),
         };
         assert_eq!(
             ctx.members("myset").unwrap(),
@@ -794,6 +834,7 @@ mod tests {
             world: vec!["app/editor".to_owned(), "sys-apps/baselayout".to_owned()],
             preserved_rebuild: Vec::new(),
             set_search_dirs: Vec::new(),
+            vdb_dir: PathBuf::from("/var/db/pkg"),
         };
         assert_eq!(ctx.members("system").unwrap(), ctx.system);
         assert_eq!(ctx.members("selected").unwrap(), ctx.selected);
@@ -902,5 +943,29 @@ mod tests {
             ctx.selected,
             vec!["app/editor".to_owned(), "dev-libs/openssl".to_owned()]
         );
+    }
+
+    #[test]
+    fn selected_unions_world_and_world_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let world = root.join("var/lib/portage/world");
+        std::fs::create_dir_all(world.parent().unwrap()).unwrap();
+        std::fs::write(&world, "app-editors/vim\n").unwrap();
+        std::fs::write(root.join("var/lib/portage/world_sets"), "@gnome\n").unwrap();
+        // The referenced set exists so @world can resolve its members too.
+        let sets_dir = root.join("etc/portage/sets");
+        std::fs::create_dir_all(&sets_dir).unwrap();
+        std::fs::write(sets_dir.join("gnome"), "gnome-base/gnome\n").unwrap();
+        let roots = Roots {
+            root: Some(root.to_path_buf()),
+            config_root: Some(root.to_path_buf()),
+            profile: None,
+        };
+        let ctx = ConfigContext::load(&roots).unwrap();
+        let selected = ctx.members("selected").unwrap();
+        // @selected is the world atoms unioned with the world-sets references.
+        assert!(selected.contains(&"app-editors/vim".to_owned()));
+        assert!(selected.contains(&"@gnome".to_owned()));
     }
 }

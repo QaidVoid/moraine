@@ -1906,6 +1906,7 @@ mod tests {
             world: Vec::new(),
             preserved_rebuild: Vec::new(),
             set_search_dirs: Vec::new(),
+            vdb_dir: std::path::PathBuf::from("/var/db/pkg"),
         };
         let planner = CliPlanner {
             repo_set: &repo_set,
@@ -1975,6 +1976,7 @@ mod tests {
             world: Vec::new(),
             preserved_rebuild: Vec::new(),
             set_search_dirs: Vec::new(),
+            vdb_dir: std::path::PathBuf::from("/var/db/pkg"),
         };
         let planner = CliPlanner {
             repo_set: &repo_set,

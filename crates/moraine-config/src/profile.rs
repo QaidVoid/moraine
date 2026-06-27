@@ -22,7 +22,10 @@ pub struct ProfileNode {
     /// Whether this is the user-config node (`/etc/portage/profile`).
     pub is_user: bool,
     /// The owning repository's `profile-formats`, used to gate format-dependent
-    /// features such as `package.bashrc` (the `profile-bashrcs` format).
+    /// features such as `package.bashrc` (the `profile-bashrcs` format). The
+    /// user-config node (`/etc/portage/profile`) instead carries the hardcoded
+    /// `profile-bashrcs` and `profile-set` formats rather than an
+    /// owning-repository value, matching Portage's `LocationsManager`.
     pub formats: Vec<String>,
 }
 
@@ -99,12 +102,16 @@ impl ProfileStack {
 
         let user = config_root.join("etc/portage/profile");
         if user.is_dir() {
-            let formats = (ctx.node_repo)(&user).formats;
+            // The user-config node lies outside every repository, so Portage
+            // hardcodes its formats rather than reading them from an owning
+            // repository (`LocationsManager`). This makes its `package.bashrc`
+            // eligible for sourcing and its non-`*` `packages` entries a
+            // profile-set.
             stack.nodes.push(ProfileNode {
                 eapi: read_eapi(&user),
                 path: user,
                 is_user: true,
-                formats,
+                formats: vec!["profile-bashrcs".to_owned(), "profile-set".to_owned()],
             });
         }
         Ok(stack)
@@ -496,6 +503,30 @@ mod tests {
             vec!["portage-2", "profile-set"]
         );
         assert_eq!(read_masters(dir.path()), vec!["gentoo"]);
+    }
+
+    #[test]
+    fn user_node_receives_hardcoded_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_root = dir.path();
+        // A minimal selected profile reached through make.profile.
+        let prof = config_root.join("repo/profiles/default");
+        fs::create_dir_all(&prof).unwrap();
+        let portage = config_root.join("etc/portage");
+        fs::create_dir_all(&portage).unwrap();
+        std::os::unix::fs::symlink(&prof, portage.join("make.profile")).unwrap();
+        // The user-config node exists but lies outside every repository.
+        fs::create_dir_all(config_root.join("etc/portage/profile")).unwrap();
+
+        let ctx = ProfileContext {
+            repo_profiles: &|_| None,
+            node_repo: &|_| RepoProfileInfo::default(),
+        };
+        let stack = ProfileStack::resolve_active(config_root, &ctx).unwrap();
+        let user = stack.nodes.last().unwrap();
+        assert!(user.is_user);
+        assert!(user.formats.iter().any(|f| f == "profile-bashrcs"));
+        assert!(user.formats.iter().any(|f| f == "profile-set"));
     }
 
     #[test]

@@ -67,7 +67,9 @@ pub fn roots_from(cli: &Cli) -> Roots {
 ///
 /// This is the read-only front half of the flow that does not require a real
 /// repository or installed store, so it is exercised in unit tests. The solver
-/// half runs only over a real corpus.
+/// half runs only over a real corpus. Expanding a dbapi-backed set
+/// (`@installed`, `@live-rebuild`, `@module-rebuild`) lazily loads the installed
+/// store during this phase to compute its membership.
 pub fn load_and_expand(cli: &Cli) -> miette::Result<(ConfigContext, Request, Timing)> {
     let mut timing = Timing::default();
 
